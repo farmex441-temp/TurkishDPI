@@ -151,11 +151,14 @@ static void ini_set_int(const wchar_t *key, int v) {
 }
 
 static int split_hosts(wchar_t *buf, const wchar_t **out) {
+    /* Portable tokenizer: wcstok's signature differs between msvcrt and ucrt. */
     int n = 0;
-    wchar_t *ctx = NULL, *tok = wcstok(buf, L", ;", &ctx);
-    while (tok && n < PROBE_MAX_HOSTS) {
-        out[n++] = tok;
-        tok = wcstok(NULL, L", ;", &ctx);
+    wchar_t *p = buf;
+    while (*p && n < PROBE_MAX_HOSTS) {
+        while (*p == L',' || *p == L' ' || *p == L';') *p++ = 0;
+        if (!*p) break;
+        out[n++] = p;
+        while (*p && *p != L',' && *p != L' ' && *p != L';') p++;
     }
     return n;
 }
