@@ -1,0 +1,872 @@
+/*
+ * TurkishDPI - automatic DPI circumvention for Turkey.
+ *
+ * One small native executable with two roles:
+ *
+ *   TurkishDPI.exe                 the app: finds a working strategy by itself
+ *                                  (learning per network), runs it, watches it
+ *                                  and re-tunes when something changes.
+ *   TurkishDPI.exe --engine ARGS   the packet engine (GoodbyeDPI-compatible
+ *                                  options). Also used directly when the first
+ *                                  argument looks like a GoodbyeDPI option,
+ *                                  so old .cmd scripts and services keep working.
+ *
+ * Copyright 2026 TurkishDPI contributors. Apache License 2.0.
+ * Engine: GoodbyeDPI (ValdikSS) / GoodbyeDPI-Turkey (cagritaskn).
+ * Auto-detection, watchdog and SNI strategies inspired by Shroudly (umutxyp, MIT).
+ */
+#define WIN32_LEAN_AND_MEAN
+#include <winsock2.h>
+#include <windows.h>
+#include <shellapi.h>
+#include <shlobj.h>
+#include <iphlpapi.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <wchar.h>
+#include "app.h"
+#include "presets.h"
+#include "version.h"
+
+int gdpi_main(int argc, char *argv[]);
+
+/* ---------- shared state ---------- */
+CRITICAL_SECTION g_lock;
+ui_state_t g_ui;
+int g_auto = 1, g_preset = 0, g_paused = 0, g_payment_protect = 1;
+wchar_t g_log[MAX_PATH], g_ini[MAX_PATH];
+
+static wchar_t g_dir[MAX_PATH], g_exe[MAX_PATH];
+static HANDLE g_job, g_cmd_event, g_net_event;
+static volatile LONG g_cmd = CMD_NONE, g_cmd_arg = 0;
+static wchar_t g_site_req[256];
+static int g_dns = 0, g_running_preset = -1, g_quiet_start = 0;
+static int g_watchdog_min = 10;
+
+static PROCESS_INFORMATION g_engine;
+static HANDLE g_engine_active;
+static volatile LONG g_engine_err = 0;
+
+static wchar_t g_targets_buf[512] = L"discord.com,www.roblox.com,www.wattpad.com";
+static wchar_t g_control_buf[256] = L"www.google.com,www.microsoft.com";
+static const wchar_t *g_targets[PROBE_MAX_HOSTS], *g_control[PROBE_MAX_HOSTS];
+static int g_ntargets, g_ncontrol;
+
+/* ---------- logging ---------- */
+static void log_write(const char *data, DWORD len) {
+    HANDLE f;
+    DWORD w;
+    EnterCriticalSection(&g_lock);
+    f = CreateFileW(g_log, FILE_APPEND_DATA, FILE_SHARE_READ | FILE_SHARE_WRITE, NULL,
+                    OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (f != INVALID_HANDLE_VALUE) {
+        WriteFile(f, data, len, &w, NULL);
+        CloseHandle(f);
+    }
+    LeaveCriticalSection(&g_lock);
+}
+
+static void log_line(const char *fmt, ...) {
+    char buf[1024];
+    SYSTEMTIME t;
+    va_list ap;
+    int n;
+    GetLocalTime(&t);
+    n = snprintf(buf, sizeof(buf), "%04d-%02d-%02d %02d:%02d:%02d [app] ",
+                 t.wYear, t.wMonth, t.wDay, t.wHour, t.wMinute, t.wSecond);
+    va_start(ap, fmt);
+    n += vsnprintf(buf + n, sizeof(buf) - (size_t)n - 3, fmt, ap);
+    va_end(ap);
+    if (n > (int)sizeof(buf) - 3) n = (int)sizeof(buf) - 3;
+    buf[n++] = '\r'; buf[n++] = '\n';
+    log_write(buf, (DWORD)n);
+}
+
+static void log_rotate(void) {
+    WIN32_FILE_ATTRIBUTE_DATA a;
+    if (GetFileAttributesExW(g_log, GetFileExInfoStandard, &a) &&
+        (a.nFileSizeHigh || a.nFileSizeLow > 1024 * 1024)) {
+        wchar_t old[MAX_PATH];
+        swprintf(old, MAX_PATH, L"%ls.old", g_log);
+        MoveFileExW(g_log, old, MOVEFILE_REPLACE_EXISTING);
+    }
+}
+
+/* ---------- state updates (worker thread -> UI) ---------- */
+static void set_state(state_kind_t k, const wchar_t *status, const wchar_t *detail) {
+    EnterCriticalSection(&g_lock);
+    g_ui.kind = k;
+    if (status) { wcsncpy(g_ui.status, status, 127); g_ui.status[127] = 0; }
+    if (detail) { wcsncpy(g_ui.detail, detail, 159); g_ui.detail[159] = 0; }
+    g_ui.preset = g_running_preset;
+    g_ui.dns = g_dns;
+    LeaveCriticalSection(&g_lock);
+    ui_refresh();
+}
+
+static void set_targets_ui(const int *ok, const int *ms) {
+    int sum = 0, cnt = 0;
+    EnterCriticalSection(&g_lock);
+    g_ui.ntargets = g_ntargets;
+    for (int i = 0; i < g_ntargets; i++) {
+        wcsncpy(g_ui.target[i], g_targets[i], 63);
+        g_ui.target[i][63] = 0;
+        g_ui.target_ok[i] = ok ? ok[i] : -1;
+        g_ui.target_ms[i] = ms ? ms[i] : -1;
+        if (ok && ok[i] && ms && ms[i] > 0) { sum += ms[i]; cnt++; }
+    }
+    g_ui.avg_ms = cnt ? sum / cnt : -1;
+    LeaveCriticalSection(&g_lock);
+    ui_refresh();
+}
+
+static void notify(const wchar_t *title, const wchar_t *text) {
+    NOTIFYICONDATAW n;
+    if (g_quiet_start) return;
+    ZeroMemory(&n, sizeof(n));
+    n.cbSize = sizeof(n);
+    n.hWnd = ui_hwnd();
+    n.uID = 1;
+    n.uFlags = NIF_INFO;
+    wcsncpy(n.szInfoTitle, title, 63);
+    wcsncpy(n.szInfo, text, 255);
+    n.dwInfoFlags = NIIF_USER | NIIF_LARGE_ICON | NIIF_NOSOUND;
+    n.hBalloonIcon = LoadIconW(GetModuleHandleW(NULL), MAKEINTRESOURCEW(1));
+    Shell_NotifyIconW(NIM_MODIFY, &n);
+}
+
+/* ---------- config ---------- */
+static int ini_int(const wchar_t *key, int def) {
+    return (int)GetPrivateProfileIntW(L"TurkishDPI", key, def, g_ini);
+}
+
+static void ini_set_int(const wchar_t *key, int v) {
+    wchar_t b[16];
+    swprintf(b, 16, L"%d", v);
+    WritePrivateProfileStringW(L"TurkishDPI", key, b, g_ini);
+}
+
+static int split_hosts(wchar_t *buf, const wchar_t **out) {
+    int n = 0;
+    wchar_t *ctx = NULL, *tok = wcstok(buf, L", ;", &ctx);
+    while (tok && n < PROBE_MAX_HOSTS) {
+        out[n++] = tok;
+        tok = wcstok(NULL, L", ;", &ctx);
+    }
+    return n;
+}
+
+static void targets_reload(void) {
+    GetPrivateProfileStringW(L"TurkishDPI", L"Targets", g_targets_buf, g_targets_buf,
+                             sizeof(g_targets_buf) / sizeof(wchar_t), g_ini);
+    g_ntargets = split_hosts(g_targets_buf, g_targets);
+    set_targets_ui(NULL, NULL);
+}
+
+static void config_load(void) {
+    g_auto = ini_int(L"Auto", 1) != 0;
+    g_preset = ini_int(L"Preset", 0);
+    if (g_preset < 0 || g_preset >= PRESET_COUNT) g_preset = 0;
+    g_dns = ini_int(L"Dns", 0);
+    if (g_dns < 0 || g_dns >= DNS_SERVER_COUNT) g_dns = 0;
+    g_payment_protect = ini_int(L"PaymentProtection", 1) != 0;
+    g_watchdog_min = ini_int(L"WatchdogMinutes", 10);
+    if (g_watchdog_min < 1) g_watchdog_min = 1;
+    GetPrivateProfileStringW(L"TurkishDPI", L"Control", g_control_buf, g_control_buf,
+                             sizeof(g_control_buf) / sizeof(wchar_t), g_ini);
+    g_ncontrol = split_hosts(g_control_buf, g_control);
+    targets_reload();
+}
+
+static void config_save(void) {
+    ini_set_int(L"Auto", g_auto);
+    ini_set_int(L"Preset", g_preset);
+    ini_set_int(L"Dns", g_dns);
+    ini_set_int(L"PaymentProtection", g_payment_protect);
+    ini_set_int(L"WatchdogMinutes", g_watchdog_min);
+}
+
+static void targets_add(const wchar_t *host) {
+    wchar_t buf[512];
+    for (int i = 0; i < g_ntargets; i++)
+        if (!_wcsicmp(g_targets[i], host)) return;
+    if (g_ntargets >= PROBE_MAX_HOSTS) return;
+    buf[0] = 0;
+    for (int i = 0; i < g_ntargets; i++) {
+        wcscat(buf, g_targets[i]);
+        wcscat(buf, L",");
+    }
+    wcsncat(buf, host, 511 - wcslen(buf));
+    WritePrivateProfileStringW(L"TurkishDPI", L"Targets", buf, g_ini);
+    wcscpy(g_targets_buf, buf);
+    g_ntargets = split_hosts(g_targets_buf, g_targets);
+    log_line("learned new target site");
+}
+
+/* ---------- engine process control ---------- */
+static void build_args(int preset, int dns, char *out, size_t cap) {
+    const char *src = PRESETS[preset].args;
+    const char *tag = strstr(src, "{DNS}");
+    char dnsargs[160];
+    const dns_server_t *d = &DNS_SERVERS[dns];
+    size_t n;
+
+    snprintf(dnsargs, sizeof(dnsargs),
+             "--dns-addr %s --dns-port %u --dnsv6-addr %s --dnsv6-port %u",
+             d->v4, d->port, d->v6, d->port);
+    if (tag)
+        snprintf(out, cap, "%.*s%s%s", (int)(tag - src), src, dnsargs, tag + 5);
+    else
+        snprintf(out, cap, "%s", src);
+    n = strlen(out);
+    if (!g_payment_protect && n + 24 < cap)
+        strcat(out, " --no-payment-exclude");
+}
+
+static DWORD WINAPI engine_reader(LPVOID p) {
+    HANDLE pipe = (HANDLE)p;
+    char buf[2048], line[512];
+    size_t ll = 0;
+    DWORD n;
+    while (ReadFile(pipe, buf, sizeof(buf), &n, NULL) && n) {
+        log_write(buf, n);
+        for (DWORD i = 0; i < n; i++) {
+            if (buf[i] == '\n' || ll == sizeof(line) - 1) {
+                line[ll] = 0;
+                if (strstr(line, "Filter activated"))
+                    SetEvent(g_engine_active);
+                else if (!strncmp(line, "Error opening filter: ", 22))
+                    InterlockedExchange(&g_engine_err, atol(line + 22));
+                ll = 0;
+            } else if (buf[i] != '\r') {
+                line[ll++] = buf[i];
+            }
+        }
+    }
+    CloseHandle(pipe);
+    return 0;
+}
+
+static void engine_stop(void) {
+    EnterCriticalSection(&g_lock);
+    if (g_engine.hProcess) {
+        TerminateProcess(g_engine.hProcess, 0);
+        WaitForSingleObject(g_engine.hProcess, 3000);
+        CloseHandle(g_engine.hProcess);
+        CloseHandle(g_engine.hThread);
+        ZeroMemory(&g_engine, sizeof(g_engine));
+    }
+    g_running_preset = -1;
+    LeaveCriticalSection(&g_lock);
+}
+
+static int engine_alive(void) {
+    return g_engine.hProcess && WaitForSingleObject(g_engine.hProcess, 0) == WAIT_TIMEOUT;
+}
+
+/* Returns 1 when the filter is active, 0 on failure (g_engine_err may be set). */
+static int engine_start(int preset, int dns) {
+    char args[512];
+    wchar_t cmd[1024], wargs[512];
+    SECURITY_ATTRIBUTES sa = { sizeof(sa), NULL, TRUE };
+    HANDLE rd = NULL, wr = NULL, waits[2], t;
+    STARTUPINFOW si;
+    PROCESS_INFORMATION pi;
+    DWORD r;
+
+    engine_stop();
+    build_args(preset, dns, args, sizeof(args));
+    MultiByteToWideChar(CP_ACP, 0, args, -1, wargs, 512);
+    swprintf(cmd, 1024, L"\"%ls\" --engine %ls", g_exe, wargs);
+    log_line("starting engine: preset %d: %s", preset, args);
+
+    if (!CreatePipe(&rd, &wr, &sa, 0)) return 0;
+    SetHandleInformation(rd, HANDLE_FLAG_INHERIT, 0);
+
+    ZeroMemory(&si, sizeof(si));
+    si.cb = sizeof(si);
+    si.dwFlags = STARTF_USESTDHANDLES | STARTF_USESHOWWINDOW;
+    si.wShowWindow = SW_HIDE;
+    si.hStdOutput = wr;
+    si.hStdError = wr;
+
+    ResetEvent(g_engine_active);
+    InterlockedExchange(&g_engine_err, 0);
+    if (!CreateProcessW(g_exe, cmd, NULL, NULL, TRUE,
+                        CREATE_NO_WINDOW | CREATE_SUSPENDED | ABOVE_NORMAL_PRIORITY_CLASS,
+                        NULL, g_dir, &si, &pi)) {
+        log_line("CreateProcess failed: %lu", GetLastError());
+        CloseHandle(rd); CloseHandle(wr);
+        return 0;
+    }
+    CloseHandle(wr);
+    AssignProcessToJobObject(g_job, pi.hProcess);   /* dies with us */
+    t = CreateThread(NULL, 64 * 1024, engine_reader, rd, STACK_SIZE_PARAM_IS_A_RESERVATION, NULL);
+    if (t) CloseHandle(t); else CloseHandle(rd);
+    ResumeThread(pi.hThread);
+
+    EnterCriticalSection(&g_lock);
+    g_engine = pi;
+    LeaveCriticalSection(&g_lock);
+
+    waits[0] = g_engine_active;
+    waits[1] = pi.hProcess;
+    r = WaitForMultipleObjects(2, waits, FALSE, 10000);
+    if (r == WAIT_OBJECT_0) {
+        g_running_preset = preset;
+        g_ui.started_tick = GetTickCount();
+        Sleep(300);  /* let the DNS cache flush and filters settle */
+        return 1;
+    }
+    log_line("engine did not start (wait=%lu, err=%ld)", r, g_engine_err);
+    engine_stop();
+    return 0;
+}
+
+static const wchar_t *windivert_error_text(long e) {
+    switch (e) {
+    case 2:    return L"WinDivert sürücü dosyası bulunamadı. Antivirüs silmiş olabilir; "
+                      L"TurkishDPI klasörünü antivirüs istisnalarına ekleyin.";
+    case 126:  return L"WinDivert.dll bulunamadı. Antivirüs silmiş olabilir; "
+                      L"TurkishDPI klasörünü antivirüs istisnalarına ekleyin.";
+    case 5:    return L"Yönetici izni gerekiyor. Programı yönetici olarak çalıştırın.";
+    case 577:  return L"Sürücü imzası doğrulanamadı. Windows güncellemelerini yükleyin.";
+    case 654:  return L"Farklı sürümde bir WinDivert sürücüsü yüklü (eski GoodbyeDPI/zapret?). "
+                      L"Onları kapatıp bilgisayarı yeniden başlatın.";
+    case 1275: return L"Sürücü bir güvenlik yazılımı tarafından engellendi (ör. Kaspersky).";
+    case 1753: return L"Base Filtering Engine (BFE) hizmeti kapalı. Hizmetler'den açın.";
+    default:   return NULL;
+    }
+}
+
+/* ---------- probing ---------- */
+static int control_ok(void) {
+    return probe_https_many(g_control, g_ncontrol, 5000, NULL, NULL) > 0;
+}
+
+/* Probes all target sites, updates the UI, returns how many opened. */
+static int targets_score(int *avg_ms) {
+    int ok[PROBE_MAX_HOSTS], ms[PROBE_MAX_HOSTS], score, sum = 0, cnt = 0;
+    probe_flush_dns_cache();
+    score = probe_https_many(g_targets, g_ntargets, 5000, ok, ms);
+    for (int i = 0; i < g_ntargets; i++)
+        if (ok[i] && ms[i] > 0) { sum += ms[i]; cnt++; }
+    if (avg_ms) *avg_ms = cnt ? sum / cnt : -1;
+    set_targets_ui(ok, ms);
+    return score;
+}
+
+static void pick_dns(void) {
+    int saved = smart_get_dns(g_dns);
+    for (int i = 0; i < DNS_SERVER_COUNT; i++) {
+        int idx = (saved + i) % DNS_SERVER_COUNT;   /* the one known for this network first */
+        if (probe_dns(DNS_SERVERS[idx].v4, DNS_SERVERS[idx].port, "discord.com", 1500)) {
+            if (idx != g_dns) log_line("DNS -> %s:%u", DNS_SERVERS[idx].v4, DNS_SERVERS[idx].port);
+            g_dns = idx;
+            smart_set_dns(idx);
+            return;
+        }
+    }
+    log_line("no alternative DNS answered, keeping %s", DNS_SERVERS[g_dns].v4);
+}
+
+static int engine_fatal(void) {
+    const wchar_t *msg = windivert_error_text(g_engine_err);
+    wchar_t st[64];
+    if (!msg) return 0;
+    swprintf(st, 64, L"Sürücü başlatılamadı (%ld)", g_engine_err);
+    set_state(ST_ERROR, st, msg);
+    g_quiet_start = 0;
+    notify(L"TurkishDPI çalışamıyor", msg);
+    return 1;
+}
+
+static void announce(int p, int score) {
+    wchar_t d[160];
+    g_preset = p;
+    config_save();
+    swprintf(d, 160, L"%ls", PRESETS[p].name);
+    if (score >= g_ntargets) {
+        set_state(ST_ACTIVE, L"Koruma aktif", d);
+        notify(L"TurkishDPI aktif", PRESETS[p].name);
+    } else {
+        set_state(ST_PARTIAL, L"Kısmen aktif", d);
+        notify(L"TurkishDPI kısmen çalışıyor",
+               L"Bazı test siteleri açılamadı; en iyi sonuç veren profil kullanılıyor.");
+    }
+    g_quiet_start = 0;
+}
+
+static int cmd_pending(void) {
+    return InterlockedCompareExchange(&g_cmd, CMD_NONE, CMD_NONE) != CMD_NONE;
+}
+
+/*
+ * Smart scan:
+ *  1. no internet -> wait (never blame the presets for a dead link)
+ *  2. pick a reachable DNS (remembered per network)
+ *  3. try presets best-first using what was learned on this network
+ *  4. on a new network, after the first full success also measure up to two
+ *     untried presets and keep the fastest (one-time learning cost)
+ */
+static void auto_scan(void) {
+    int order[PRESET_COUNT], best = -1, best_score = -1, best_ms = 0;
+    int winner = -1, winner_ms = 0, extra = 0;
+    int known_before[PRESET_COUNT], learned_before;
+
+    set_state(ST_SCANNING, L"Bağlantı kontrol ediliyor…", L"");
+    engine_stop();
+    probe_flush_dns_cache();
+    smart_network_changed();
+
+    if (!control_ok()) {
+        set_state(ST_OFFLINE, L"İnternet bağlantısı yok", L"Bağlantı gelince otomatik başlayacak");
+        log_line("control sites unreachable, waiting for network");
+        return;
+    }
+    set_state(ST_SCANNING, L"En iyi DNS aranıyor…", L"");
+    pick_dns();
+    smart_order(order, PRESET_COUNT);
+    for (int i = 0; i < PRESET_COUNT; i++) known_before[i] = smart_known(i);
+    learned_before = smart_learned_count();
+
+    for (int k = 0; k < PRESET_COUNT; k++) {
+        int p = order[k], score, ms;
+        wchar_t st[64];
+        if (cmd_pending()) return;
+        if (winner >= 0 && (known_before[p] || extra >= 2)) break;
+        EnterCriticalSection(&g_lock);
+        g_ui.scan_pos = k + 1;
+        g_ui.scan_total = PRESET_COUNT;
+        LeaveCriticalSection(&g_lock);
+        swprintf(st, 64, winner >= 0 ? L"Optimize ediliyor (%d/%d)" : L"Taranıyor (%d/%d)",
+                 k + 1, PRESET_COUNT);
+        set_state(ST_SCANNING, st, PRESETS[p].name);
+        if (!engine_start(p, g_dns)) {
+            if (engine_fatal()) return;
+            smart_record(p, 0, 0);
+            continue;
+        }
+        score = targets_score(&ms);
+        smart_record(p, score >= g_ntargets, ms);
+        log_line("preset %d score %d/%d avg %d ms", p, score, g_ntargets, ms);
+        if (winner >= 0) extra++;
+        if (score >= g_ntargets) {
+            if (winner < 0 || (ms > 0 && ms < winner_ms * 8 / 10)) {
+                winner = p;
+                winner_ms = ms;
+            }
+            /* Known network and a proven preset works: no need to explore. */
+            if (known_before[p] && learned_before > 1 && extra == 0) break;
+            continue;
+        }
+        if (score > best_score) { best = p; best_score = score; best_ms = ms; }
+    }
+
+    if (winner >= 0) {
+        if (g_running_preset != winner && !engine_start(winner, g_dns)) {
+            if (!engine_fatal()) set_state(ST_ERROR, L"Başlatılamadı", PRESETS[winner].name);
+            return;
+        }
+        targets_score(NULL);
+        announce(winner, g_ntargets);
+        return;
+    }
+    (void)best_ms;
+    if (best >= 0 && best_score > 0 && engine_start(best, g_dns)) {
+        targets_score(NULL);
+        announce(best, best_score);
+        return;
+    }
+    engine_stop();
+    if (targets_score(NULL) >= g_ntargets) {
+        set_state(ST_STANDBY, L"Engel algılanmadı", L"Bekleme modunda – engel çıkarsa devreye girer");
+        log_line("targets reachable without engine; standing by");
+        return;
+    }
+    if (engine_start(g_preset, g_dns))
+        set_state(ST_PARTIAL, L"Çalışan profil bulunamadı", PRESETS[g_preset].name);
+    else if (!engine_fatal())
+        set_state(ST_ERROR, L"Çalışan profil bulunamadı", L"Günlük dosyasına bakın");
+    notify(L"TurkishDPI", L"Hiçbir profil tüm test sitelerini açamadı.");
+}
+
+static int health_ok(void) {
+    int s;
+    if (g_running_preset >= 0 && !engine_alive()) return 0;
+    s = targets_score(NULL) >= g_ntargets;
+    if (g_running_preset >= 0) smart_record(g_running_preset, s, 0);
+    return s;
+}
+
+static void manual_start(int p) {
+    int ms, score;
+    set_state(ST_SCANNING, L"Başlatılıyor…", PRESETS[p].name);
+    if (!engine_start(p, g_dns)) {
+        if (!engine_fatal()) set_state(ST_ERROR, L"Başlatılamadı", PRESETS[p].name);
+        return;
+    }
+    score = targets_score(&ms);
+    smart_record(p, score >= g_ntargets, ms);
+    announce(p, score);
+}
+
+/* Extract "host" from what the user typed (URL, host, host/path). */
+static void normalize_host(const wchar_t *in, wchar_t *out, size_t cap) {
+    const wchar_t *s = in, *e;
+    size_t n;
+    while (*s == L' ') s++;
+    if (!_wcsnicmp(s, L"https://", 8)) s += 8;
+    else if (!_wcsnicmp(s, L"http://", 7)) s += 7;
+    e = s;
+    while (*e && *e != L'/' && *e != L':' && *e != L' ' && *e != L'?') e++;
+    n = (size_t)(e - s);
+    if (n >= cap) n = cap - 1;
+    wcsncpy(out, s, n);
+    out[n] = 0;
+    _wcslwr(out);
+}
+
+static void site_result(const wchar_t *fmt, const wchar_t *host) {
+    EnterCriticalSection(&g_lock);
+    swprintf(g_ui.site_result, 160, fmt, host);
+    LeaveCriticalSection(&g_lock);
+    ui_refresh();
+}
+
+/* "Site testi": check one site; if blocked, look for a preset that opens it
+ * together with the existing targets, then remember the site. */
+static void site_test(const wchar_t *raw) {
+    wchar_t host[128];
+    const wchar_t *h[1];
+    int order[PRESET_COUNT], prev = g_running_preset;
+
+    normalize_host(raw, host, 128);
+    if (!host[0] || !wcschr(host, L'.')) { site_result(L"Geçersiz adres: %ls", raw); return; }
+    h[0] = host;
+    site_result(L"%ls test ediliyor…", host);
+    probe_flush_dns_cache();
+    if (probe_https_many(h, 1, 6000, NULL, NULL) == 1) {
+        site_result(L"✓ %ls açılıyor", host);
+        return;
+    }
+    if (!control_ok()) { site_result(L"İnternet yok, %ls test edilemedi", host); return; }
+
+    site_result(L"%ls engelli – çözüm aranıyor…", host);
+    set_state(ST_SCANNING, L"Site için çözüm aranıyor…", host);
+    smart_order(order, PRESET_COUNT);
+    for (int k = 0; k < PRESET_COUNT; k++) {
+        int p = order[k];
+        if (cmd_pending()) break;
+        if (p == prev) continue;
+        if (!engine_start(p, g_dns)) { if (engine_fatal()) return; continue; }
+        probe_flush_dns_cache();
+        if (probe_https_many(h, 1, 6000, NULL, NULL) == 1 && targets_score(NULL) >= g_ntargets) {
+            targets_add(host);
+            smart_record(p, 1, 0);
+            site_result(L"✓ %ls açıldı – profil değişti ve site hatırlandı", host);
+            announce(p, g_ntargets);
+            return;
+        }
+    }
+    site_result(L"✗ %ls açılamadı: IP/sunucu engeli olabilir (DPI ile aşılamaz)", host);
+    if (prev >= 0 && engine_start(prev, g_dns)) { targets_score(NULL); announce(prev, g_ntargets); }
+    else auto_scan();
+}
+
+/* ---------- controller thread ---------- */
+static DWORD WINAPI controller(LPVOID unused) {
+    OVERLAPPED ov;
+    HANDLE notify_h = NULL;
+    int fails = 0;
+    (void)unused;
+
+    ZeroMemory(&ov, sizeof(ov));
+    ov.hEvent = g_net_event;
+    NotifyAddrChange(&notify_h, &ov);
+
+    smart_network_changed();
+    if (g_auto) auto_scan(); else manual_start(g_preset);
+
+    for (;;) {
+        HANDLE w[3];
+        DWORD nw = 0, r, timeout;
+        LONG cmd;
+
+        w[nw++] = g_cmd_event;
+        w[nw++] = g_net_event;
+        if (g_engine.hProcess) w[nw++] = g_engine.hProcess;
+        timeout = g_paused ? INFINITE : (DWORD)g_watchdog_min * 60000u;
+        if (!g_paused && g_ui.kind == ST_OFFLINE) timeout = 30000;
+
+        r = WaitForMultipleObjects(nw, w, FALSE, timeout);
+        cmd = InterlockedExchange(&g_cmd, CMD_NONE);
+
+        if (r == WAIT_OBJECT_0 || cmd != CMD_NONE) {
+            switch (cmd) {
+            case CMD_RESCAN:  g_paused = 0; auto_scan(); break;
+            case CMD_AUTO:    g_auto = 1; g_paused = 0; config_save(); auto_scan(); break;
+            case CMD_SELECT:  g_auto = 0; g_paused = 0; config_save(); manual_start((int)g_cmd_arg); break;
+            case CMD_PAUSE:   g_paused = 1; engine_stop(); probe_flush_dns_cache();
+                              set_state(ST_PAUSED, L"Duraklatıldı", L"Açmak için düğmeye basın"); break;
+            case CMD_RESUME:
+            case CMD_RESTART: g_paused = 0;
+                              if (g_auto) auto_scan(); else manual_start(g_preset);
+                              break;
+            case CMD_TESTSITE: {
+                wchar_t h[256];
+                EnterCriticalSection(&g_lock);
+                wcscpy(h, g_site_req);
+                LeaveCriticalSection(&g_lock);
+                if (!g_paused) site_test(h);
+                break;
+            }
+            default: break;
+            }
+            fails = 0;
+            continue;
+        }
+        if (g_paused) continue;
+
+        if (r == WAIT_OBJECT_0 + 1) {
+            ResetEvent(g_net_event);
+            NotifyAddrChange(&notify_h, &ov);
+            Sleep(4000);   /* let DHCP/DNS settle */
+            log_line("network change detected");
+            smart_network_changed();
+            if (!control_ok()) {
+                engine_stop();
+                set_state(ST_OFFLINE, L"İnternet bağlantısı yok", L"Bağlantı gelince otomatik başlayacak");
+                continue;
+            }
+            if (!health_ok()) { if (g_auto) auto_scan(); else manual_start(g_preset); }
+            else if (g_running_preset >= 0) announce(g_running_preset, g_ntargets);
+            continue;
+        }
+        if (nw == 3 && r == WAIT_OBJECT_0 + 2) {
+            int p = g_running_preset >= 0 ? g_running_preset : g_preset;
+            log_line("engine exited unexpectedly");
+            engine_stop();
+            if (++fails <= 3) manual_start(p);
+            else { fails = 0; if (g_auto) auto_scan(); }
+            continue;
+        }
+        /* watchdog */
+        if (!health_ok()) {
+            log_line("watchdog: health check failed");
+            if (control_ok()) { if (g_auto) auto_scan(); else manual_start(g_preset); }
+            else { engine_stop(); set_state(ST_OFFLINE, L"İnternet bağlantısı yok", L""); }
+        } else if (g_ui.kind == ST_OFFLINE) {
+            if (g_auto) auto_scan(); else manual_start(g_preset);
+        }
+    }
+    return 0;
+}
+
+void post_cmd(LONG cmd, LONG arg) {
+    InterlockedExchange(&g_cmd_arg, arg);
+    InterlockedExchange(&g_cmd, cmd);
+    SetEvent(g_cmd_event);
+}
+
+void post_site_test(const wchar_t *host) {
+    EnterCriticalSection(&g_lock);
+    wcsncpy(g_site_req, host, 255);
+    g_site_req[255] = 0;
+    LeaveCriticalSection(&g_lock);
+    post_cmd(CMD_TESTSITE, 0);
+}
+
+void set_payment_protect(int on) {
+    g_payment_protect = on;
+    config_save();
+    if (g_running_preset >= 0 || g_ui.kind == ST_SCANNING) post_cmd(CMD_RESTART, 0);
+    else ui_refresh();
+}
+
+/* ---------- autostart via Task Scheduler (elevated, no UAC prompt) ---------- */
+static DWORD run_hidden(const wchar_t *cmdline) {
+    STARTUPINFOW si;
+    PROCESS_INFORMATION pi;
+    wchar_t buf[1024];
+    DWORD code = 1;
+    ZeroMemory(&si, sizeof(si));
+    si.cb = sizeof(si);
+    si.dwFlags = STARTF_USESHOWWINDOW;
+    si.wShowWindow = SW_HIDE;
+    wcsncpy(buf, cmdline, 1023); buf[1023] = 0;
+    if (CreateProcessW(NULL, buf, NULL, NULL, FALSE, CREATE_NO_WINDOW, NULL, NULL, &si, &pi)) {
+        WaitForSingleObject(pi.hProcess, 15000);
+        GetExitCodeProcess(pi.hProcess, &code);
+        CloseHandle(pi.hProcess);
+        CloseHandle(pi.hThread);
+    }
+    return code;
+}
+
+static int g_autostart_cache = -1;
+
+int autostart_enabled(void) {
+    if (g_autostart_cache < 0)
+        g_autostart_cache = run_hidden(L"schtasks.exe /Query /TN \"TurkishDPI\"") == 0;
+    return g_autostart_cache;
+}
+
+void autostart_set(int on) {
+    wchar_t cmd[1024];
+    if (on)
+        swprintf(cmd, 1024, L"schtasks.exe /Create /F /RL HIGHEST /SC ONLOGON /DELAY 0000:10 "
+                            L"/TN \"TurkishDPI\" /TR \"\\\"%ls\\\" --tray\"", g_exe);
+    else
+        wcscpy(cmd, L"schtasks.exe /Delete /F /TN \"TurkishDPI\"");
+    if (run_hidden(cmd) != 0)
+        MessageBoxW(ui_hwnd(), L"Başlangıç görevi ayarlanamadı.", L"TurkishDPI", MB_ICONWARNING);
+    g_autostart_cache = -1;
+    ui_refresh();
+}
+
+/* ---------- conflicting tools ---------- */
+static void check_conflicts(void) {
+    static const wchar_t *names[] = { L"GoodbyeDPI", L"zapret", L"winws1", L"winws2" };
+    SC_HANDLE scm = OpenSCManagerW(NULL, NULL, SC_MANAGER_CONNECT);
+    if (!scm) return;
+    for (size_t i = 0; i < sizeof(names) / sizeof(names[0]); i++) {
+        SC_HANDLE s = OpenServiceW(scm, names[i], SERVICE_QUERY_STATUS | SERVICE_STOP | DELETE);
+        SERVICE_STATUS st;
+        wchar_t msg[512];
+        if (!s) continue;
+        if (QueryServiceStatus(s, &st) && st.dwCurrentState != SERVICE_STOPPED) {
+            swprintf(msg, 512,
+                     L"Bilgisayarınızda \"%ls\" hizmeti çalışıyor. TurkishDPI ile aynı anda çalışırsa "
+                     L"bağlantı sorunlarına yol açar.\n\nBu hizmet durdurulup kaldırılsın mı?",
+                     names[i]);
+            if (MessageBoxW(NULL, msg, L"TurkishDPI – çakışma", MB_YESNO | MB_ICONQUESTION) == IDYES) {
+                ControlService(s, SERVICE_CONTROL_STOP, &st);
+                for (int t = 0; t < 30 && QueryServiceStatus(s, &st) &&
+                                st.dwCurrentState != SERVICE_STOPPED; t++)
+                    Sleep(200);
+                DeleteService(s);
+                log_line("removed conflicting service #%d", (int)i);
+            }
+        }
+        CloseServiceHandle(s);
+    }
+    CloseServiceHandle(scm);
+}
+
+void app_exit(void) {
+    NOTIFYICONDATAW n;
+    ZeroMemory(&n, sizeof(n));
+    n.cbSize = sizeof(n);
+    n.hWnd = ui_hwnd();
+    n.uID = 1;
+    Shell_NotifyIconW(NIM_DELETE, &n);
+    engine_stop();
+    probe_flush_dns_cache();
+    log_line("exit");
+    ExitProcess(0);
+}
+
+static int app_main(int quiet) {
+    HANDLE mtx, t;
+    MSG m;
+    WSADATA wsa;
+    JOBOBJECT_EXTENDED_LIMIT_INFORMATION jl;
+    wchar_t *pd = NULL;
+
+    mtx = CreateMutexW(NULL, TRUE, L"Global\\TurkishDPI_app");
+    if (mtx && GetLastError() == ERROR_ALREADY_EXISTS) {
+        /* Bring the running instance's window to front. */
+        HWND w = FindWindowW(L"TurkishDPI_main", NULL);
+        if (w && !quiet) PostMessageW(w, WM_TRAY, 0, WM_LBUTTONUP);
+        return 0;
+    }
+
+    InitializeCriticalSection(&g_lock);
+    WSAStartup(MAKEWORD(2, 2), &wsa);
+    GetModuleFileNameW(NULL, g_exe, MAX_PATH);
+
+    if (SUCCEEDED(SHGetKnownFolderPath(&FOLDERID_ProgramData, 0, NULL, &pd))) {
+        swprintf(g_dir, MAX_PATH, L"%ls\\TurkishDPI", pd);
+        CoTaskMemFree(pd);
+    } else {
+        wcscpy(g_dir, L"C:\\ProgramData\\TurkishDPI");
+    }
+    CreateDirectoryW(g_dir, NULL);
+    swprintf(g_ini, MAX_PATH, L"%ls\\TurkishDPI.ini", g_dir);
+    swprintf(g_log, MAX_PATH, L"%ls\\TurkishDPI.log", g_dir);
+    log_rotate();
+    log_line("TurkishDPI " TURKISHDPI_VERSION_A " starting");
+
+    g_ui.kind = ST_STARTING;
+    g_ui.preset = -1;
+    wcscpy(g_ui.status, L"Başlatılıyor…");
+    config_load();
+    config_save();
+    g_quiet_start = quiet;
+
+    g_job = CreateJobObjectW(NULL, NULL);
+    ZeroMemory(&jl, sizeof(jl));
+    jl.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+    SetInformationJobObject(g_job, JobObjectExtendedLimitInformation, &jl, sizeof(jl));
+
+    g_cmd_event = CreateEventW(NULL, FALSE, FALSE, NULL);
+    g_net_event = CreateEventW(NULL, TRUE, FALSE, NULL);
+    g_engine_active = CreateEventW(NULL, TRUE, FALSE, NULL);
+
+    check_conflicts();
+    if (!ui_init(GetModuleHandleW(NULL))) return 1;
+    if (!quiet) ui_show();
+
+    t = CreateThread(NULL, 256 * 1024, controller, NULL, STACK_SIZE_PARAM_IS_A_RESERVATION, NULL);
+    if (t) CloseHandle(t);
+
+    while (GetMessageW(&m, NULL, 0, 0) > 0) {
+        if (!IsDialogMessageW(ui_hwnd(), &m)) {
+            TranslateMessage(&m);
+            DispatchMessageW(&m);
+        }
+    }
+    app_exit();
+    return 0;
+}
+
+/* Fires network re-check from the UI thread (sleep resume). */
+void app_network_event(void) {
+    SetEvent(g_net_event);
+}
+
+/* ---------- entry ---------- */
+static void attach_console_if_any(void) {
+    HANDLE out = GetStdHandle(STD_OUTPUT_HANDLE);
+    if ((out == NULL || out == INVALID_HANDLE_VALUE) && AttachConsole(ATTACH_PARENT_PROCESS)) {
+        freopen("CONOUT$", "w", stdout);
+        freopen("CONOUT$", "w", stderr);
+    }
+    setvbuf(stdout, NULL, _IONBF, 0);
+}
+
+int main(int argc, char *argv[]) {
+    if (argc >= 2 && !strcmp(argv[1], "--engine")) {
+        attach_console_if_any();
+        argv[1] = argv[0];
+        return gdpi_main(argc - 1, argv + 1);
+    }
+    if (argc >= 2 && (!strcmp(argv[1], "--help") || !strcmp(argv[1], "-h") || !strcmp(argv[1], "/?"))) {
+        MessageBoxW(NULL,
+            L"TurkishDPI " TURKISHDPI_VERSION_W L"\n\n"
+            L"TurkishDPI.exe                 Uygulama (otomatik mod)\n"
+            L"TurkishDPI.exe --tray          Sessiz başlat (Windows açılışında)\n"
+            L"TurkishDPI.exe --engine [ARG]  Sadece motoru GoodbyeDPI argümanlarıyla çalıştır\n"
+            L"TurkishDPI.exe -9 --dns-addr … GoodbyeDPI ile birebir uyumlu kullanım\n\n"
+            L"Ayarlar: %ProgramData%\\TurkishDPI\\TurkishDPI.ini",
+            L"TurkishDPI", MB_ICONINFORMATION);
+        return 0;
+    }
+    if (argc >= 2 && argv[1][0] == '-' && strcmp(argv[1], "--tray") != 0) {
+        attach_console_if_any();
+        return gdpi_main(argc, argv);
+    }
+    return app_main(argc >= 2 && !strcmp(argv[1], "--tray"));
+}

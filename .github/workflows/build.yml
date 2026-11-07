@@ -1,0 +1,77 @@
+name: Build
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  WINDIVERT_URL: https://github.com/basil00/WinDivert/releases/download/v2.2.2/WinDivert-2.2.2-A.zip
+  WINDIVERT_SHA256: 63cb41763bb4b20f600b6de04e991a9c2be73279e317d4d82f237b150c5f3f15
+  WINDIVERT_DIR: WinDivert-2.2.2-A
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install MinGW-w64
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends gcc-mingw-w64 zip
+
+      - name: Download WinDivert
+        run: |
+          curl -sSL -o windivert.zip "$WINDIVERT_URL"
+          echo "$WINDIVERT_SHA256  windivert.zip" | sha256sum -c
+          unzip -q windivert.zip
+
+      - name: Build
+        run: |
+          for a in x86_64 i686; do
+            make ARCH=$a WINDIVERT=$WINDIVERT_DIR OUT=build/$a -j4
+            make ARCH=$a WINDIVERT=$WINDIVERT_DIR OUT=build/$a-single EMBED=1 -j4
+          done
+
+      - name: Build tests
+        run: |
+          x86_64-w64-mingw32-gcc -O2 -Isrc/engine tests/exclude_test.c src/engine/exclude.c src/engine/utils/getline.c -o build/exclude_test.exe
+          x86_64-w64-mingw32-gcc -O2 -Isrc/app tests/probe_test.c src/app/probe.c -lws2_32 -lwinhttp -o build/probe_test.exe
+
+      - name: Package
+        run: |
+          V="${GITHUB_REF_NAME}"; [[ "$GITHUB_REF" == refs/tags/* ]] || V="dev-${GITHUB_SHA::7}"
+          mkdir -p dist
+          # Single-file builds (WinDivert embedded)
+          cp build/x86_64-single/TurkishDPI.exe dist/TurkishDPI.exe
+          cp build/i686-single/TurkishDPI.exe   dist/TurkishDPI-x86.exe
+          # Classic zip builds (exe + WinDivert files side by side)
+          for a in x86_64 i686; do
+            w=x64; [ $a = i686 ] && w=x86
+            d=TurkishDPI-$V-$w
+            mkdir -p pkg/$d
+            cp build/$a/TurkishDPI.exe pkg/$d/
+            cp $WINDIVERT_DIR/$w/WinDivert.dll $WINDIVERT_DIR/$w/WinDivert*.sys pkg/$d/
+            cp LICENSE NOTICE pkg/$d/
+            cp $WINDIVERT_DIR/LICENSE pkg/$d/WinDivert-LICENSE.txt
+            cp docs/BENIOKU.txt pkg/$d/
+            (cd pkg && zip -qr ../dist/$d.zip $d)
+          done
+          (cd dist && sha256sum * > SHA256SUMS.txt)
+          ls -la dist
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: TurkishDPI
+          path: dist/*
+
+      - name: Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          generate_release_notes: true

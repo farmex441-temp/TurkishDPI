@@ -1,0 +1,31 @@
+TurkishDPI - Otomatik DPI atlatma aracı
+=======================================
+
+KULLANIM
+1) TurkishDPI.exe dosyasına çift tıklayın ve yönetici iznini onaylayın.
+2) TurkishDPI penceresi açılır ve sizin için en uygun ayarı (profili)
+   kendisi bulur. Hiçbir şey yapmanıza gerek yoktur. Her ağı ayrı
+   öğrenir; bir dahaki sefere doğru profili ilk denemede seçer.
+   Pencereyi kapatınca saatin yanındaki simgede çalışmaya devam eder.
+3) Açılmayan bir site olursa pencereye yazıp "Test et" deyin; uygulama
+   o siteyi açan profili kendisi arar.
+4) Banka ve ödeme sitelerinin (3D Secure dahil) trafiğine dokunulmaz
+   ("Ödeme ve banka koruması", varsayılan olarak açık).
+5) Pencerede ve simge menüsünde:
+   - Otomatik mod   : Çalışan profili otomatik bulur (önerilir)
+   - Profil seç     : Profili elle seçmek için
+   - Yeniden tara   : Profilleri baştan dener
+   - Duraklat       : DPI atlatmayı geçici olarak kapatır
+   - Windows ile başlat : Bilgisayar açıldığında otomatik çalıştırır
+   - Günlüğü aç     : Sorun giderme kayıtları
+
+ÖNEMLİ
+- WinDivert.dll ve WinDivert64.sys dosyaları TurkishDPI.exe ile aynı
+  klasörde durmalıdır (tek dosyalık sürümde bunlar exe'nin içindedir).
+- Bazı antivirüsler WinDivert'i "HackTool/RiskWare" olarak işaretler; bu
+  bir yanlış alarmdır. Klasörü istisnalara ekleyin. Kaspersky kullanıyorsanız
+  tamamen kaldırmanız gerekebilir.
+- Eski GoodbyeDPI hizmeti kuruluysa TurkishDPI bunu fark eder ve
+  kaldırmayı önerir.
+
+Ayarlar ve günlük: C:\ProgramData\TurkishDPI\
