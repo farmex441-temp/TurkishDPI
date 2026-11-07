@@ -9,6 +9,8 @@
  *
  * "{DNS}" is replaced at run time with the DNS redirection arguments of the
  * resolver that the auto-detector found reachable (see probe.c).
+ * Every preset blocks QUIC (-q) so browsers fall back to TCP, where the
+ * tricks apply: this is what makes them work on all sites (YouTube, Google...).
  * Order matters: the auto-detector tries them top to bottom, so the most
  * widely working / lightest presets come first.
  */
@@ -21,15 +23,15 @@ typedef struct {
 } preset_t;
 
 static const preset_t PRESETS[] = {
-    { L"Türkiye Standart (-5, TTL 5, DNS)",      "-5 --set-ttl 5 {DNS}" },
+    { L"Türkiye Standart (-5, TTL 5, DNS)",      "-5 -q --set-ttl 5 {DNS}" },
     { L"Modern (-9, DNS)",                        "-9 {DNS}" },
-    { L"Auto-TTL (-5, DNS)",                      "-5 {DNS}" },
-    { L"Sabit TTL 3 (DNS)",                       "--set-ttl 3 {DNS}" },
+    { L"Auto-TTL (-5, DNS)",                      "-5 -q {DNS}" },
+    { L"Sabit TTL 3 (DNS)",                       "-q --set-ttl 3 {DNS}" },
     { L"SNI Parçalama + Sahte SNI (DNS)",         "-9 --frag-by-sni --fake-with-sni www.google.com {DNS}" },
     { L"Agresif SNI (DNS, 2x sahte paket)",       "-9 --frag-by-sni --fake-with-sni www.google.com --fake-resend 2 --auto-ttl {DNS}" },
-    { L"Superonline (-5)",                        "-5" },
+    { L"Superonline (-5)",                        "-5 -q" },
     { L"Superonline (-9)",                        "-9" },
-    { L"Superonline (TTL 3)",                     "--set-ttl 3" },
+    { L"Superonline (TTL 3)",                     "-q --set-ttl 3" },
     { L"Superonline SNI Parçalama",               "-9 --frag-by-sni --fake-with-sni www.google.com" },
 };
 #define PRESET_COUNT ((int)(sizeof(PRESETS) / sizeof(PRESETS[0])))

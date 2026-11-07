@@ -33,6 +33,12 @@ typedef struct {
     int learned;                /* presets with history on this net */
     wchar_t site_result[160];   /* result of the last site test   */
     DWORD started_tick;         /* when the current preset started */
+    /* live engine counters */
+    unsigned long st_packets, st_https, st_http, st_excluded, st_dns;
+    /* notices shown as a banner */
+    wchar_t rival[48];          /* another bypass/VPN tool running     */
+    int proxy_broken;           /* system proxy points at nothing      */
+    wchar_t update_tag[32];     /* newer release available             */
 } ui_state_t;
 
 /* app.c */
@@ -47,6 +53,8 @@ void autostart_set(int on);
 void app_exit(void);
 void set_payment_protect(int on);
 void app_network_event(void);
+void app_repair_proxy(void);
+void app_uninstall(void);
 
 /* ui.c */
 int  ui_init(HINSTANCE inst);

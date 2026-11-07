@@ -20,7 +20,13 @@
 - **Akıllı motor:** Her ağı (modem/Wi-Fi) ayrı tanır ve o ağda hangi profilin ne kadar başarılı ve hızlı olduğunu **öğrenir**. Bilinen bir ağa bağlandığınızda doğru profili ilk denemede seçer; yeni bir ağda en hızlı çalışanı ölçerek bulur. ISS engeli değiştirirse eski bilgiyi yavaşça unutup yeniden öğrenir.
 - **Site testi ve onarımı:** Açılmayan bir siteyi yazın; TurkishDPI önce test eder, engelliyse o siteyi açan profili kendisi bulur ve siteyi izleme listesine ekler.
 - **Ödeme koruması:** 100'den fazla banka, kart, 3D Secure ve ödeme sistemi alan adının (Garanti, İş Bankası, Akbank, Ziraat, Papara, iyzico, PayTR, PayPal, Stripe, Visa, Mastercard…) trafiğine **hiç dokunulmaz**. Böylece ödeme ve 3D Secure adımları etkilenmez. İsterseniz `--exclude dosya.txt` ile kendi listenizi ekleyebilirsiniz.
-- **Tüm siteler:** Motor, yalnızca belirli siteleri değil 80/443 portundaki tüm HTTP/HTTPS bağlantılarını işler (QUIC/HTTP3 engellenerek TCP'ye düşürülür).
+- **Tüm siteler:** Motor, yalnızca belirli siteleri değil 80/443 portundaki tüm HTTP/HTTPS bağlantılarını işler. Tüm profillerde QUIC/HTTP3 engellenir, böylece YouTube/Google gibi QUIC kullanan siteler de TCP'ye düşüp atlatmadan geçer.
+- **Sahte DNS filtresi:** Engel sayfasına, sinkhole'a veya özel ağ adreslerine yönlendiren sahte DNS cevapları veren sunucular otomatik elenir; yalnızca gerçek cevap veren DNS kullanılır.
+- **Canlı istatistik:** İşlenen paket, HTTPS/HTTP/DNS işlemleri ve atlanan ödeme bağlantıları pencerede anlık görünür.
+- **Otopilot kontrolleri (Shroudly'den):** Aynı anda çalışan başka bir DPI/VPN aracı (GoodbyeDPI, zapret, ByeDPI, Shroudly, WARP, v2rayN…) varsa uyarır; Windows proxy ayarı kapanmış bir programı gösteriyorsa (eski ByeDPI/proxy araçlarından kalan) tek tıkla onarır.
+- **Güncelleme bildirimi:** Yeni sürüm çıktığında pencerede bildirir.
+- **Temiz kaldırma:** *Ayarlar → Kaldır ve temizle* başlangıç görevini, ayarları, günlüğü ve WinDivert sürücüsünü siler.
+- **Kendi kendini test:** `TurkishDPI.exe --selftest` tarar, ödeme sitelerinin dokunulmadan geçtiğini doğrular, sonucu günlüğe yazıp kapanır.
 
 > **Not:** DPI atlatma; SNI/Host incelemesi ve DNS ile yapılan engelleri aşar. Bir sitenin **IP adresi** engellenmişse veya site Türkiye'ye kendisi hizmet vermiyorsa hiçbir DPI aracı (VPN olmadan) bunu aşamaz – TurkishDPI bu durumu site testinde size söyler.
 
@@ -104,7 +110,7 @@ Eski GoodbyeDPI `.cmd` betiklerinde `goodbyedpi.exe` yerine `TurkishDPI.exe` yaz
 
 ## Sorun giderme
 
-- **Antivirüs uyarısı:** WinDivert sürücüsü bazı antivirüslerce "HackTool" olarak işaretlenir (yanlış alarm). Klasörü / `C:\ProgramData\TurkishDPI\bin` dizinini istisnalara ekleyin.
+- **Antivirüs:** Windows Defender'ın işaretlediği şey WinDivert'in resmi zip arşivindeki örnek araçlardır; TurkishDPI bu arşivi dağıtmaz, yalnızca imzalı `WinDivert.dll` ve sürücüyü içerir (Defender taramasında temiz). Başka bir antivirüs engellerse uygulamadaki *Ayarlar → Antivirüs sorunu yardımı* adım adım yol gösterir; TurkishDPI hiçbir zaman antivirüs ayarlarınızı kendisi değiştirmez.
 - **Kaspersky:** GoodbyeDPI'ı engeller; tamamen kaldırılması gerekir.
 - **Eski GoodbyeDPI / zapret hizmeti:** TurkishDPI açılışta tespit eder ve kaldırmayı önerir.
 - Ayrıntılı kayıt: menüden **Günlüğü aç**.

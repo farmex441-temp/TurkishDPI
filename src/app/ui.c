@@ -74,11 +74,13 @@ static NOTIFYICONDATAW g_nid;
 static WNDPROC g_edit_proc;
 int g_payment_domains = 100;
 
-enum { HIT_NONE, HIT_POWER, HIT_RESCAN, HIT_PROFILE, HIT_SETTINGS, HIT_TEST };
+enum { HIT_NONE, HIT_POWER, HIT_RESCAN, HIT_PROFILE, HIT_SETTINGS, HIT_TEST, HIT_BANNER };
 enum { IDM_AUTO = 1000, IDM_AUTOSTART, IDM_PAYMENT, IDM_LOG, IDM_INI, IDM_GITHUB,
-       IDM_EXIT, IDM_SHOW, IDM_PAUSE, IDM_RESCAN, IDM_PRESET = 1100 };
+       IDM_EXIT, IDM_SHOW, IDM_PAUSE, IDM_RESCAN, IDM_UNINSTALL, IDM_AVHELP, IDM_PROXY,
+       IDM_UPDATE, IDM_PRESET = 1100 };
 
-static RECT r_power, r_rescan, r_profile, r_settings, r_test, r_edit;
+static RECT r_power, r_rescan, r_profile, r_settings, r_test, r_edit, r_banner;
+static int g_banner_kind;   /* 0 none, 1 update, 2 proxy, 3 rival, 4 antivirus */
 
 #define BASE_W 440
 #define BASE_H 734
@@ -168,6 +170,7 @@ static void fonts_create(void) {
 
 static void layout(void) {
     r_power = rc(BASE_W / 2 - 66, 92, 132, 132);
+    r_banner = rc(20, 66, 400, 24);
     r_edit = rc(32, 584, 280, 30);
     r_test = rc(328, 580, 92, 38);
     r_rescan = rc(20, 650, 128, 40);
@@ -198,6 +201,8 @@ static void paint(HDC dc, RECT client) {
     EnterCriticalSection(&g_lock);
     st = g_ui;
     LeaveCriticalSection(&g_lock);
+    g_banner_kind = st.kind == ST_ERROR && wcsstr(st.status, L"Sürücü") ? 4
+                  : st.proxy_broken ? 2 : st.rival[0] ? 3 : st.update_tag[0] ? 1 : 0;
 
     FillRect(dc, &client, bg);
     DeleteObject(bg);
@@ -272,6 +277,13 @@ static void paint(HDC dc, RECT client) {
     draw_button(g, r_rescan, g_hover == HIT_RESCAN, 0);
     draw_button(g, r_profile, g_hover == HIT_PROFILE, 0);
     draw_button(g, r_settings, g_hover == HIT_SETTINGS, 0);
+    /* notice banner */
+    if (g_banner_kind) {
+        DWORD bc = g_banner_kind == 1 ? ARGB(255, 0x1E, 0x3A, 0x8A)
+                 : g_banner_kind == 2 ? ARGB(255, 0x78, 0x35, 0x0F)
+                 : ARGB(255, 0x7F, 0x1D, 0x1D);
+        fill_round(g, r_banner, 8, g_hover == HIT_BANNER ? (bc | 0xFF000000) + 0x00101010 : bc, 0);
+    }
     /* payment shield dot */
     GdipCreateSolidFill(g_payment_protect ? ARGB(255, 0x22, 0xC5, 0x5E) : ARGB(255, 0xF5, 0xB0, 0x14), &b);
     GdipFillEllipse(g, b, SF(24), SF(707), SF(8), SF(8));
@@ -330,6 +342,24 @@ static void paint(HDC dc, RECT client) {
     if (!st.ntargets)
         text(dc, f_small, C_SUB, rc(36, 430, 368, 18), L"Test sitesi yok", DT_LEFT | DT_SINGLELINE);
 
+    /* live engine counters */
+    if (st.st_packets) {
+        swprintf(buf, 160, L"%lu paket · %lu HTTPS · %lu HTTP · %lu DNS · %lu ödeme atlandı",
+                 st.st_packets, st.st_https, st.st_http, st.st_dns, st.st_excluded);
+        text(dc, f_label, C_FAINT, rc(36, 546, 368, 14), buf, DT_LEFT | DT_SINGLELINE | DT_END_ELLIPSIS);
+    }
+    /* banner text */
+    if (g_banner_kind) {
+        if (g_banner_kind == 1)
+            swprintf(buf, 160, L"Yeni sürüm hazır: %ls – indirmek için tıklayın", st.update_tag);
+        else if (g_banner_kind == 2)
+            wcscpy(buf, L"Sistem proxy'si kapalı bir programı gösteriyor – onarmak için tıklayın");
+        else if (g_banner_kind == 3)
+            swprintf(buf, 160, L"%ls çalışıyor – çakışmayı önlemek için kapatın", st.rival);
+        else
+            wcscpy(buf, L"Antivirüs sürücüyü engelledi – çözüm için tıklayın");
+        text(dc, f_small, RGB(255, 255, 255), r_banner, buf, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+    }
     text(dc, f_value, RGB(255, 255, 255), r_test, L"Test et", DT_CENTER | DT_VCENTER | DT_SINGLELINE);
     text(dc, f_small, C_SUB, rc(20, 622, 400, 18),
          st.site_result[0] ? st.site_result : L"Açılmayan bir siteyi yazın; TurkishDPI çözümü kendisi arasın.",
@@ -412,8 +442,10 @@ static void settings_menu(void) {
     AppendMenuW(m, MF_SEPARATOR, 0, NULL);
     AppendMenuW(m, MF_STRING, IDM_LOG, L"Günlüğü aç");
     AppendMenuW(m, MF_STRING, IDM_INI, L"Gelişmiş ayarlar (ini)");
+    AppendMenuW(m, MF_STRING, IDM_AVHELP, L"Antivirüs sorunu yardımı");
     AppendMenuW(m, MF_STRING, IDM_GITHUB, L"GitHub sayfası");
     AppendMenuW(m, MF_SEPARATOR, 0, NULL);
+    AppendMenuW(m, MF_STRING, IDM_UNINSTALL, L"Kaldır ve temizle…");
     AppendMenuW(m, MF_STRING, IDM_EXIT, L"Çıkış");
     ClientToScreen(g_wnd, &p);
     popup(m, p.x, p.y);
@@ -451,6 +483,7 @@ static int hit(int x, int y) {
     if (PtInRect(&r_profile, p)) return HIT_PROFILE;
     if (PtInRect(&r_settings, p)) return HIT_SETTINGS;
     if (PtInRect(&r_test, p)) return HIT_TEST;
+    if (g_banner_kind && PtInRect(&r_banner, p)) return HIT_BANNER;
     return HIT_NONE;
 }
 
@@ -466,6 +499,8 @@ static LRESULT CALLBACK edit_proc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
     return CallWindowProcW(g_edit_proc, h, msg, wp, lp);
 }
 
+static void command(int id);
+
 static void click(int id) {
     switch (id) {
     case HIT_POWER:    post_cmd(g_paused ? CMD_RESUME : CMD_PAUSE, 0); break;
@@ -473,6 +508,10 @@ static void click(int id) {
     case HIT_PROFILE:  profile_menu(); break;
     case HIT_SETTINGS: settings_menu(); break;
     case HIT_TEST:     do_site_test(); break;
+    case HIT_BANNER:
+        command(g_banner_kind == 1 ? IDM_UPDATE : g_banner_kind == 2 ? IDM_PROXY
+              : g_banner_kind == 4 ? IDM_AVHELP : 0);
+        break;
     }
 }
 
@@ -499,6 +538,33 @@ static void command(int id) {
     case IDM_INI:       ShellExecuteW(NULL, L"open", L"notepad.exe", g_ini, NULL, SW_SHOWNORMAL); break;
     case IDM_GITHUB:    ShellExecuteW(NULL, L"open", TURKISHDPI_URL, NULL, NULL, SW_SHOWNORMAL); break;
     case IDM_EXIT:      app_exit(); break;
+    case IDM_UPDATE:    ShellExecuteW(NULL, L"open", TURKISHDPI_RELEASES_URL, NULL, NULL, SW_SHOWNORMAL); break;
+    case IDM_PROXY:
+        if (MessageBoxW(g_wnd, L"Windows'un proxy ayarı bu bilgisayarda artık çalışmayan bir programı "
+                               L"gösteriyor (eski bir DPI/proxy aracı). Bu yüzden bazı programlar internete "
+                               L"çıkamaz.\n\nProxy kapatılsın mı? (Adres silinmez, isterseniz geri açabilirsiniz.)",
+                        L"TurkishDPI", MB_YESNO | MB_ICONQUESTION) == IDYES)
+            app_repair_proxy();
+        break;
+    case IDM_AVHELP:
+        MessageBoxW(g_wnd,
+            L"TurkishDPI, paketleri işlemek için imzalı WinDivert sürücüsünü kullanır. Bazı antivirüsler "
+            L"bunu yanlışlıkla engelleyebilir.\n\n"
+            L"1) Windows Güvenliği > Virüs ve tehdit koruması > Koruma geçmişi'nde TurkishDPI ile ilgili "
+            L"bir kayıt varsa 'Geri yükle' deyin.\n"
+            L"2) Aynı yerde Ayarları yönet > Dışlamalar > Klasör olarak şunları ekleyin:\n"
+            L"     C:\\ProgramData\\TurkishDPI\n"
+            L"     TurkishDPI.exe'nin bulunduğu klasör\n"
+            L"3) Kaspersky kullanıyorsanız kaldırmanız gerekebilir.\n\n"
+            L"Tamam'a basınca Windows Güvenliği açılır.", L"Antivirüs yardımı", MB_ICONINFORMATION);
+        ShellExecuteW(NULL, L"open", L"windowsdefender://threat", NULL, NULL, SW_SHOWNORMAL);
+        break;
+    case IDM_UNINSTALL:
+        if (MessageBoxW(g_wnd, L"TurkishDPI durdurulacak; Windows başlangıç görevi, ayarlar, öğrenilen "
+                               L"bilgiler, günlük ve WinDivert sürücüsü kaldırılacak.\n\nDevam edilsin mi?",
+                        L"Kaldır ve temizle", MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2) == IDYES)
+            app_uninstall();
+        break;
     case IDM_SHOW:      ui_show(); break;
     case IDM_PAUSE:     post_cmd(g_paused ? CMD_RESUME : CMD_PAUSE, 0); break;
     case IDM_RESCAN:    post_cmd(CMD_RESCAN, 0); break;

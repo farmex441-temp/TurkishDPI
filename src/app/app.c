@@ -28,6 +28,7 @@
 #include "app.h"
 #include "presets.h"
 #include "version.h"
+#include "system.h"
 
 int gdpi_main(int argc, char *argv[]);
 
@@ -43,6 +44,8 @@ static volatile LONG g_cmd = CMD_NONE, g_cmd_arg = 0;
 static wchar_t g_site_req[256];
 static int g_dns = 0, g_running_preset = -1, g_quiet_start = 0;
 static int g_watchdog_min = 10;
+static int g_selftest = 0;        /* --selftest: scan, verify, log, exit */
+static wchar_t g_rival_notified[48];
 
 static PROCESS_INFORMATION g_engine;
 static HANDLE g_engine_active;
@@ -230,10 +233,24 @@ static DWORD WINAPI engine_reader(LPVOID p) {
     size_t ll = 0;
     DWORD n;
     while (ReadFile(pipe, buf, sizeof(buf), &n, NULL) && n) {
-        log_write(buf, n);
+        if (!(n > 6 && !memcmp(buf, "STATS ", 6)))   /* keep the log readable */
+            log_write(buf, n);
         for (DWORD i = 0; i < n; i++) {
             if (buf[i] == '\n' || ll == sizeof(line) - 1) {
                 line[ll] = 0;
+                if (!strncmp(line, "STATS ", 6)) {
+                    unsigned long a = 0, b = 0, c = 0, d = 0, e = 0;
+                    if (sscanf(line + 6, "packets=%lu https=%lu http=%lu excluded=%lu dns=%lu",
+                               &a, &b, &c, &d, &e) == 5) {
+                        EnterCriticalSection(&g_lock);
+                        g_ui.st_packets = a; g_ui.st_https = b; g_ui.st_http = c;
+                        g_ui.st_excluded = d; g_ui.st_dns = e;
+                        LeaveCriticalSection(&g_lock);
+                        ui_refresh();
+                    }
+                    ll = 0;
+                    continue;
+                }
                 if (strstr(line, "Filter activated"))
                     SetEvent(g_engine_active);
                 else if (!strncmp(line, "Error opening filter: ", 22))
@@ -293,6 +310,9 @@ static int engine_start(int preset, int dns) {
 
     ResetEvent(g_engine_active);
     InterlockedExchange(&g_engine_err, 0);
+    EnterCriticalSection(&g_lock);
+    g_ui.st_packets = g_ui.st_https = g_ui.st_http = g_ui.st_excluded = g_ui.st_dns = 0;
+    LeaveCriticalSection(&g_lock);
     if (!CreateProcessW(g_exe, cmd, NULL, NULL, TRUE,
                         CREATE_NO_WINDOW | CREATE_SUSPENDED | ABOVE_NORMAL_PRIORITY_CLASS,
                         NULL, g_dir, &si, &pi)) {
@@ -398,6 +418,100 @@ static void announce(int p, int score) {
     g_quiet_start = 0;
 }
 
+/* Autopilot-style checks of the rest of the system (cheap, run per scan). */
+static void system_checks(void) {
+    wchar_t rival[48] = L"";
+    int broken;
+    sys_find_rival(rival, 48);
+    broken = sys_proxy_broken();
+    EnterCriticalSection(&g_lock);
+    wcscpy(g_ui.rival, rival);
+    g_ui.proxy_broken = broken;
+    LeaveCriticalSection(&g_lock);
+    if (rival[0] && wcscmp(rival, g_rival_notified) != 0) {
+        wchar_t msg[200];
+        swprintf(msg, 200, L"%ls çalışıyor. İki araç aynı bağlantıları değiştirirse siteler açılmaz; "
+                           L"%ls'ı kapatın.", rival, rival);
+        notify(L"Çakışan program", msg);
+        wcscpy(g_rival_notified, rival);
+        log_line("rival tool running");
+    }
+    if (broken) log_line("system proxy points at a dead local port");
+    ui_refresh();
+}
+
+void app_repair_proxy(void) {
+    if (sys_proxy_repair()) {
+        log_line("system proxy switched off (was pointing at nothing)");
+        EnterCriticalSection(&g_lock);
+        g_ui.proxy_broken = 0;
+        LeaveCriticalSection(&g_lock);
+        ui_refresh();
+    }
+}
+
+void app_uninstall(void) {
+    NOTIFYICONDATAW n;
+    ZeroMemory(&n, sizeof(n));
+    n.cbSize = sizeof(n);
+    n.hWnd = ui_hwnd();
+    n.uID = 1;
+    Shell_NotifyIconW(NIM_DELETE, &n);
+    engine_stop();
+    if (autostart_enabled()) autostart_set(0);
+    Sleep(500);
+    sys_uninstall(g_dir);
+    probe_flush_dns_cache();
+    MessageBoxW(NULL, L"TurkishDPI kaldırıldı: başlangıç görevi, ayarlar, günlük ve sürücü silindi.\n"
+                      L"Son olarak TurkishDPI.exe dosyasını silebilirsiniz.", L"TurkishDPI",
+                MB_ICONINFORMATION);
+    ExitProcess(0);
+}
+
+static DWORD WINAPI update_thread(LPVOID u) {
+    (void)u;
+    Sleep(20000);   /* do not compete with the first scan */
+    for (;;) {
+        wchar_t tag[32];
+        if (sys_check_update(tag, 32)) {
+            EnterCriticalSection(&g_lock);
+            wcscpy(g_ui.update_tag, tag);
+            LeaveCriticalSection(&g_lock);
+            ui_refresh();
+            log_line("update available");
+            return 0;
+        }
+        Sleep(24u * 3600u * 1000u);
+    }
+}
+
+/* --selftest: verifies the running preset, payment pass-through and logs a verdict. */
+static void selftest_finish(void) {
+    static const wchar_t *pay[] = { L"www.paypal.com", L"www.garantibbva.com.tr", L"www.iyzico.com" };
+    int pok[3], score, ms = -1;
+    unsigned long ex0, ex1;
+    Sleep(1500);
+    score = g_ntargets ? targets_score(&ms) : 0;
+    EnterCriticalSection(&g_lock);
+    ex0 = g_ui.st_excluded;
+    LeaveCriticalSection(&g_lock);
+    probe_flush_dns_cache();
+    probe_https_many(pay, 3, 8000, pok, NULL);
+    Sleep(3500);   /* let the engine report its counters */
+    EnterCriticalSection(&g_lock);
+    ex1 = g_ui.st_excluded;
+    LeaveCriticalSection(&g_lock);
+    log_line("SELFTEST state=%d preset=%d targets=%d/%d avg_ms=%d engine_alive=%d",
+             (int)g_ui.kind, g_running_preset, score, g_ntargets, ms, engine_alive());
+    log_line("SELFTEST payment paypal=%d garanti=%d iyzico=%d excluded_before=%lu excluded_after=%lu",
+             pok[0], pok[1], pok[2], ex0, ex1);
+    log_line("SELFTEST stats packets=%lu https=%lu http=%lu dns=%lu",
+             g_ui.st_packets, g_ui.st_https, g_ui.st_http, g_ui.st_dns);
+    log_line("SELFTEST %s", (g_ui.kind == ST_ACTIVE || g_ui.kind == ST_STANDBY) &&
+                            pok[0] + pok[1] + pok[2] == 3 ? "PASS" : "CHECK");
+    app_exit();
+}
+
 static int cmd_pending(void) {
     return InterlockedCompareExchange(&g_cmd, CMD_NONE, CMD_NONE) != CMD_NONE;
 }
@@ -419,6 +533,7 @@ static void auto_scan(void) {
     engine_stop();
     probe_flush_dns_cache();
     smart_network_changed();
+    system_checks();
 
     if (!control_ok()) {
         set_state(ST_OFFLINE, L"İnternet bağlantısı yok", L"Bağlantı gelince otomatik başlayacak");
@@ -588,6 +703,7 @@ static DWORD WINAPI controller(LPVOID unused) {
 
     smart_network_changed();
     if (g_auto) auto_scan(); else manual_start(g_preset);
+    if (g_selftest) selftest_finish();
 
     for (;;) {
         HANDLE w[3];
@@ -653,6 +769,7 @@ static DWORD WINAPI controller(LPVOID unused) {
             continue;
         }
         /* watchdog */
+        system_checks();
         if (!health_ok()) {
             log_line("watchdog: health check failed");
             if (control_ok()) { if (g_auto) auto_scan(); else manual_start(g_preset); }
@@ -815,12 +932,16 @@ static int app_main(int quiet) {
     g_net_event = CreateEventW(NULL, TRUE, FALSE, NULL);
     g_engine_active = CreateEventW(NULL, TRUE, FALSE, NULL);
 
-    check_conflicts();
+    if (!g_selftest) check_conflicts();
     if (!ui_init(GetModuleHandleW(NULL))) return 1;
     if (!quiet) ui_show();
 
     t = CreateThread(NULL, 256 * 1024, controller, NULL, STACK_SIZE_PARAM_IS_A_RESERVATION, NULL);
     if (t) CloseHandle(t);
+    if (!g_selftest && ini_int(L"CheckUpdates", 1)) {
+        t = CreateThread(NULL, 64 * 1024, update_thread, NULL, STACK_SIZE_PARAM_IS_A_RESERVATION, NULL);
+        if (t) CloseHandle(t);
+    }
 
     while (GetMessageW(&m, NULL, 0, 0) > 0) {
         if (!IsDialogMessageW(ui_hwnd(), &m)) {
@@ -863,6 +984,10 @@ int main(int argc, char *argv[]) {
             L"Ayarlar: %ProgramData%\\TurkishDPI\\TurkishDPI.ini",
             L"TurkishDPI", MB_ICONINFORMATION);
         return 0;
+    }
+    if (argc >= 2 && !strcmp(argv[1], "--selftest")) {
+        g_selftest = 1;
+        return app_main(1);
     }
     if (argc >= 2 && argv[1][0] == '-' && strcmp(argv[1], "--tray") != 0) {
         attach_console_if_any();

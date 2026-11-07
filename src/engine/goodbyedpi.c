@@ -160,6 +160,24 @@ enum ERROR_CODE{
 };
 
 static int running_from_service = 0;
+
+/* Live counters, reported to the TurkishDPI app as "STATS ..." lines. */
+static struct {
+    unsigned long packets, https, http, excluded, dns;
+    unsigned long last_report_tick;
+    unsigned long reported_packets;
+} stats;
+
+static void stats_maybe_report(void) {
+    unsigned long now = GetTickCount();
+    if (now - stats.last_report_tick < 3000 || stats.packets == stats.reported_packets)
+        return;
+    stats.last_report_tick = now;
+    stats.reported_packets = stats.packets;
+    printf("STATS packets=%lu https=%lu http=%lu excluded=%lu dns=%lu\n",
+           stats.packets, stats.https, stats.http, stats.excluded, stats.dns);
+    fflush(stdout);
+}
 static int exiting = 0;
 static HANDLE filters[MAX_FILTERS];
 static int filter_num = 0;
@@ -1210,6 +1228,8 @@ int gdpi_main(int argc, char *argv[]) {
 
     while (1) {
         if (WinDivertRecv(w_filter, packet, sizeof(packet), &packetLen, &addr)) {
+            stats.packets++;
+            stats_maybe_report();
             debug("Got %s packet, len=%d!\n", addr.Outbound ? "outbound" : "inbound",
                    packetLen);
             should_reinject = 1;
@@ -1307,6 +1327,7 @@ int gdpi_main(int argc, char *argv[]) {
                         if (sni_ok && exclude_check_hostname(host_addr, host_len)) {
                             /* payment / bank: leave the connection untouched */
                             sni_ok = 0;
+                            stats.excluded++;
                         }
                         else if (
                              (do_blacklist && sni_ok &&
@@ -1323,6 +1344,7 @@ int gdpi_main(int argc, char *argv[]) {
                             memcpy(lsni, host_addr, host_len);
                             printf("Blocked HTTPS website SNI: %s\n", lsni);
 #endif
+                            stats.https++;
                             if (do_fake_packet) {
                                 TCP_HANDLE_OUTGOING_FAKE_PACKET(send_fake_https_request);
                             }
@@ -1354,6 +1376,7 @@ int gdpi_main(int argc, char *argv[]) {
                     {
                         host_addr = hdr_value_addr;
                         host_len = hdr_value_len;
+                        stats.http++;
 #ifdef DEBUG
                         char lhost[HOST_MAXLEN + 1] = {0};
                         memcpy(lhost, host_addr, host_len);
@@ -1572,6 +1595,7 @@ int gdpi_main(int argc, char *argv[]) {
                             ipv6_copy_addr(ppIpV6Hdr->DstAddr, (uint32_t*)dnsv6_addr.s6_addr);
                             ppUdpHdr->DstPort = dnsv6_port;
                         }
+                        stats.dns++;
                         should_recalc_checksum = 1;
                     }
                     else {

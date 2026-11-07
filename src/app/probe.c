@@ -132,6 +132,60 @@ static int dns_build_query(unsigned char *buf, size_t cap, const char *name, uns
     return (int)pos;
 }
 
+/* Addresses that a real site never resolves to: forged/sinkhole answers. */
+static int bogus_ipv4(const unsigned char *a) {
+    static const unsigned char block_pages[][4] = {
+        { 195, 175, 254, 2 },     /* BTK / Turk Telekom block page */
+        { 193, 192, 98, 43 },
+    };
+    if (a[0] == 0 || a[0] == 127 || a[0] == 10 || a[0] >= 224) return 1;
+    if (a[0] == 192 && a[1] == 168) return 1;
+    if (a[0] == 172 && a[1] >= 16 && a[1] <= 31) return 1;
+    if (a[0] == 169 && a[1] == 254) return 1;
+    for (size_t i = 0; i < sizeof(block_pages) / sizeof(block_pages[0]); i++)
+        if (!memcmp(a, block_pages[i], 4)) return 1;
+    return 0;
+}
+
+/* Skips a (possibly compressed) DNS name. Returns new offset or -1. */
+static int dns_skip_name(const unsigned char *m, int len, int off) {
+    while (off < len) {
+        unsigned char l = m[off];
+        if (l == 0) return off + 1;
+        if ((l & 0xC0) == 0xC0) return off + 2 <= len ? off + 2 : -1;
+        off += l + 1;
+    }
+    return -1;
+}
+
+/* 1 if the answer holds at least one A record and none of them is bogus. */
+int dns_answer_ok(const unsigned char *m, int len) {
+    int qd, an, off = 12, good = 0;
+    if (len < 12) return 0;
+    qd = (m[4] << 8) | m[5];
+    an = (m[6] << 8) | m[7];
+    for (int i = 0; i < qd; i++) {
+        off = dns_skip_name(m, len, off);
+        if (off < 0 || off + 4 > len) return 0;
+        off += 4;
+    }
+    for (int i = 0; i < an; i++) {
+        int type, rdlen;
+        off = dns_skip_name(m, len, off);
+        if (off < 0 || off + 10 > len) return 0;
+        type = (m[off] << 8) | m[off + 1];
+        rdlen = (m[off + 8] << 8) | m[off + 9];
+        off += 10;
+        if (off + rdlen > len) return 0;
+        if (type == 1 && rdlen == 4) {
+            if (bogus_ipv4(m + off)) return 0;
+            good = 1;
+        }
+        off += rdlen;
+    }
+    return good;
+}
+
 int probe_dns(const char *server_v4, unsigned short port, const char *name, DWORD timeout_ms) {
     SOCKET s;
     struct sockaddr_in sa;
@@ -162,7 +216,7 @@ int probe_dns(const char *server_v4, unsigned short port, const char *name, DWOR
             a[0] == q[0] && a[1] == q[1] &&     /* same ID */
             (a[2] & 0x80) &&                    /* is a response */
             (a[3] & 0x0F) == 0 &&               /* RCODE NOERROR */
-            ((a[6] << 8) | a[7]) > 0)           /* ANCOUNT > 0 */
+            dns_answer_ok(a, alen))             /* real, non-forged A record */
             ok = 1;
     }
     closesocket(s);
