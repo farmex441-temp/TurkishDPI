@@ -172,5 +172,16 @@ SHA-256 in the workflow.
   controller join on exit, DPI sizing) and engine (exact clean-DNS filter
   clause instead of a port rule, payment IPs learned from clean-resolver
   answers too, built-in block IPs independent of argument order).
-- Pending before final v1.1.0: elevated `--selftest` of the new build and a
-  VirusTotal check of the rc zip (VT shows a CAPTCHA that only the user can solve).
+- v1.1.0-rc3 / v1.1.0: engine STATS from a reporter thread, self-test checks
+  payment exclusion and engine latency, AV hygiene (no long sleeps, BMP icons,
+  symbols kept).
+- Verified on the developer's network (Turkish ISP, DNS block page
+  195.175.254.2) with `--selftest`: blocked targets 3/3, TCP+TLS ~150 ms,
+  fastest clean DNS OpenDNS 42 ms (Yandex 96 ms), payment connections passed
+  untouched (excluded=6), engine overhead ~9 ms (247 vs 238 ms).
+- VirusTotal: release zip 3/68, all three are WinDivert-driver labels
+  (Elastic Rootkit.WinDivert, Kaspersky not-a-virus RiskTool, Lionic
+  Riskware) that every WinDivert-based tool gets. The v1.0 single-file exe was
+  3/55 (embedded driver), rc2's exe 3/71 (ML "dropper"); the rc3 changes
+  target those heuristics. Remaining options are code signing and
+  false-positive reports to the vendors (both need the owner).

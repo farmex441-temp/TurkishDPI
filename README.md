@@ -30,6 +30,16 @@
 
 > **Not:** DPI atlatma; SNI/Host incelemesi ve DNS ile yapılan engelleri aşar. Bir sitenin **IP adresi** engellenmişse veya site Türkiye'ye kendisi hizmet vermiyorsa hiçbir DPI aracı (VPN olmadan) bunu aşamaz – TurkishDPI bu durumu site testinde size söyler.
 
+### Ölçüm sonuçları (v1.1.0, Türk Telekom altyapılı bir ağ, `--selftest`)
+
+| | Sonuç |
+|---|---|
+| Engelli test siteleri (discord, roblox, wattpad) | 3/3 açıldı |
+| Bağlantı kurulum süresi (TCP + TLS) | ~150 ms |
+| Seçilen temiz DNS | OpenDNS 42 ms (Yandex 96 ms idi) |
+| TurkishDPI'ın eklediği gecikme | ~9 ms (motor açık 247 ms, kapalı 238 ms) |
+| Ödeme siteleri (PayPal, Garanti, iyzico) | Açıldı, bağlantılara dokunulmadı |
+
 ## Neden TurkishDPI?
 
 | | GoodbyeDPI-Turkey | Shroudly (masaüstü) | **TurkishDPI** |
