@@ -154,19 +154,48 @@ static HANDLE open_pinned(const wchar_t *path, DWORD *err) {
 }
 #endif
 
-/* 1 if the file at path is the pinned WinDivert file of that name (a file
- * without a pin, or any file in a build without pins, is accepted). Used
- * before the app copies the files into Program Files. */
-int windivert_file_ok(const wchar_t *path) {
+/* 1 if a pin for this WinDivert file name is compiled in. */
+int windivert_file_pinned(const wchar_t *name) {
 #ifdef WD_PINNED
-    DWORD err;
-    HANDLE f = open_pinned(path, &err);
-    if (f == INVALID_HANDLE_VALUE) return 0;
-    CloseHandle(f);
-    return 1;
+    return pin_for(name) != NULL;
 #else
-    (void)path;
+    (void)name;
+    return 0;
+#endif
+}
+
+/* 1 if the open file f (read access) holds the pinned contents for name; a
+ * file without a pin is accepted. Checked on the handle the caller then
+ * copies from, so a check-then-reopen race is impossible. The file pointer
+ * is left at the start. */
+int windivert_handle_ok(HANDLE f, const wchar_t *name) {
+#ifdef WD_PINNED
+    const char *pin = pin_for(name);
+    unsigned char digest[32];
+    LARGE_INTEGER zero;
+    int ok;
+    zero.QuadPart = 0;
+    if (!pin) return 1;
+    if (!SetFilePointerEx(f, zero, NULL, FILE_BEGIN)) return 0;
+    ok = sha256_of_handle(f, digest) && hash_matches(digest, pin);
+    SetFilePointerEx(f, zero, NULL, FILE_BEGIN);
+    return ok;
+#else
+    (void)f; (void)name;
     return 1;
+#endif
+}
+
+/* The driver WinDivert itself will load on this system. */
+static const wchar_t *driver_in_use(void) {
+#ifdef _WIN64
+    return L"WinDivert64.sys";
+#else
+    typedef BOOL (WINAPI *wow_fn)(HANDLE, PBOOL);
+    BOOL wow = FALSE;
+    wow_fn f = (wow_fn)(void *)GetProcAddress(GetModuleHandleW(L"kernel32.dll"), "IsWow64Process");
+    if (f) f(GetCurrentProcess(), &wow);
+    return wow ? L"WinDivert64.sys" : L"WinDivert32.sys";
 #endif
 }
 
@@ -176,25 +205,28 @@ static BOOL CALLBACK wd_load(PINIT_ONCE o, PVOID p, PVOID *c) {
     HMODULE h;
     HANDLE pin = INVALID_HANDLE_VALUE;
     (void)o; (void)p; (void)c;
+    /* a truncated path could name a different (plantable) file */
+    if (n == 0 || n >= MAX_PATH) return TRUE;
     while (n > 0 && path[n - 1] != L'\\') n--;
     if (n == 0 || n + 16 >= MAX_PATH) return TRUE;
 #ifdef WD_PINNED
     {
-        /* Drivers first: checked, then held open (no writes, no deletes) for
-         * the rest of this process, so the file WinDivert installs as a
-         * driver is the one that was checked. A missing driver is left to
-         * WinDivert's own error (2) when it tries to load it. */
-        static HANDLE sys_hold[2] = { INVALID_HANDLE_VALUE, INVALID_HANDLE_VALUE };
-        static const wchar_t *sys_names[2] = { L"WinDivert64.sys", L"WinDivert32.sys" };
-        for (int i = 0; i < 2; i++) {
+        /* The driver WinDivert will install on this system: checked, then
+         * held open (no writes, no deletes) for the rest of this process, so
+         * the file loaded into the kernel is the one that was checked. When
+         * its pin is compiled in it must exist: otherwise it could be planted
+         * between this check and the moment WinDivert installs it. */
+        static HANDLE sys_hold = INVALID_HANDLE_VALUE;
+        const wchar_t *drv = driver_in_use();
+        if (sys_hold == INVALID_HANDLE_VALUE && pin_for(drv)) {
             DWORD err = 0;
-            if (sys_hold[i] != INVALID_HANDLE_VALUE) continue;
-            lstrcpyW(path + n, sys_names[i]);
-            sys_hold[i] = open_pinned(path, &err);
-            if (sys_hold[i] == INVALID_HANDLE_VALUE && err != ERROR_FILE_NOT_FOUND) {
-                /* locked or quarantined by an antivirus, or in use: one clear
-                 * code for the app instead of e.g. "access denied" */
-                wd.err = err == ERROR_FILE_INVALID ? ERROR_FILE_INVALID : ERROR_CANT_ACCESS_FILE;
+            lstrcpyW(path + n, drv);
+            sys_hold = open_pinned(path, &err);
+            if (sys_hold == INVALID_HANDLE_VALUE) {
+                /* missing: WinDivert's own "driver not found" (2); locked or
+                 * quarantined by an antivirus: one clear code (1920) */
+                wd.err = err == ERROR_FILE_NOT_FOUND || err == ERROR_PATH_NOT_FOUND ? ERROR_FILE_NOT_FOUND
+                       : err == ERROR_FILE_INVALID ? ERROR_FILE_INVALID : ERROR_CANT_ACCESS_FILE;
                 return TRUE;
             }
         }

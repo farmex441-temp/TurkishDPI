@@ -8,7 +8,10 @@ int  sys_proxy_broken(void);                           /* manual proxy -> dead l
 int  sys_proxy_repair(void);
 int  sys_check_update(wchar_t *tag_out, size_t cap);  /* newer GitHub release? */
 void sys_uninstall(const wchar_t *data_dir);
-int  sys_secure_dir(const wchar_t *dir);              /* admin-owned, protected DACL */
+/* admin-owned, protected DACL; users_read for folders users must run from */
+int  sys_secure_dir(const wchar_t *dir, int users_read);
+/* objects this process creates are owned by Administrators */
+int  sys_set_default_owner(void);
 /* Protected %ProgramFiles%\TurkishDPI copy used by the elevated logon task. */
 int  sys_install_dir(wchar_t *out, size_t cap);
 /* self_exe: handle to the running exe file (see g_self_exe in app.c) */

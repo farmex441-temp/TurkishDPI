@@ -124,9 +124,26 @@ TurkishDPI.exe -5 --set-ttl 5 ...    :: goodbyedpi.exe ile birebir aynı argüma
 
 Eski GoodbyeDPI `.cmd` betiklerinde `goodbyedpi.exe` yerine `TurkishDPI.exe` yazmanız yeterlidir; Windows hizmeti (`sc create`) olarak da çalışır.
 
+## Gizlilik ve güvenlik
+
+**Bilgisayarınızdan neler çıkar:**
+- **DNS:** Hibrit DNS açıkken (varsayılan) her DNS sorgusu hem ağınızın DNS'ine hem de seçilen temiz DNS'e (Yandex, AdGuard veya OpenDNS; en hızlısı) gider. Bu sorgular şifresizdir. İsterseniz `DnsHybrid=0` ile yalnızca temiz DNS kullanılır.
+- **Bağlantı testleri:** Profil seçimi ve bekçi için test sitelerine (varsayılan discord.com, roblox.com, wattpad.com) ve kontrol sitelerine (google.com, microsoft.com) yaklaşık 10 dakikada bir HTTPS bağlantısı kurulur; içerik indirilmez.
+- **Güncelleme kontrolü:** Günde bir kez GitHub API'sine sürüm sorusu gider (`CheckUpdates=0` ile kapatılır).
+- Bunların dışında hiçbir veri gönderilmez: telemetri, hesap veya analiz yoktur.
+
+**Yerelde ne saklanır:** `C:\ProgramData\TurkishDPI` yalnızca Yöneticiler ve SYSTEM tarafından okunabilir. Ayarlar, öğrenilen ağ bilgisi (ağ geçidi kimliği ve bağdaştırıcı adı) ve günlük burada durur. Günlük, ziyaret ettiğiniz siteleri kaydetmez.
+
+**Yönetici yetkisiyle çalışan bir program olarak alınan önlemler:**
+- WinDivert DLL'i ve sürücüleri derleme anında sabitlenen SHA-256 ile doğrulanır; başka bir dosya yüklenmez veya kopyalanmaz.
+- Sistem kitaplıkları (winhttp, iphlpapi, dnsapi, bcrypt, gdiplus) yalnızca System32'den yüklenir; exe'nin klasörüne bırakılan bir DLL yüklenmez.
+- "Windows ile başlat" yalnızca yöneticiye ait `C:\Program Files\TurkishDPI` kopyasını çalıştırır; kopyalanamazsa görev hiç oluşturulmaz (ya da eskisi silinir).
+- Veri klasörü yöneticiye aittir; başkasına ait dosya veya bağlantı (junction/symlink) bulunursa kaldırılır, kaldırılamazsa program başlamaz.
+- Bağlantılar ve günlük, kullanıcının dosya ilişkilendirmeleri kullanılmadan doğrudan `explorer.exe`/`notepad.exe` ile açılır.
+
 ## Sorun giderme
 
-- **Antivirüs:** TurkishDPI.exe sürücü taşımaz; yalnızca "Windows ile başlat" açıkken kendisini ve WinDivert dosyalarını Program Files'a kopyalar. Exe, yanındaki `WinDivert.dll`'in resmi sürümle aynı olduğunu (SHA-256) doğrulamadan onu yüklemez. Paketteki `WinDivert64.sys`, WinDivert'in resmi imzalı sürücüsüdür; bazı üreticiler (ör. Elastic, Kaspersky "not-a-virus", Lionic) **her** WinDivert sürücüsünü genel bir kuralla "WinDivert"/"RiskTool" olarak etiketler. Bu, GoodbyeDPI ve zapret'te de aynıdır ve imzalı sürücü değiştirilemez. Windows Defender'ın işaretlediği şey ise WinDivert'in resmi zip arşivindeki örnek araçlardır; TurkishDPI bunları dağıtmaz. Başka bir antivirüs engellerse uygulamadaki *Ayarlar → Antivirüs sorunu yardımı* adım adım yol gösterir; TurkishDPI hiçbir zaman antivirüs ayarlarınızı kendisi değiştirmez.
+- **Antivirüs:** TurkishDPI.exe sürücü taşımaz; yalnızca "Windows ile başlat" açıkken kendisini ve WinDivert dosyalarını Program Files'a kopyalar. Exe, yanındaki `WinDivert.dll` ve sürücü dosyalarının resmi sürümle aynı olduğunu (SHA-256) doğrulamadan onları yüklemez. Paketteki `WinDivert64.sys`, WinDivert'in resmi imzalı sürücüsüdür; bazı üreticiler (ör. Elastic, Kaspersky "not-a-virus", Lionic) **her** WinDivert sürücüsünü genel bir kuralla "WinDivert"/"RiskTool" olarak etiketler. Bu, GoodbyeDPI ve zapret'te de aynıdır ve imzalı sürücü değiştirilemez. Windows Defender'ın işaretlediği şey ise WinDivert'in resmi zip arşivindeki örnek araçlardır; TurkishDPI bunları dağıtmaz. Başka bir antivirüs engellerse uygulamadaki *Ayarlar → Antivirüs sorunu yardımı* adım adım yol gösterir; TurkishDPI hiçbir zaman antivirüs ayarlarınızı kendisi değiştirmez.
 - **Kaspersky:** GoodbyeDPI'ı engeller; tamamen kaldırılması gerekir.
 - **Eski GoodbyeDPI / zapret hizmeti:** TurkishDPI açılışta tespit eder ve kaldırmayı önerir.
 - Ayrıntılı kayıt: menüden **Günlüğü aç**.

@@ -30,29 +30,110 @@ typedef struct { UINT32 ver; void *cb; BOOL no_thread; BOOL no_codecs; } GpStart
 typedef void GpGraphics, GpBrush, GpPen, GpPath;
 typedef struct { float X, Y; } GpPointF;
 #define GPAPI __stdcall
-int GPAPI GdiplusStartup(ULONG_PTR *, const GpStartupInput *, void *);
-int GPAPI GdipCreateFromHDC(HDC, GpGraphics **);
-int GPAPI GdipDeleteGraphics(GpGraphics *);
-int GPAPI GdipSetSmoothingMode(GpGraphics *, int);
-int GPAPI GdipCreateSolidFill(DWORD, GpBrush **);
-int GPAPI GdipDeleteBrush(GpBrush *);
-int GPAPI GdipCreatePen1(DWORD, float, int, GpPen **);
-int GPAPI GdipSetPenStartCap(GpPen *, int);
-int GPAPI GdipSetPenEndCap(GpPen *, int);
-int GPAPI GdipSetPenLineJoin(GpPen *, int);
-int GPAPI GdipDeletePen(GpPen *);
-int GPAPI GdipFillEllipse(GpGraphics *, GpBrush *, float, float, float, float);
-int GPAPI GdipDrawEllipse(GpGraphics *, GpPen *, float, float, float, float);
-int GPAPI GdipDrawArc(GpGraphics *, GpPen *, float, float, float, float, float, float);
-int GPAPI GdipDrawLine(GpGraphics *, GpPen *, float, float, float, float);
-int GPAPI GdipDrawLines(GpGraphics *, GpPen *, const GpPointF *, int);
-int GPAPI GdipFillPolygon(GpGraphics *, GpBrush *, const GpPointF *, int, int);
-int GPAPI GdipCreatePath(int, GpPath **);
-int GPAPI GdipAddPathArc(GpPath *, float, float, float, float, float, float);
-int GPAPI GdipClosePathFigure(GpPath *);
-int GPAPI GdipFillPath(GpGraphics *, GpBrush *, GpPath *);
-int GPAPI GdipDrawPath(GpGraphics *, GpPen *, GpPath *);
-int GPAPI GdipDeletePath(GpPath *);
+/*
+ * Resolved at run time from System32 (gdiplus_load) instead of being a
+ * static import: on Windows 7/8 gdiplus.dll is not a KnownDLL, so this
+ * elevated exe would otherwise load a gdiplus.dll planted next to it.
+ */
+typedef int (GPAPI *GdiplusStartup_t)(ULONG_PTR *, const GpStartupInput *, void *);
+static GdiplusStartup_t p_GdiplusStartup;
+#define GdiplusStartup p_GdiplusStartup
+typedef int (GPAPI *GdipCreateFromHDC_t)(HDC, GpGraphics **);
+static GdipCreateFromHDC_t p_GdipCreateFromHDC;
+#define GdipCreateFromHDC p_GdipCreateFromHDC
+typedef int (GPAPI *GdipDeleteGraphics_t)(GpGraphics *);
+static GdipDeleteGraphics_t p_GdipDeleteGraphics;
+#define GdipDeleteGraphics p_GdipDeleteGraphics
+typedef int (GPAPI *GdipSetSmoothingMode_t)(GpGraphics *, int);
+static GdipSetSmoothingMode_t p_GdipSetSmoothingMode;
+#define GdipSetSmoothingMode p_GdipSetSmoothingMode
+typedef int (GPAPI *GdipCreateSolidFill_t)(DWORD, GpBrush **);
+static GdipCreateSolidFill_t p_GdipCreateSolidFill;
+#define GdipCreateSolidFill p_GdipCreateSolidFill
+typedef int (GPAPI *GdipDeleteBrush_t)(GpBrush *);
+static GdipDeleteBrush_t p_GdipDeleteBrush;
+#define GdipDeleteBrush p_GdipDeleteBrush
+typedef int (GPAPI *GdipCreatePen1_t)(DWORD, float, int, GpPen **);
+static GdipCreatePen1_t p_GdipCreatePen1;
+#define GdipCreatePen1 p_GdipCreatePen1
+typedef int (GPAPI *GdipSetPenStartCap_t)(GpPen *, int);
+static GdipSetPenStartCap_t p_GdipSetPenStartCap;
+#define GdipSetPenStartCap p_GdipSetPenStartCap
+typedef int (GPAPI *GdipSetPenEndCap_t)(GpPen *, int);
+static GdipSetPenEndCap_t p_GdipSetPenEndCap;
+#define GdipSetPenEndCap p_GdipSetPenEndCap
+typedef int (GPAPI *GdipSetPenLineJoin_t)(GpPen *, int);
+static GdipSetPenLineJoin_t p_GdipSetPenLineJoin;
+#define GdipSetPenLineJoin p_GdipSetPenLineJoin
+typedef int (GPAPI *GdipDeletePen_t)(GpPen *);
+static GdipDeletePen_t p_GdipDeletePen;
+#define GdipDeletePen p_GdipDeletePen
+typedef int (GPAPI *GdipFillEllipse_t)(GpGraphics *, GpBrush *, float, float, float, float);
+static GdipFillEllipse_t p_GdipFillEllipse;
+#define GdipFillEllipse p_GdipFillEllipse
+typedef int (GPAPI *GdipDrawEllipse_t)(GpGraphics *, GpPen *, float, float, float, float);
+static GdipDrawEllipse_t p_GdipDrawEllipse;
+#define GdipDrawEllipse p_GdipDrawEllipse
+typedef int (GPAPI *GdipDrawArc_t)(GpGraphics *, GpPen *, float, float, float, float, float, float);
+static GdipDrawArc_t p_GdipDrawArc;
+#define GdipDrawArc p_GdipDrawArc
+typedef int (GPAPI *GdipDrawLine_t)(GpGraphics *, GpPen *, float, float, float, float);
+static GdipDrawLine_t p_GdipDrawLine;
+#define GdipDrawLine p_GdipDrawLine
+typedef int (GPAPI *GdipDrawLines_t)(GpGraphics *, GpPen *, const GpPointF *, int);
+static GdipDrawLines_t p_GdipDrawLines;
+#define GdipDrawLines p_GdipDrawLines
+typedef int (GPAPI *GdipFillPolygon_t)(GpGraphics *, GpBrush *, const GpPointF *, int, int);
+static GdipFillPolygon_t p_GdipFillPolygon;
+#define GdipFillPolygon p_GdipFillPolygon
+typedef int (GPAPI *GdipCreatePath_t)(int, GpPath **);
+static GdipCreatePath_t p_GdipCreatePath;
+#define GdipCreatePath p_GdipCreatePath
+typedef int (GPAPI *GdipAddPathArc_t)(GpPath *, float, float, float, float, float, float);
+static GdipAddPathArc_t p_GdipAddPathArc;
+#define GdipAddPathArc p_GdipAddPathArc
+typedef int (GPAPI *GdipClosePathFigure_t)(GpPath *);
+static GdipClosePathFigure_t p_GdipClosePathFigure;
+#define GdipClosePathFigure p_GdipClosePathFigure
+typedef int (GPAPI *GdipFillPath_t)(GpGraphics *, GpBrush *, GpPath *);
+static GdipFillPath_t p_GdipFillPath;
+#define GdipFillPath p_GdipFillPath
+typedef int (GPAPI *GdipDrawPath_t)(GpGraphics *, GpPen *, GpPath *);
+static GdipDrawPath_t p_GdipDrawPath;
+#define GdipDrawPath p_GdipDrawPath
+typedef int (GPAPI *GdipDeletePath_t)(GpPath *);
+static GdipDeletePath_t p_GdipDeletePath;
+#define GdipDeletePath p_GdipDeletePath
+
+static int gdiplus_load(void) {
+    HMODULE h = LoadLibraryExW(L"gdiplus.dll", NULL, LOAD_LIBRARY_SEARCH_SYSTEM32);
+    if (!h) return 0;
+    p_GdiplusStartup = (GdiplusStartup_t)(void *)GetProcAddress(h, "GdiplusStartup");
+    p_GdipCreateFromHDC = (GdipCreateFromHDC_t)(void *)GetProcAddress(h, "GdipCreateFromHDC");
+    p_GdipDeleteGraphics = (GdipDeleteGraphics_t)(void *)GetProcAddress(h, "GdipDeleteGraphics");
+    p_GdipSetSmoothingMode = (GdipSetSmoothingMode_t)(void *)GetProcAddress(h, "GdipSetSmoothingMode");
+    p_GdipCreateSolidFill = (GdipCreateSolidFill_t)(void *)GetProcAddress(h, "GdipCreateSolidFill");
+    p_GdipDeleteBrush = (GdipDeleteBrush_t)(void *)GetProcAddress(h, "GdipDeleteBrush");
+    p_GdipCreatePen1 = (GdipCreatePen1_t)(void *)GetProcAddress(h, "GdipCreatePen1");
+    p_GdipSetPenStartCap = (GdipSetPenStartCap_t)(void *)GetProcAddress(h, "GdipSetPenStartCap");
+    p_GdipSetPenEndCap = (GdipSetPenEndCap_t)(void *)GetProcAddress(h, "GdipSetPenEndCap");
+    p_GdipSetPenLineJoin = (GdipSetPenLineJoin_t)(void *)GetProcAddress(h, "GdipSetPenLineJoin");
+    p_GdipDeletePen = (GdipDeletePen_t)(void *)GetProcAddress(h, "GdipDeletePen");
+    p_GdipFillEllipse = (GdipFillEllipse_t)(void *)GetProcAddress(h, "GdipFillEllipse");
+    p_GdipDrawEllipse = (GdipDrawEllipse_t)(void *)GetProcAddress(h, "GdipDrawEllipse");
+    p_GdipDrawArc = (GdipDrawArc_t)(void *)GetProcAddress(h, "GdipDrawArc");
+    p_GdipDrawLine = (GdipDrawLine_t)(void *)GetProcAddress(h, "GdipDrawLine");
+    p_GdipDrawLines = (GdipDrawLines_t)(void *)GetProcAddress(h, "GdipDrawLines");
+    p_GdipFillPolygon = (GdipFillPolygon_t)(void *)GetProcAddress(h, "GdipFillPolygon");
+    p_GdipCreatePath = (GdipCreatePath_t)(void *)GetProcAddress(h, "GdipCreatePath");
+    p_GdipAddPathArc = (GdipAddPathArc_t)(void *)GetProcAddress(h, "GdipAddPathArc");
+    p_GdipClosePathFigure = (GdipClosePathFigure_t)(void *)GetProcAddress(h, "GdipClosePathFigure");
+    p_GdipFillPath = (GdipFillPath_t)(void *)GetProcAddress(h, "GdipFillPath");
+    p_GdipDrawPath = (GdipDrawPath_t)(void *)GetProcAddress(h, "GdipDrawPath");
+    p_GdipDeletePath = (GdipDeletePath_t)(void *)GetProcAddress(h, "GdipDeletePath");
+    return p_GdiplusStartup && p_GdipCreateFromHDC && p_GdipDeleteGraphics && p_GdipSetSmoothingMode && p_GdipCreateSolidFill && p_GdipDeleteBrush && p_GdipCreatePen1 && p_GdipSetPenStartCap && p_GdipSetPenEndCap && p_GdipSetPenLineJoin && p_GdipDeletePen && p_GdipFillEllipse && p_GdipDrawEllipse && p_GdipDrawArc && p_GdipDrawLine && p_GdipDrawLines && p_GdipFillPolygon && p_GdipCreatePath && p_GdipAddPathArc && p_GdipClosePathFigure && p_GdipFillPath && p_GdipDrawPath && p_GdipDeletePath;
+}
+
 
 /* ---------- palette (docs/design/DESIGN-SYSTEM.md §4) ---------- */
 typedef struct {
@@ -1043,6 +1124,23 @@ static void tray_update(void) {
     Shell_NotifyIconW(NIM_MODIFY, &g_nid);
 }
 
+/* 1 if the mouse pointer is on our tray icon (or the shell cannot tell). */
+static int tray_click_genuine(void) {
+    typedef HRESULT (WINAPI *rect_fn)(const NOTIFYICONIDENTIFIER *, RECT *);
+    rect_fn f = (rect_fn)(void *)GetProcAddress(GetModuleHandleW(L"shell32.dll"), "Shell_NotifyIconGetRect");
+    NOTIFYICONIDENTIFIER id;
+    RECT r;
+    POINT pt;
+    if (!f) return 1;
+    ZeroMemory(&id, sizeof(id));
+    id.cbSize = sizeof(id);
+    id.hWnd = g_wnd;
+    id.uID = 1;
+    if (FAILED(f(&id, &r)) || !GetCursorPos(&pt)) return 1;   /* e.g. icon hidden in the overflow */
+    InflateRect(&r, 4, 4);
+    return PtInRect(&r, pt);
+}
+
 static void tray_add(void) {
     ZeroMemory(&g_nid, sizeof(g_nid));
     g_nid.cbSize = sizeof(g_nid);
@@ -1254,10 +1352,9 @@ static void command(int id) {
             L"bunu yanlışlıkla engelleyebilir.\n\n"
             L"1) Windows Güvenliği > Virüs ve tehdit koruması > Koruma geçmişi'nde TurkishDPI ile ilgili "
             L"bir kayıt varsa 'Geri yükle' deyin.\n"
-            L"2) Aynı yerde Ayarları yönet > Dışlamalar > Klasör olarak şunları ekleyin:\n"
-            L"     C:\\ProgramData\\TurkishDPI\n"
+            L"2) Gerekirse yalnızca şu klasörü dışlamalara ekleyin (İndirilenler gibi tüm "
+            L"klasörleri değil):\n"
             L"     C:\\Program Files\\TurkishDPI (Windows ile başlat açıksa)\n"
-            L"     TurkishDPI.exe'nin bulunduğu klasör\n"
             L"3) Kaspersky kullanıyorsanız kaldırmanız gerekebilir.\n\n"
             L"Tamam'a basınca Windows Güvenliği açılır.", L"Antivirüs yardımı", MB_ICONINFORMATION);
         app_open_url(L"windowsdefender://threat");
@@ -1436,10 +1533,20 @@ static LRESULT CALLBACK wndproc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
         g_anim = (g_anim + 9) % 360;
         InvalidateRect(ctl(ID_POWER)->hwnd, NULL, FALSE);
         return 0;
-    case WM_TRAY:
+    case WM_TRAY: {
+        /* WM_TRAY is let through UIPI, so any program could post it: act
+         * only when the pointer really is on our icon, and never open a
+         * second menu while one is showing. */
+        static int in_menu = 0;
+        if (!tray_click_genuine() || in_menu) return 0;
         if (lp == WM_LBUTTONUP || lp == WM_LBUTTONDBLCLK) ui_toggle();
-        else if (lp == WM_RBUTTONUP || lp == WM_CONTEXTMENU) ui_tray_menu(h);
+        else if (lp == WM_RBUTTONUP || lp == WM_CONTEXTMENU) {
+            in_menu = 1;
+            ui_tray_menu(h);
+            in_menu = 0;
+        }
         return 0;
+    }
     case WM_STATUS:
         tray_update();
         if (IsWindowVisible(h)) update_controls();
@@ -1468,6 +1575,7 @@ int ui_init(HINSTANCE inst) {
 
     g_inst = inst;
     InitCommonControlsEx(&icc);
+    if (!gdiplus_load()) return 0;
     GdiplusStartup(&g_gdip, &gi, NULL);
     dark_menus();
     g_sunken_brush = CreateSolidBrush(P->sunken);

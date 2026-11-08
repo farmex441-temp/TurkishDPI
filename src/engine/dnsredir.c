@@ -139,17 +139,17 @@ int dns_answer_is_forged(const char *data, unsigned int len) {
     an = (m[6] << 8) | m[7];
     for (unsigned int i = 0; i < qd; i++) {
         off = skip_name(m, len, (unsigned int)off);
-        if (off < 0 || (unsigned int)off + 4 > len) return 0;
+        if (off < 0 || (unsigned int)off + 4 > len) return 1;   /* malformed: untrusted */
         off += 4;
     }
     for (unsigned int i = 0; i < an; i++) {
         unsigned int type, rdlen;
         off = skip_name(m, len, (unsigned int)off);
-        if (off < 0 || (unsigned int)off + 10 > len) return 0;
+        if (off < 0 || (unsigned int)off + 10 > len) return 1;
         type = (m[off] << 8) | m[off + 1];
         rdlen = (m[off + 8] << 8) | m[off + 9];
         off += 10;
-        if ((unsigned int)off + rdlen > len) return 0;
+        if ((unsigned int)off + rdlen > len) return 1;
         if (type == 1 && rdlen == 4 && forged_v4(m + off)) return 1;
         if (type == 28 && rdlen == 16 && forged_v6(m + off)) return 1;
         off += (int)rdlen;
@@ -451,10 +451,34 @@ int dns_handle_incoming_hybrid(const uint32_t local_ip[4], const uint16_t local_
         deconstruct_key(key, rec, conn_info);
         return DNS_IN_REWRITE;
     }
-    /* From the network's own resolver (or another one the system asked):
-     * only a trustworthy first answer gets through. */
-    if (rec->answered || dns_answer_is_forged(packet_data, packet_dataLen))
+    /* Forged answers are dropped whoever sends them. */
+    if (dns_answer_is_forged(packet_data, packet_dataLen))
         return DNS_IN_DROP;
-    rec->answered = 1;
-    return DNS_IN_PASS;
+    if (same_addr(remote_ip, rec->dstip, is_ipv6) && remote_port == rec->dstport) {
+        /* the resolver the query went to: the first trustworthy answer wins */
+        if (rec->answered)
+            return DNS_IN_DROP;
+        rec->answered = 1;
+        return DNS_IN_PASS;
+    }
+    /* Someone else (another resolver the system asked, or a spoofer): it
+     * neither settles the race nor counts as trusted. */
+    return DNS_IN_PASS_OTHER;
+}
+
+int dns_answer_matches(const uint32_t local_ip[4], const uint16_t local_port,
+                       const uint32_t remote_ip[4], const uint16_t remote_port,
+                       const char *packet_data, const UINT packet_dataLen, const uint8_t is_ipv6)
+{
+    char key[UDP_CONNRECORD_KEY_LEN];
+    udp_connrecord_t *rec = NULL;
+    uint16_t txid;
+    if (packet_dataLen < 12 || !dns_is_dns_packet(packet_data, packet_dataLen, 0))
+        return 0;
+    construct_key(local_ip, local_port, key, is_ipv6);
+    if (!check_get_udp_conntrack_key(key, &rec) || !rec)
+        return 0;
+    txid = (uint16_t)(((unsigned char)packet_data[0] << 8) | (unsigned char)packet_data[1]);
+    return txid == rec->txid && same_addr(remote_ip, rec->dstip, is_ipv6) &&
+           remote_port == rec->dstport;
 }

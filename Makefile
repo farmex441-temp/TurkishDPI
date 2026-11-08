@@ -22,11 +22,11 @@ LDFLAGS := -mwindows -static -Wl,--gc-sections \
 ifeq ($(ARCH),x86_64)
 LDFLAGS += -Wl,--high-entropy-va
 endif
-# winhttp.dll and iphlpapi.dll are deliberately NOT linked: they are not
-# KnownDLLs, so as static imports of this elevated exe they would be looked up
+# winhttp, iphlpapi (and gdiplus, dnsapi, bcrypt) are deliberately NOT linked: they are not
+# KnownDLLs (gdiplus on Windows 7/8), so as static imports of this elevated exe they would be looked up
 # in its (possibly user-writable) folder first. src/app/sysdll.c loads them
 # from System32 at run time.
-LIBS    := -lws2_32 -lshell32 -lole32 -luser32 -ladvapi32 -luuid -lgdiplus -lcomctl32 -lgdi32
+LIBS    := -lws2_32 -lshell32 -lole32 -luser32 -ladvapi32 -luuid -lcomctl32 -lgdi32
 
 # SHA-256 of the WinDivert.dll that ships next to the exe; the engine refuses
 # any other DLL (src/engine/windivert_dyn.c). Taken from the WinDivert folder

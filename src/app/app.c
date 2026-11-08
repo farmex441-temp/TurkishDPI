@@ -22,6 +22,7 @@
 #include <shellapi.h>
 #include <shlobj.h>
 #include <iphlpapi.h>
+#include <sddl.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -1433,13 +1434,27 @@ static int autostart_register(int on, int quiet) {
             return 0;
         }
         xml_escape(installed, exe, MAX_PATH * 2);
-        GetUserNameW(user, &ulen);
+        (void)user; (void)ulen;
         {
-            wchar_t dom[128] = L"", uq[300], esc[600];
-            GetEnvironmentVariableW(L"USERDOMAIN", dom, 128);
-            _snwprintf(uq, 299, L"%ls%ls%ls", dom, dom[0] ? L"\\" : L"", user);
-            uq[299] = 0;
-            xml_escape(uq, esc, 600);
+            /* the token's own SID (not USERDOMAIN/USERNAME from the
+             * environment, which the user's programs can change) */
+            wchar_t esc[600] = L"";
+            HANDLE tok;
+            if (OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &tok)) {
+                BYTE tbuf[256];
+                DWORD tl = 0;
+                LPWSTR sid = NULL;
+                if (GetTokenInformation(tok, TokenUser, tbuf, sizeof(tbuf), &tl) &&
+                    ConvertSidToStringSidW(((TOKEN_USER *)tbuf)->User.Sid, &sid)) {
+                    xml_escape(sid, esc, 600);
+                    LocalFree(sid);
+                }
+                CloseHandle(tok);
+            }
+            if (!esc[0]) {
+                log_line("autostart: could not read the user SID");
+                return 0;
+            }
             _snwprintf(xml, 4095,
                 L"<?xml version=\"1.0\" encoding=\"UTF-16\"?>\r\n"
                 L"<Task version=\"1.2\" xmlns=\"http://schemas.microsoft.com/windows/2004/02/mit/task\">\r\n"
@@ -1465,15 +1480,22 @@ static int autostart_register(int on, int quiet) {
         }
         /* written to the admin-only data folder, removed right after use */
         swprintf(xml_path, MAX_PATH, L"%ls\\autostart.xml", g_dir);
-        f = CreateFileW(xml_path, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+        /* Kept open (others may read, nobody may write or delete) until
+         * schtasks has read it, then deleted through the same handle. */
+        f = CreateFileW(xml_path, GENERIC_WRITE | DELETE, FILE_SHARE_READ, NULL, CREATE_ALWAYS,
+                        FILE_ATTRIBUTE_NORMAL, NULL);
         if (f != INVALID_HANDLE_VALUE) {
             static const WCHAR bom = 0xFEFF;
+            FILE_DISPOSITION_INFO di;
             WriteFile(f, &bom, sizeof(bom), &w, NULL);
             WriteFile(f, xml, (DWORD)(wcslen(xml) * sizeof(wchar_t)), &w, NULL);
-            CloseHandle(f);
+            FlushFileBuffers(f);
             _snwprintf(args, MAX_PATH + 63, L"/Create /F /TN \"TurkishDPI\" /XML \"%ls\"", xml_path);
             args[MAX_PATH + 63] = 0;
             ok = run_hidden(L"schtasks.exe", args) == 0;
+            di.DeleteFile = TRUE;
+            SetFileInformationByHandle(f, FileDispositionInfo, &di, sizeof(di));
+            CloseHandle(f);
             DeleteFileW(xml_path);
         }
     } else {
@@ -1499,13 +1521,11 @@ void autostart_set(int on) {
  * the protected copy and point the task at it. The user just approved this
  * exe through UAC, so it is trusted as much as running it is. */
 static void autostart_migrate(void) {
-    wchar_t dir[MAX_PATH], mine[MAX_PATH];
-    size_t n;
-    if (g_autostart_cache != 1 || !sys_install_dir(dir, MAX_PATH)) return;
-    wcscpy(mine, g_exe);
-    n = wcslen(dir);
-    if (!_wcsnicmp(mine, dir, n) && mine[n] == L'\\' && !wcschr(mine + n + 1, L'\\')) return;
-    log_line("autostart: refreshing the protected copy");
+    /* An existing task may point anywhere (e.g. a v1.1.0 task at the
+     * extraction folder): re-register it every start. Cheap when nothing
+     * changed - files with identical contents are not copied again. */
+    if (g_autostart_cache != 1) return;
+    log_line("autostart: re-registering the logon task for the protected copy");
     autostart_register(1, 1);
 }
 
@@ -1552,6 +1572,64 @@ void app_exit(void) {
     ExitProcess(0);
 }
 
+/*
+ * The single-instance mutex lives in a private namespace whose boundary is
+ * the Administrators group: only an elevated process can create or open it,
+ * so an ordinary program cannot squat the name to keep TurkishDPI from
+ * starting (a plain "Global\\..." name can be created by anyone first).
+ */
+static HANDLE instance_mutex(void) {
+    SID_IDENTIFIER_AUTHORITY nt = SECURITY_NT_AUTHORITY;
+    PSID admins = NULL;
+    HANDLE boundary, ns = NULL, m = NULL;
+    SECURITY_ATTRIBUTES sa;
+    PSECURITY_DESCRIPTOR sd = NULL;
+    boundary = CreateBoundaryDescriptorW(L"TurkishDPI", 0);
+    if (!boundary) return NULL;
+    if (!AllocateAndInitializeSid(&nt, 2, SECURITY_BUILTIN_DOMAIN_RID, DOMAIN_ALIAS_RID_ADMINS,
+                                  0, 0, 0, 0, 0, 0, &admins) ||
+        !AddSIDToBoundaryDescriptor(&boundary, admins)) {
+        if (admins) FreeSid(admins);
+        DeleteBoundaryDescriptor(boundary);
+        return NULL;
+    }
+    sa.nLength = sizeof(sa);
+    sa.bInheritHandle = FALSE;
+    sa.lpSecurityDescriptor = NULL;
+    if (ConvertStringSecurityDescriptorToSecurityDescriptorW(L"D:P(A;;GA;;;BA)(A;;GA;;;SY)",
+                                                             SDDL_REVISION_1, &sd, NULL))
+        sa.lpSecurityDescriptor = sd;
+    ns = CreatePrivateNamespaceW(&sa, boundary, L"TurkishDPI");
+    if (!ns && GetLastError() == ERROR_ALREADY_EXISTS)
+        ns = OpenPrivateNamespaceW(boundary, L"TurkishDPI");
+    if (ns) m = CreateMutexW(&sa, TRUE, L"TurkishDPI\\app");
+    /* the namespace stays open for the process lifetime (it holds the name) */
+    if (sd) LocalFree(sd);
+    FreeSid(admins);
+    DeleteBoundaryDescriptor(boundary);
+    return m;
+}
+
+/* The running exe, opened without delete sharing (it cannot be renamed away
+ * and replaced while we run). Refused when the path was truncated or the
+ * opened file is not the image this process runs from. */
+static int lock_self_exe(void) {
+    typedef DWORD (WINAPI *mapped_fn)(HANDLE, LPVOID, LPWSTR, DWORD);
+    wchar_t mapped[MAX_PATH * 2], opened[MAX_PATH * 2];
+    DWORD n = GetModuleFileNameW(NULL, g_exe, MAX_PATH);
+    HMODULE k32 = GetModuleHandleW(L"kernel32.dll");
+    mapped_fn gm = k32 ? (mapped_fn)(void *)GetProcAddress(k32, "K32GetMappedFileNameW") : NULL;
+    if (n == 0 || n >= MAX_PATH) return 0;
+    g_self_exe = CreateFileW(g_exe, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, 0, NULL);
+    if (g_self_exe == INVALID_HANDLE_VALUE) return 0;
+    /* same file? compare the NT device paths of the mapped image and the handle */
+    if (gm && gm(GetCurrentProcess(), (LPVOID)GetModuleHandleW(NULL), mapped, MAX_PATH * 2) &&
+        GetFinalPathNameByHandleW(g_self_exe, opened, MAX_PATH * 2, VOLUME_NAME_NT) &&
+        _wcsicmp(mapped, opened) != 0)
+        return 0;
+    return 1;
+}
+
 static int app_main(int quiet) {
     HANDLE mtx, t;
     MSG m;
@@ -1559,8 +1637,14 @@ static int app_main(int quiet) {
     JOBOBJECT_EXTENDED_LIMIT_INFORMATION jl;
     wchar_t *pd = NULL;
 
-    mtx = CreateMutexW(NULL, TRUE, L"Global\\TurkishDPI_app");
-    if (mtx && GetLastError() == ERROR_ALREADY_EXISTS) {
+    mtx = instance_mutex();
+    if (!mtx) {
+        if (!quiet)
+            MessageBoxW(NULL, L"TurkishDPI başlatılamadı: tek örnek kilidi oluşturulamadı.",
+                        L"TurkishDPI", MB_ICONERROR);
+        return 1;
+    }
+    if (GetLastError() == ERROR_ALREADY_EXISTS) {
         /* Bring the running instance's window to front. */
         HWND w = FindWindowW(L"TurkishDPI_main", NULL);
         if (g_selftest) return 3;   /* another instance is running: cannot self-test */
@@ -1571,8 +1655,16 @@ static int app_main(int quiet) {
     InitializeCriticalSection(&g_lock);
     InitializeCriticalSection(&g_log_lock);
     WSAStartup(MAKEWORD(2, 2), &wsa);
-    GetModuleFileNameW(NULL, g_exe, MAX_PATH);
-    g_self_exe = CreateFileW(g_exe, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, 0, NULL);
+    /* The engine is started from this path again and again: if the file
+     * cannot be locked, another program could swap it for its own exe. */
+    if (!lock_self_exe()) {
+        if (!quiet)
+            MessageBoxW(NULL, L"TurkishDPI.exe dosyası kilitlenemedi (başka bir program kullanıyor olabilir). "
+                              L"Güvenlik nedeniyle başlatılmadı.", L"TurkishDPI", MB_ICONERROR);
+        return 1;
+    }
+    /* everything we create below is owned by Administrators */
+    sys_set_default_owner();
 
     if (SUCCEEDED(SHGetKnownFolderPath(&FOLDERID_ProgramData, 0, NULL, &pd))) {
         swprintf(g_dir, MAX_PATH, L"%ls\\TurkishDPI", pd);
@@ -1580,9 +1672,10 @@ static int app_main(int quiet) {
     } else {
         wcscpy(g_dir, L"C:\\ProgramData\\TurkishDPI");
     }
-    /* Admin-only folder (users may read): we run elevated, so a folder that
-     * users can write to would let them plant links or files we act on. */
-    if (!sys_secure_dir(g_dir)) {
+    /* Admin-only folder: we run elevated, so a folder ordinary programs can
+     * write to would let them plant links or files we act on. It also holds
+     * network history, so other users cannot read it either. */
+    if (!sys_secure_dir(g_dir, 0)) {
         MessageBoxW(NULL, L"Veri klasörü güvenli hale getirilemedi:\n%ProgramData%\\TurkishDPI\n\n"
                           L"Klasör bir bağlantı (junction) olabilir veya başka bir kullanıcıya ait olabilir. "
                           L"Klasörü silip TurkishDPI'ı yeniden başlatın.", L"TurkishDPI", MB_ICONERROR);
@@ -1632,6 +1725,27 @@ static int app_main(int quiet) {
     return 0;
 }
 
+/*
+ * Starts exe (absolute path) with one quoted argument via CreateProcessW.
+ * Never ShellExecute from this elevated process: the shell resolves file
+ * types through the user's own HKCU\\Software\\Classes, which ordinary
+ * programs can rewrite (the classic UAC-bypass channel).
+ */
+static void launch(const wchar_t *exe, const wchar_t *arg) {
+    STARTUPINFOW si;
+    PROCESS_INFORMATION pi;
+    wchar_t cmd[MAX_PATH * 3];
+    if (wcschr(arg, L'"')) return;   /* constant URLs and our own paths only */
+    if (_snwprintf(cmd, MAX_PATH * 3 - 1, L"\"%ls\" \"%ls\"", exe, arg) < 0) return;
+    cmd[MAX_PATH * 3 - 1] = 0;
+    ZeroMemory(&si, sizeof(si));
+    si.cb = sizeof(si);
+    if (CreateProcessW(exe, cmd, NULL, NULL, FALSE, 0, NULL, NULL, &si, &pi)) {
+        CloseHandle(pi.hProcess);
+        CloseHandle(pi.hThread);
+    }
+}
+
 void app_open_url(const wchar_t *url) {
     /* explorer.exe hands the URL to the already running, non-elevated shell,
      * so the browser does not start with administrator rights */
@@ -1639,17 +1753,15 @@ void app_open_url(const wchar_t *url) {
     UINT n = GetWindowsDirectoryW(ex, MAX_PATH);
     if (n == 0 || n + 14 >= MAX_PATH) return;
     wcscat(ex, L"\\explorer.exe");
-    ShellExecuteW(NULL, L"open", ex, url, NULL, SW_SHOWNORMAL);
+    launch(ex, url);
 }
 
 void app_open_file(const wchar_t *path) {
-    wchar_t np[MAX_PATH], arg[MAX_PATH + 2];
+    wchar_t np[MAX_PATH];
     UINT n = GetSystemDirectoryW(np, MAX_PATH);
     if (n == 0 || n + 14 >= MAX_PATH) return;
     wcscat(np, L"\\notepad.exe");
-    _snwprintf(arg, MAX_PATH + 1, L"\"%ls\"", path);
-    arg[MAX_PATH + 1] = 0;
-    ShellExecuteW(NULL, L"open", np, arg, NULL, SW_SHOWNORMAL);
+    launch(np, path);
 }
 
 /* Fires network re-check from the UI thread (sleep resume). */

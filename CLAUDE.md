@@ -177,34 +177,59 @@ SHA-256 in the workflow.
 - `g_lock` guards `g_ui` and the command queue; file logging uses `g_log_lock`.
   Never hold `g_lock` across process waits, file I/O or message boxes.
 - The UI talks to the controller only through `post_cmd`/`post_site_test`.
-- Elevated code must not trust user-writable paths:
-  - data folder goes through `sys_secure_dir` (handle opened with
-    `FILE_FLAG_OPEN_REPARSE_POINT`, owner + protected DACL set on that handle,
-    entries owned by other users removed); the app refuses to start if it fails;
-  - uninstall never follows reparse points;
+- Elevated code must not trust user-writable paths. Threat model: unprivileged
+  code of the *same* user (same SID - "owned by the current user" is never
+  trusted), other local users, the network/ISP. Rules:
+  - trusted owners are only BUILTIN\Administrators and SYSTEM
+    (`owner_is_trusted`); `sys_set_default_owner()` makes everything the app
+    creates Administrators-owned regardless of local policy;
+  - `sys_secure_dir(dir, users_read)`: handle opened with
+    `FILE_FLAG_OPEN_REPARSE_POINT`; a folder someone else created first is
+    moved aside (`.untrusted-<tick>`) and recreated; owner + protected DACL
+    (SY/BA full, OW read-only, BU read only for the Program Files copy - the
+    data folder is admin-only because it holds network history); entries not
+    owned by BA/SY or that are links are removed through handles; if anything
+    cannot be verified/removed it returns 0 and the app refuses to start;
+  - deletions go through `delete_object` / `delete_tree_in`: open without
+    following links, check the real location with `GetFinalPathNameByHandle`
+    stays inside the root, delete by handle (FileDispositionInfo). Delete-at-
+    reboot only in admin-only folders, after renaming the file aside;
   - the exe's own folder is NOT trusted (zips get extracted to Downloads):
-    the logon task always runs the protected copy in
-    `%ProgramFiles%\TurkishDPI` (`sys_install_copy`, refreshed when started
-    from elsewhere, `autostart_migrate`); a failed copy means no task, never a
-    task pointing at the extraction folder. The exe is copied from
-    `g_self_exe` (the running image's file, opened at start without delete
-    sharing), never re-opened by name; WinDivert files only if their hashes match;
-  - WinDivert.dll **and the drivers** (`WinDivert64.sys`, `WinDivert32.sys`)
-    only from the exe's own folder, and only if their SHA-256 match the ones
-    pinned at build time (`WINDIVERT_DLL_SHA256`, `WINDIVERT_SYS64_SHA256`,
-    `WINDIVERT_SYS32_SHA256`; Makefile computes them from the checksum-pinned
-    archive; CI sets `REQUIRE_WINDIVERT_HASH=1`). Checked on handles that deny
-    writes/deletes: the DLL's until it is mapped, the drivers' for the whole
-    engine process (WinDivert.dll installs whatever .sys sits next to it as a
-    kernel driver - an unpinned driver would allow loading any signed,
-    possibly vulnerable driver). Error 1006 otherwise. `windivert_file_ok()`
-    guards the Program Files copy the same way;
-  - no static imports of non-KnownDLLs (winhttp, iphlpapi, dnsapi, bcrypt):
-    `sysdll.c` / `LoadLibraryExW(..., LOAD_LIBRARY_SEARCH_SYSTEM32)`; CI's
-    "Check imports" step fails the build otherwise; `schtasks.exe`/`notepad.exe`
-    by absolute System32 path (`run_hidden`, `app_open_file`), system DLLs with
-    `LOAD_LIBRARY_SEARCH_SYSTEM32`;
-  - URLs open through `explorer.exe` (`app_open_url`) so the browser is not elevated.
+    the logon task always runs the protected copy in `%ProgramFiles%\TurkishDPI`
+    (`sys_install_copy`; `autostart_migrate` re-registers on every start when a
+    task exists); a failed copy deletes the task. Copy rules: only pinned
+    drivers, hash checked on the very handle that is copied
+    (`windivert_handle_ok`), single-link plain files only, the driver this OS
+    needs must be present. The exe comes from `g_self_exe` (`lock_self_exe`:
+    opened without delete sharing, path not truncated, same file as the mapped
+    image - otherwise the app refuses to start);
+  - WinDivert.dll **and the driver this system uses** only from the exe's own
+    folder, and only if their SHA-256 match the build-time pins
+    (`WINDIVERT_DLL_SHA256`, `WINDIVERT_SYS64_SHA256`, `WINDIVERT_SYS32_SHA256`;
+    Makefile computes them from the checksum-pinned archive and tracks them in
+    `obj/wdpin.stamp`; CI sets `REQUIRE_WINDIVERT_HASH=1`). Checked on handles
+    that deny writes/deletes (DLL until mapped, driver for the whole engine
+    process); a pinned driver must exist (error 2), mismatch 1006, locked or
+    quarantined 1920;
+  - no static imports of non-KnownDLLs (winhttp, iphlpapi, dnsapi, bcrypt,
+    gdiplus - the last is not a KnownDLL on Windows 7/8): `sysdll.c`,
+    `gdiplus_load()` in ui.c, `LoadLibraryExW(..., LOAD_LIBRARY_SEARCH_SYSTEM32)`;
+    CI's "Check imports" step fails the build otherwise;
+  - never `ShellExecute` from the elevated process (it resolves file types via
+    the user-writable HKCU\Software\Classes): `launch()` = `CreateProcessW`
+    with an absolute path (`explorer.exe` for URLs so the browser is not
+    elevated, System32 `notepad.exe` for log/ini, `run_hidden` for schtasks);
+  - single instance: mutex `TurkishDPI\app` in a private namespace bounded by
+    the Administrators SID (`instance_mutex`), so it cannot be squatted;
+  - window messages: only `TaskbarCreated` and `WM_TRAY` pass UIPI; `WM_TRAY`
+    is acted on only when the cursor is on our icon (`tray_click_genuine`) and
+    never re-entered while a menu is open; never allow `WM_COMMAND`;
+  - logon task XML: `<UserId>` is the token user's SID (not environment
+    variables); the XML file is held open deny-write until schtasks has read
+    it, then deleted through the handle;
+  - DNS learning for payment exclusion trusts only answers that match a
+    tracked query (txid, port, the server it went to) or come from the clean
+    resolver (`dns_trusted`); malformed answers count as forged.
 - Autostart is a Task Scheduler logon task registered from XML
   (`autostart_set`): no "AC power only", no 72 h limit. Its state is queried on
   the controller thread; the UI only reads the cache and posts `CMD_AUTOSTART`.
@@ -235,6 +260,13 @@ SHA-256 in the workflow.
 - Branch `feature/hardening-autopilot` (not merged): security hardening and
   autopilot work from docs/DEVELOPMENT-ROADMAP.md items 1, 2, 3 (partly), 5,
   16; see docs/ for the analysis.
+- v1.2.0: merge of feature/hardening-autopilot + feature/ui-redesign, then a
+  /code-review round (driver pinning, TCP-first diagnosis), a bug hunt
+  (10 findings) and a full security audit (14 findings: same-user attacker
+  model for the data folder, handle-based deletes, mandatory pinned driver,
+  self-exe lock check, no ShellExecute, private-namespace mutex, WM_TRAY
+  guard, trusted-only DNS learning, gdiplus from System32, SID task user,
+  persist-credentials: false in CI).
 - After rc2 (on main, not yet tagged): second bug-hunting round - app layer
   (17 findings: folder-security race, laptop autostart, tray icon after
   Explorer restart, manual mode overridden by site test, watchdog balloon

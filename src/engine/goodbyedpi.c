@@ -672,6 +672,7 @@ int gdpi_main(int argc, char *argv[]) {
     char dnsv4_str[INET6_ADDRSTRLEN] = "", dnsv6_str[INET6_ADDRSTRLEN] = "";
     int i, should_reinject, should_recalc_checksum = 0;
     int sni_ok = 0;
+    int dns_trusted = 0;   /* inbound DNS answer we may learn payment addresses from */
     int opt;
     int packet_v4, packet_v6;
     HANDLE w_filter = NULL;
@@ -1307,6 +1308,7 @@ int gdpi_main(int argc, char *argv[]) {
             should_reinject = 1;
             should_recalc_checksum = 0;
             sni_ok = 0;
+            dns_trusted = 0;
 
             ppIpHdr = (PWINDIVERT_IPHDR)NULL;
             ppIpV6Hdr = (PWINDIVERT_IPV6HDR)NULL;
@@ -1623,7 +1625,8 @@ int gdpi_main(int argc, char *argv[]) {
                      (do_dnsv6_redirect && (packet_type == ipv6_udp_data)))
             {
                 if (!addr.Outbound && dns_hybrid_enabled()) {
-                    int verdict = packet_v4
+                    int verdict;
+                    verdict = packet_v4
                         ? dns_handle_incoming_hybrid(&ppIpHdr->DstAddr, ppUdpHdr->DstPort,
                                                      &ppIpHdr->SrcAddr, ppUdpHdr->SrcPort,
                                                      packet_data, packet_dataLen, &dns_conn_info, 0)
@@ -1643,9 +1646,15 @@ int gdpi_main(int argc, char *argv[]) {
                     else if (verdict == DNS_IN_DROP) {
                         should_reinject = 0;
                     }
-                    /* PASS / NOT_OURS: deliver unchanged */
+                    /* PASS / PASS_OTHER / NOT_OURS: deliver unchanged */
+                    dns_trusted = verdict == DNS_IN_REWRITE || verdict == DNS_IN_PASS;
                 }
                 else if (!addr.Outbound) {
+                    /* trusted for learning only when it really comes from the
+                     * clean resolver the queries were redirected to */
+                    int from_clean = packet_v4
+                        ? ppIpHdr->SrcAddr == dnsv4_addr && ppUdpHdr->SrcPort == dnsv4_port
+                        : !memcmp(ppIpV6Hdr->SrcAddr, dnsv6_addr.s6_addr, 16) && ppUdpHdr->SrcPort == dnsv6_port;
                     if ((packet_v4 && dns_handle_incoming(&ppIpHdr->DstAddr, ppUdpHdr->DstPort,
                                         packet_data, packet_dataLen,
                                         &dns_conn_info, 0))
@@ -1663,6 +1672,7 @@ int gdpi_main(int argc, char *argv[]) {
                         ppUdpHdr->DstPort = dns_conn_info.srcport;
                         ppUdpHdr->SrcPort = dns_conn_info.dstport;
                         should_recalc_checksum = 1;
+                        dns_trusted = from_clean;
                     }
                     else {
                         if (dns_is_dns_packet(packet_data, packet_dataLen, 0))
@@ -1713,10 +1723,30 @@ int gdpi_main(int argc, char *argv[]) {
                 }
             }
 
+            /* No DNS redirection (payment exclusion only): track the system's
+             * queries, so that only answers to them are learned from. */
+            else if (exclude_enabled() && !do_dnsv4_redirect && !do_dnsv6_redirect &&
+                     (packet_type == ipv4_udp_data || packet_type == ipv6_udp_data)) {
+                if (addr.Outbound && ppUdpHdr->DstPort == htons(53)) {
+                    if (packet_v4)
+                        dns_handle_outgoing(&ppIpHdr->SrcAddr, ppUdpHdr->SrcPort, &ppIpHdr->DstAddr,
+                                            ppUdpHdr->DstPort, packet_data, packet_dataLen, 0);
+                    else
+                        dns_handle_outgoing(ppIpV6Hdr->SrcAddr, ppUdpHdr->SrcPort, ppIpV6Hdr->DstAddr,
+                                            ppUdpHdr->DstPort, packet_data, packet_dataLen, 1);
+                } else if (!addr.Outbound && ppUdpHdr->SrcPort == htons(53)) {
+                    dns_trusted = packet_v4
+                        ? dns_answer_matches(&ppIpHdr->DstAddr, ppUdpHdr->DstPort, &ppIpHdr->SrcAddr,
+                                             ppUdpHdr->SrcPort, packet_data, packet_dataLen, 0)
+                        : dns_answer_matches(ppIpV6Hdr->DstAddr, ppUdpHdr->DstPort, ppIpV6Hdr->SrcAddr,
+                                             ppUdpHdr->SrcPort, packet_data, packet_dataLen, 1);
+                }
+            }
+
             /* Payment/bank names in DNS answers that reach the system (also the
              * clean resolver's, rewritten to port 53 above): remember their
              * addresses, so those connections stay untouched. */
-            if (should_reinject && !addr.Outbound && ppUdpHdr && packet_data &&
+            if (should_reinject && dns_trusted && !addr.Outbound && ppUdpHdr && packet_data &&
                 (packet_type == ipv4_udp_data || packet_type == ipv6_udp_data) &&
                 ppUdpHdr->SrcPort == htons(53) && exclude_enabled())
                 exclude_learn_dns(packet_data, packet_dataLen);
