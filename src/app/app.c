@@ -6,14 +6,12 @@
  *   TurkishDPI.exe                 the app: finds a working strategy by itself
  *                                  (learning per network), runs it, watches it
  *                                  and re-tunes when something changes.
- *   TurkishDPI.exe --engine ARGS   the packet engine (GoodbyeDPI-compatible
- *                                  options). Also used directly when the first
- *                                  argument looks like a GoodbyeDPI option,
- *                                  so old .cmd scripts and services keep working.
+ *   TurkishDPI.exe --engine ARGS   the packet engine (src/engine/engine.c,
+ *                                  options in engine_main).
  *
  * Copyright 2026 TurkishDPI contributors. Apache License 2.0.
- * Engine: GoodbyeDPI (ValdikSS) / GoodbyeDPI-Turkey (cagritaskn).
- * Auto-detection, watchdog and SNI strategies inspired by Shroudly (umutxyp, MIT).
+ * The engine's IPv4 packet path and its helpers come from Shroudly
+ * (umutxyp/Shroudly, MIT; see THIRD_PARTY_LICENSES.txt).
  */
 #define WIN32_LEAN_AND_MEAN
 #include <winsock2.h>
@@ -32,8 +30,8 @@
 #include "presets.h"
 #include "version.h"
 #include "system.h"
+#include "engine.h"
 
-int gdpi_main(int argc, char *argv[]);
 static DWORD run_hidden(const wchar_t *exe, const wchar_t *args);
 static void autostart_query(void);
 static void autostart_migrate(void);
@@ -1827,19 +1825,17 @@ int main(int argc, char *argv[]) {
         return 1;
     }
     if (argc >= 2 && !strcmp(argv[1], "--engine")) {
-        extern int gdpi_report_stats;
-        gdpi_report_stats = 1;   /* "STATS" lines are for the app only */
+        engine_report_stats = 1;   /* "STATS" lines are for the app only */
         attach_console_if_any();
         argv[1] = argv[0];
-        return gdpi_main(argc - 1, argv + 1);
+        return engine_main(argc - 1, argv + 1);
     }
     if (argc >= 2 && (!strcmp(argv[1], "--help") || !strcmp(argv[1], "-h") || !strcmp(argv[1], "/?"))) {
         MessageBoxW(NULL,
             L"TurkishDPI " TURKISHDPI_VERSION_W L"\n\n"
             L"TurkishDPI.exe                 Uygulama (otomatik mod)\n"
             L"TurkishDPI.exe --tray          Sessiz başlat (Windows açılışında)\n"
-            L"TurkishDPI.exe --engine [ARG]  Sadece motoru GoodbyeDPI argümanlarıyla çalıştır\n"
-            L"TurkishDPI.exe -9 --dns-addr … GoodbyeDPI ile birebir uyumlu kullanım\n\n"
+            L"TurkishDPI.exe --engine [ARG]  Yalnızca motoru çalıştır (--engine --help)\n\n"
             L"Ayarlar: %ProgramData%\\TurkishDPI\\TurkishDPI.ini",
             L"TurkishDPI", MB_ICONINFORMATION);
         return 0;
@@ -1849,10 +1845,6 @@ int main(int argc, char *argv[]) {
     if (argc >= 2 && !strcmp(argv[1], "--selftest")) {
         g_selftest = 1;
         return app_main(1);
-    }
-    if (argc >= 2 && argv[1][0] == '-' && strcmp(argv[1], "--tray") != 0) {
-        attach_console_if_any();
-        return gdpi_main(argc, argv);
     }
     return app_main(argc >= 2 && !strcmp(argv[1], "--tray"));
 }

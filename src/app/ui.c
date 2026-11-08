@@ -766,7 +766,7 @@ static void a11y_update(const ui_state_t *st) {
     }
     a11y_set(A_SITE_RESULT, b);
 
-    a11y_set(A_SETTINGS, L"TurkishDPI " TURKISHDPI_VERSION_W L", Apache-2.0, GoodbyeDPI tabanlı. "
+    a11y_set(A_SETTINGS, L"TurkishDPI " TURKISHDPI_VERSION_W L", Apache-2.0, kendi motoru, Shroudly çekirdeğinden. "
              L"Kaldırma: TurkishDPI durdurulur; başlangıç görevi, ayarlar, öğrenilen bilgiler, günlük ve "
              L"sürücü bu bilgisayardan silinir.");
 }
@@ -1026,7 +1026,7 @@ static void paint_settings(HDC dc) {
     hline(dc, 24, 240, 352);
     hline(dc, 24, 324, 352);
     text(dc, f_caption, P->text3, rc(24, 334, 352, 20),
-         L"TurkishDPI " TURKISHDPI_VERSION_W L" · Apache-2.0 · GoodbyeDPI tabanlı",
+         L"TurkishDPI " TURKISHDPI_VERSION_W L" · Apache-2.0 · Shroudly çekirdeğinden",
          DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
     hline(dc, 24, 364, 352);
     text(dc, f_label, P->text3, rc(24, 376, 352, 20), L"Kaldırma", DT_LEFT | DT_VCENTER | DT_SINGLELINE);

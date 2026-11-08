@@ -34,12 +34,20 @@ jobs:
       - name: Unit tests
         run: |
           mkdir -p build
-          gcc -O2 -Wall -Isrc/engine tests/exclude_test.c src/engine/exclude.c src/engine/utils/getline.c -o build/exclude_test.exe
-          gcc -O2 -Wall -Isrc/engine tests/dns_test.c src/engine/dnsredir.c -lws2_32 -o build/dns_test.exe
+          gcc -O2 -Wall -Isrc/engine tests/exclude_test.c src/engine/exclude.c -lws2_32 -o build/exclude_test.exe
+          gcc -O2 -Wall -Isrc/engine tests/dns_test.c src/engine/dns.c -lws2_32 -o build/dns_test.exe
           gcc -O2 -Wall -Isrc/app tests/diag_test.c src/app/diag.c -o build/diag_test.exe
           ./build/exclude_test.exe
           ./build/dns_test.exe
           ./build/diag_test.exe
+          # the packet engine's helpers (from Shroudly's core, with its tests)
+          CORE="src/engine/core/proto.c src/engine/core/tcpdpi.c src/engine/core/udpdpi.c src/engine/core/rawscope.c"
+          for t in proto tcpdpi udpdpi rawscope; do
+            gcc -O2 -Wall -Isrc/engine/core tests/core/test_$t.c $CORE -lws2_32 -o build/test_$t.exe
+            ./build/test_$t.exe
+          done
+          gcc -O2 -Wall -Isrc/engine/core tests/xlate_test.c src/engine/core/tcpdpi.c -o build/xlate_test.exe
+          ./build/xlate_test.exe
       - name: WinDivert.dll pinning test
         run: |
           # Any harmless DLL stands in for WinDivert.dll: with its own hash it
@@ -95,6 +103,16 @@ jobs:
           gcc -g -O1 -fsanitize=address,undefined -fno-sanitize-recover=all -Wall -Wextra \
               -Isrc/app tests/diag_test.c src/app/diag.c -o build/diag_test
           ./build/diag_test
+      - name: engine core (ASan/UBSan)
+        run: |
+          CORE="src/engine/core/proto.c src/engine/core/tcpdpi.c src/engine/core/udpdpi.c src/engine/core/rawscope.c"
+          for t in proto tcpdpi udpdpi rawscope; do
+            gcc -g -O1 -fsanitize=address,undefined -fno-sanitize-recover=all -Wall \
+                -Isrc/engine/core tests/core/test_$t.c $CORE -o build/test_$t
+            ./build/test_$t
+          done
+          gcc -g -O1 -fsanitize=address,undefined -fno-sanitize-recover=all -Wall               -Isrc/engine/core tests/xlate_test.c src/engine/core/tcpdpi.c -o build/xlate_test
+          ./build/xlate_test
 
   build:
     needs: [test, test-sanitizers]
@@ -152,7 +170,7 @@ jobs:
             mkdir -p pkg/$d
             cp build/$a/TurkishDPI.exe pkg/$d/
             cp $WINDIVERT_DIR/$w/WinDivert.dll $WINDIVERT_DIR/$w/WinDivert*.sys pkg/$d/
-            cp LICENSE NOTICE pkg/$d/
+            cp LICENSE NOTICE THIRD_PARTY_LICENSES.txt pkg/$d/
             cp $WINDIVERT_DIR/LICENSE pkg/$d/WinDivert-LICENSE.txt
             cp docs/BENIOKU.txt pkg/$d/
             (cd pkg && zip -qr ../dist/$d.zip $d)

@@ -59,14 +59,14 @@ else ifeq ($(REQUIRE_WINDIVERT_HASH)$(WDARCH),1x86)
 $(error $(WINDIVERT_SYS32) not found: cannot pin its SHA-256)
 endif
 
-ENGINE_SRC := $(wildcard src/engine/*.c src/engine/utils/*.c)
+ENGINE_SRC := $(wildcard src/engine/*.c src/engine/core/*.c)
 APP_SRC    := $(wildcard src/app/*.c)
 OBJS := $(patsubst src/%.c,$(OUT)/obj/%.o,$(ENGINE_SRC) $(APP_SRC)) $(OUT)/obj/res.o
 
 .PHONY: all clean
 all: $(OUT)/TurkishDPI.exe
 
-$(OUT)/obj/%.o: src/%.c $(wildcard src/*/*.h)
+$(OUT)/obj/%.o: src/%.c $(wildcard src/*/*.h src/*/*/*.h)
 	@mkdir -p $(dir $@)
 	$(CC) $(CFLAGS) -c $< -o $@
 

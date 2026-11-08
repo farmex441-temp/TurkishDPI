@@ -37,7 +37,7 @@ static void load_stats(void) {
     wchar_t sec[64], key[8], val[64];
     section(sec, 64);
     for (int i = 0; i < PRESET_COUNT; i++) {
-        swprintf(key, 8, L"p%d", i);
+        swprintf(key, 8, L"e%d", i);   /* "e": the engine-2 presets; old "p" records are ignored */
         GetPrivateProfileStringW(sec, key, L"", val, 64, g_ini);
         g_stats[i].trials = g_stats[i].ok = 0;
         g_stats[i].ms = 0;
@@ -49,7 +49,7 @@ static void load_stats(void) {
 static void save_stat(int i) {
     wchar_t sec[64], key[8], val[64];
     section(sec, 64);
-    swprintf(key, 8, L"p%d", i);
+    swprintf(key, 8, L"e%d", i);   /* "e": the engine-2 presets; old "p" records are ignored */
     swprintf(val, 64, L"%d,%d,%d", g_stats[i].trials, g_stats[i].ok, g_stats[i].ms);
     WritePrivateProfileStringW(sec, key, val, g_ini);
     WritePrivateProfileStringW(sec, L"Name", g_net_name, g_ini);

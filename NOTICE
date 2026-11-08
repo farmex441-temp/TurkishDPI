@@ -5,21 +5,16 @@ This product is licensed under the Apache License, Version 2.0 (see LICENSE).
 
 It includes software developed by:
 
-  * GoodbyeDPI — Copyright ValdikSS and contributors
-    https://github.com/ValdikSS/GoodbyeDPI  (Apache License 2.0)
-    The packet engine in src/engine/ is derived from it.
-
-  * GoodbyeDPI-Turkey — Copyright cagritaskn and contributors
-    https://github.com/cagritaskn/GoodbyeDPI-Turkey  (Apache License 2.0)
-    Turkey-specific strategy presets and DNS settings.
-
-  * Shroudly — Copyright (c) 2026 Codeshare Technology Ltd
+  * Shroudly - Copyright (c) 2026 Codeshare Technology Ltd
     https://github.com/umutxyp/Shroudly  (MIT License)
-    Ideas for automatic strategy probing, the network watchdog and the
-    split-before-SNI + decoy ClientHello strategies were taken from Shroudly.
-    MIT License text: https://github.com/umutxyp/Shroudly/blob/main/LICENSE
-
-  * uthash — Copyright Troy D. Hanson (BSD license), src/engine/utils/uthash.h
+    src/engine/core/ (TLS/HTTP parsing, decoy and split builders, QUIC and
+    Discord voice handling, forged-reset and decoy bookkeeping) is taken from
+    Shroudly's core/src/, and the IPv4 packet path in src/engine/engine.c is
+    adapted from its core/src/raw_windows.c. The MIT License text is in
+    THIRD_PARTY_LICENSES.txt.
 
 Binary releases bundle WinDivert 2.2.2 (https://reqrypt.org/windivert.html),
-Copyright Basil Hussain, distributed under the GNU LGPL v3.
+distributed under the GNU LGPL v3 (WinDivert-LICENSE.txt).
+
+Versions 1.x of TurkishDPI used a packet engine derived from GoodbyeDPI
+(ValdikSS, Apache License 2.0); since version 2.0 no GoodbyeDPI code remains.

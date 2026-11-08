@@ -3,7 +3,7 @@
 #include <ws2tcpip.h>
 #include <stdio.h>
 #include <string.h>
-#include "dnsredir.h"
+#include "dns.h"
 
 static int fails;
 #define EXPECT(cond, what) do { if (!(cond)) { printf("FAIL: %s\n", what); fails++; } } while (0)
@@ -96,6 +96,26 @@ int main(void) {
             n = build(m, 0x1234, 0, 1, real, 4);
             EXPECT(dns_answer_is_forged((char *)m, (unsigned)n - 2), "truncated answer is untrusted");
         }
+
+        /* 2c) a name that does not exist: the network's NXDOMAIN is held back
+         *     (it may be censorship), the clean resolver's NXDOMAIN gets through
+         *     at once instead of the program waiting for a timeout */
+        EXPECT(dns_handle_outgoing(local, lport, isp, p53, (char *)q, 29, 0), "tracked for 2c");
+        n = build(m, 0x1234, 3, 1, NULL, 0);
+        EXPECT(dns_handle_incoming_hybrid(local, lport, isp, p53, (char *)m, (unsigned)n, &ci, 0) == DNS_IN_DROP,
+               "network NXDOMAIN held back");
+        EXPECT(dns_handle_incoming_hybrid(local, lport, clean, cport, (char *)m, (unsigned)n, &ci, 0) == DNS_IN_REWRITE,
+               "clean NXDOMAIN delivered");
+        EXPECT(dns_handle_incoming_hybrid(local, lport, clean, cport, (char *)m, (unsigned)n, &ci, 0) == DNS_IN_DROP,
+               "clean duplicate dropped");
+        /* a LAN-style name whose real answer is a private address */
+        EXPECT(dns_handle_outgoing(local, lport, isp, p53, (char *)q, 29, 0), "tracked for private");
+        {
+            unsigned char lan[4] = { 192, 168, 1, 50 };
+            n = build(m, 0x1234, 0, 1, lan, 4);
+        }
+        EXPECT(dns_handle_incoming_hybrid(local, lport, clean, cport, (char *)m, (unsigned)n, &ci, 0) == DNS_IN_REWRITE,
+               "clean private answer delivered");
 
         /* 3) wrong transaction ID is not ours */
         EXPECT(dns_handle_outgoing(local, lport, isp, p53, (char *)q, 29, 0), "tracked again");
