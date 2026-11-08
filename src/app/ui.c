@@ -12,6 +12,8 @@
 #include <commctrl.h>
 #include <math.h>
 #include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
 #include <wchar.h>
 #include "app.h"
 #include "presets.h"
@@ -73,6 +75,13 @@ static int g_anim = 0, g_hover = 0, g_tracking = 0;
 static NOTIFYICONDATAW g_nid;
 static WNDPROC g_edit_proc;
 int g_payment_domains = 100;
+
+/* --ui-preview: UI only, mock state, no privileged or persistent action */
+int g_ui_preview = 0;
+static float g_force_scale = 0.0f;   /* preview --scale; 0 = window DPI */
+static int g_preview_shot = 0;       /* render off-screen, capture, exit */
+static void preview_action(const wchar_t *what);
+static int g_page = 0;               /* 0 status, 1 details, 2 settings */
 
 enum { HIT_NONE, HIT_POWER, HIT_RESCAN, HIT_PROFILE, HIT_SETTINGS, HIT_TEST, HIT_BANNER };
 enum { IDM_AUTO = 1000, IDM_AUTOSTART, IDM_PAYMENT, IDM_LOG, IDM_INI, IDM_GITHUB,
@@ -383,6 +392,7 @@ static void paint(HDC dc, RECT client) {
 /* ---------- tray ---------- */
 static void tray_update(void) {
     ui_state_t st;
+    if (g_ui_preview) return;
     EnterCriticalSection(&g_lock);
     st = g_ui;
     LeaveCriticalSection(&g_lock);
@@ -506,6 +516,11 @@ static LRESULT CALLBACK edit_proc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
 static void command(int id);
 
 static void click(int id) {
+    if (g_ui_preview && (id == HIT_POWER || id == HIT_RESCAN || id == HIT_TEST)) {
+        preview_action(id == HIT_POWER ? L"Duraklat/Devam" : id == HIT_RESCAN ? L"Yeniden tara"
+                                                                              : L"Site testi");
+        return;
+    }
     switch (id) {
     case HIT_POWER:    post_cmd(CMD_TOGGLE_PAUSE, 0); break;
     case HIT_RESCAN:   post_cmd(CMD_RESCAN, 0); break;
@@ -521,6 +536,13 @@ static void click(int id) {
 
 static void command(int id) {
     wchar_t buf[MAX_PATH + 8];
+    if (g_ui_preview) {
+        /* Single gate: no menu or banner action runs in preview, including
+         * ones added later (ini writes, schtasks, uninstall, URLs, exit). */
+        if (id == IDM_EXIT) { PostMessageW(g_wnd, WM_CLOSE, 0, 0); return; }
+        if (id) preview_action(L"Menü komutu");
+        return;
+    }
     if (id >= IDM_PRESET && id < IDM_PRESET + PRESET_COUNT) {
         post_cmd(CMD_SELECT, id - IDM_PRESET);
         return;
@@ -577,7 +599,7 @@ static void command(int id) {
 }
 
 static void apply_dpi(UINT dpi) {
-    g_scale = dpi / 96.0f;
+    g_scale = g_force_scale > 0 ? g_force_scale : dpi / 96.0f;
     fonts_create();
     layout();
 }
@@ -638,6 +660,7 @@ static LRESULT CALLBACK wndproc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
         return 0;
     case WM_DPICHANGED: {
         RECT *r = (RECT *)lp;
+        if (g_force_scale > 0) return 0;   /* preview pins the scale */
         apply_dpi(HIWORD(wp));
         SetWindowPos(h, NULL, r->left, r->top, r->right - r->left, r->bottom - r->top,
                      SWP_NOZORDER | SWP_NOACTIVATE);
@@ -662,6 +685,12 @@ static LRESULT CALLBACK wndproc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
         DeleteObject(bmp);
         DeleteDC(mem);
         EndPaint(h, &ps);
+        return 0;
+    }
+    case WM_PRINTCLIENT: {             /* PrintWindow (preview screenshots) */
+        RECT cr;
+        GetClientRect(h, &cr);
+        paint((HDC)wp, cr);
         return 0;
     }
     case WM_CTLCOLOREDIT:
@@ -709,15 +738,16 @@ static LRESULT CALLBACK wndproc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
         }
         return 0;
     case WM_CLOSE:
+        if (g_ui_preview) { DestroyWindow(h); PostQuitMessage(0); return 0; }
         ShowWindow(h, SW_HIDE);
         KillTimer(h, 1);
         SetProcessWorkingSetSize(GetCurrentProcess(), (SIZE_T)-1, (SIZE_T)-1);
         return 0;
     case WM_POWERBROADCAST:
-        if (wp == PBT_APMRESUMEAUTOMATIC) app_network_event();
+        if (wp == PBT_APMRESUMEAUTOMATIC && !g_ui_preview) app_network_event();
         return TRUE;
     case WM_ENDSESSION:
-        if (wp) app_exit();
+        if (wp && !g_ui_preview) app_exit();
         return 0;
     }
     return DefWindowProcW(h, msg, wp, lp);
@@ -745,16 +775,20 @@ int ui_init(HINSTANCE inst) {
     wc.hIcon = LoadIconW(inst, MAKEINTRESOURCEW(1));
     wc.hIconSm = g_tray_icons[0];
     wc.hCursor = LoadCursor(NULL, IDC_ARROW);
-    wc.lpszClassName = L"TurkishDPI_main";
+    /* the preview must not be found by the real app's FindWindowW() */
+    wc.lpszClassName = g_ui_preview ? L"TurkishDPI_preview" : L"TurkishDPI_main";
     if (!RegisterClassExW(&wc)) return 0;
 
-    g_wnd = CreateWindowExW(0, wc.lpszClassName, L"TurkishDPI",
+    g_wnd = CreateWindowExW(g_preview_shot ? WS_EX_TOOLWINDOW : 0, wc.lpszClassName,
+                            g_ui_preview ? L"TurkishDPI (önizleme)" : L"TurkishDPI",
                             WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX | WS_CLIPCHILDREN,
                             CW_USEDEFAULT, CW_USEDEFAULT, 100, 100, NULL, NULL, inst, NULL);
     if (!g_wnd) return 0;
     dark_titlebar(g_wnd);
     fit_window();
-    {
+    if (g_preview_shot) {
+        SetWindowPos(g_wnd, NULL, -32000, -32000, 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+    } else {
         /* centre on the work area */
         RECT wr, wa;
         GetWindowRect(g_wnd, &wr);
@@ -763,6 +797,7 @@ int ui_init(HINSTANCE inst) {
                      wa.top + ((wa.bottom - wa.top) - (wr.bottom - wr.top)) / 2, 0, 0,
                      SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
     }
+    if (g_ui_preview) return 1;   /* no tray icon, no UIPI changes */
     g_taskbar_created = RegisterWindowMessageW(L"TaskbarCreated");
     {
         /* We run elevated: UIPI drops messages from the (non-elevated)
@@ -802,4 +837,239 @@ void ui_refresh(void) {
 
 HWND ui_hwnd(void) {
     return g_wnd;
+}
+
+/* ---------- --ui-preview ---------- */
+/* Developer tool: shows the window with mock state so the design can be
+ * reviewed and screenshotted without administrator rights. Nothing here
+ * touches the data folder, the registry, the network, the engine or the
+ * tray; every action is stopped by the gates in click() and command(). */
+static void preview_action(const wchar_t *what) {
+    EnterCriticalSection(&g_lock);
+    _snwprintf(g_ui.site_result, 159, L"Önizleme: \"%ls\" çalıştırılmadı.", what);
+    g_ui.site_result[159] = 0;
+    LeaveCriticalSection(&g_lock);
+    InvalidateRect(g_wnd, NULL, FALSE);
+}
+
+static void pv_state(state_kind_t k, const wchar_t *status, const wchar_t *detail) {
+    g_ui.kind = k;
+    _snwprintf(g_ui.status, 127, L"%ls", status);
+    g_ui.status[127] = 0;
+    _snwprintf(g_ui.detail, 159, L"%ls", detail);
+    g_ui.detail[159] = 0;
+}
+
+static void pv_targets(int n, const wchar_t *const *names, const int *ok, const int *ms) {
+    int sum = 0, cnt = 0;
+    g_ui.ntargets = n;
+    for (int i = 0; i < n; i++) {
+        _snwprintf(g_ui.target[i], 63, L"%ls", names[i]);
+        g_ui.target[i][63] = 0;
+        g_ui.target_ok[i] = ok ? ok[i] : -1;
+        g_ui.target_ms[i] = ms ? ms[i] : -1;
+        if (ok && ok[i] == 1 && ms && ms[i] > 0) { sum += ms[i]; cnt++; }
+    }
+    g_ui.avg_ms = cnt ? sum / cnt : -1;
+}
+
+/* Returns 0 for an unknown scenario. All values are mock data. */
+static int preview_fill(const char *name) {
+    static const wchar_t *t3[] = { L"discord.com", L"www.roblox.com", L"www.wattpad.com" };
+    static const wchar_t *t8[] = { L"discord.com", L"www.roblox.com", L"www.wattpad.com",
+                                   L"pastebin.com", L"imgur.com", L"cdn.discordapp.com",
+                                   L"bir-cok-uzun-alt-alan-adi.ornek-site.com.tr", L"www.example.org" };
+    static const int ok3[] = { 1, 1, 1 }, ms3[] = { 148, 162, 139 };
+    static const int okp[] = { 1, 0, 1 }, msp[] = { 151, -1, 143 };
+    static const int ok8[] = { 1, 1, 1, 1, 0, 1, 1, -1 };
+    static const int ms8[] = { 148, 162, 139, 201, -1, 187, 1234, -1 };
+    static const int unk[] = { -1, -1, -1 }, none[] = { 0, 0, 0 };
+
+    ZeroMemory(&g_ui, sizeof(g_ui));
+    g_ui.preset = 4;
+    g_ui.dns = 4;
+    g_ui.dns_ms = 42;
+    g_ui.hybrid = 1;
+    g_ui.n_block_ips = 1;
+    g_ui.autostart = 1;
+    g_ui.learned = 3;
+    g_ui.scan_total = 10;
+    wcscpy(g_ui.network, L"Ev Wi-Fi");
+    g_auto = 1; g_preset = 4; g_paused = 0; g_payment_protect = 1;
+    pv_targets(3, t3, ok3, ms3);
+    g_ui.st_packets = 18432; g_ui.st_https = 812; g_ui.st_http = 37;
+    g_ui.st_dns = 655; g_ui.st_excluded = 6;
+    pv_state(ST_ACTIVE, L"Koruma aktif", L"SNI Parçalama + Sahte SNI (DNS)");
+
+    if (!strcmp(name, "active")) {
+        /* defaults above */
+    } else if (!strcmp(name, "active-long")) {
+        wcscpy(g_ui.network, L"Çok Uzun Bir Kablosuz Ağ Adı (5 GHz) – Misafir");
+        pv_targets(8, t8, ok8, ms8);
+        g_ui.st_packets = 4294967295UL; g_ui.st_https = 123456789UL;
+        g_ui.st_dns = 98765432UL; g_ui.st_excluded = 1234567UL;
+        pv_state(ST_ACTIVE, L"Koruma aktif", L"Agresif SNI (DNS, 2x sahte paket)");
+        g_ui.preset = 5; g_preset = 5;
+        _snwprintf(g_ui.site_result, 159, L"%ls",
+                   L"bir-cok-uzun-alt-alan-adi.ornek-site.com.tr açılıyor (1234 ms). Mevcut profil "
+                   L"bu siteyi de açıyor, değişiklik gerekmedi.");
+        g_ui.site_result[159] = 0;
+    } else if (!strcmp(name, "partial")) {
+        pv_targets(3, t3, okp, msp);
+        pv_state(ST_PARTIAL, L"Kısmen aktif", L"Türkiye Standart (-5, TTL 5, DNS)");
+        g_ui.preset = 0; g_preset = 0;
+    } else if (!strcmp(name, "scanning") || !strcmp(name, "first-run")) {
+        pv_targets(3, t3, unk, NULL);
+        g_ui.preset = -1;
+        g_ui.scan_pos = 3;
+        g_ui.st_packets = 0;
+        if (name[0] == 'f') { g_ui.learned = 0; g_ui.dns_ms = 0; }
+        pv_state(ST_SCANNING, L"Profil 3/10 deneniyor…", L"Auto-TTL (-5, DNS)");
+    } else if (!strcmp(name, "standby")) {
+        g_ui.preset = -1;
+        g_ui.st_packets = 0;
+        pv_state(ST_STANDBY, L"Engel algılanmadı", L"Bekleme modunda – engel çıkarsa devreye girer");
+    } else if (!strcmp(name, "paused")) {
+        pv_targets(3, t3, unk, NULL);
+        g_ui.preset = -1; g_paused = 1;
+        g_ui.st_packets = 0;
+        pv_state(ST_PAUSED, L"Duraklatıldı", L"Açmak için düğmeye basın");
+    } else if (!strcmp(name, "offline")) {
+        pv_targets(3, t3, unk, NULL);
+        g_ui.preset = -1;
+        g_ui.network[0] = 0;
+        g_ui.st_packets = 0;
+        pv_state(ST_OFFLINE, L"İnternet bağlantısı yok", L"Bağlantı gelince otomatik başlayacak");
+    } else if (!strcmp(name, "error-driver")) {
+        pv_targets(3, t3, unk, NULL);
+        g_ui.preset = -1; g_ui.driver_err = 2;
+        g_ui.st_packets = 0;
+        pv_state(ST_ERROR, L"Sürücü başlatılamadı (2)",
+                 L"WinDivert64.sys bulunamadı. Zip'teki tüm dosyaları TurkishDPI.exe ile aynı "
+                 L"klasöre çıkarın; dosya oradaysa antivirüs karantinasına bakın.");
+    } else if (!strcmp(name, "error-av")) {
+        pv_targets(3, t3, unk, NULL);
+        g_ui.preset = -1; g_ui.driver_err = 1275;
+        g_ui.st_packets = 0;
+        pv_state(ST_ERROR, L"Sürücü başlatılamadı (1275)",
+                 L"Sürücü bir güvenlik yazılımı tarafından engellendi (ör. Kaspersky).");
+    } else if (!strcmp(name, "error-noprofile")) {
+        pv_targets(3, t3, none, NULL);
+        g_ui.preset = -1;
+        g_ui.st_packets = 0;
+        pv_state(ST_ERROR, L"Çalışan profil bulunamadı", L"Günlük dosyasına bakın");
+    } else if (!strcmp(name, "banner-update")) {
+        wcscpy(g_ui.update_tag, L"v1.2.0");
+    } else if (!strcmp(name, "banner-proxy")) {
+        g_ui.proxy_broken = 1;
+    } else if (!strcmp(name, "banner-rival")) {
+        wcscpy(g_ui.rival, L"GoodbyeDPI");
+    } else if (!strcmp(name, "banner-multi")) {
+        wcscpy(g_ui.update_tag, L"v1.2.0");
+        g_ui.proxy_broken = 1;
+        wcscpy(g_ui.rival, L"GoodbyeDPI");
+    } else if (!strcmp(name, "manual")) {
+        g_auto = 0; g_preset = 7; g_ui.preset = 7;
+        pv_state(ST_ACTIVE, L"Koruma aktif", L"Superonline (-9)");
+    } else if (!strcmp(name, "payment-off")) {
+        g_payment_protect = 0;
+    } else {
+        return 0;
+    }
+    return 1;
+}
+
+/* Writes the client area as a top-down 32-bit BMP (no GDI+ codecs). */
+static int preview_capture(HWND h, const char *path) {
+    RECT cr;
+    BITMAPINFO bi;
+    BITMAPFILEHEADER fh;
+    void *bits = NULL;
+    HDC sdc, mem;
+    HBITMAP bmp, old;
+    FILE *f;
+    int ok = 0, w, hh;
+
+    GetClientRect(h, &cr);
+    w = cr.right;
+    hh = cr.bottom;
+    if (w <= 0 || hh <= 0) return 0;
+    ZeroMemory(&bi, sizeof(bi));
+    bi.bmiHeader.biSize = sizeof(bi.bmiHeader);
+    bi.bmiHeader.biWidth = w;
+    bi.bmiHeader.biHeight = -hh;
+    bi.bmiHeader.biPlanes = 1;
+    bi.bmiHeader.biBitCount = 32;
+    bi.bmiHeader.biCompression = BI_RGB;
+    sdc = GetDC(NULL);
+    mem = CreateCompatibleDC(sdc);
+    bmp = CreateDIBSection(sdc, &bi, DIB_RGB_COLORS, &bits, NULL, 0);
+    ReleaseDC(NULL, sdc);
+    if (!mem || !bmp) {
+        if (mem) DeleteDC(mem);
+        if (bmp) DeleteObject(bmp);
+        return 0;
+    }
+    old = SelectObject(mem, bmp);
+    if (PrintWindow(h, mem, 1 /* PW_CLIENTONLY */)) {
+        GdiFlush();
+        ZeroMemory(&fh, sizeof(fh));
+        fh.bfType = 0x4D42;
+        fh.bfOffBits = sizeof(fh) + sizeof(bi.bmiHeader);
+        fh.bfSize = fh.bfOffBits + (DWORD)w * (DWORD)hh * 4;
+        f = fopen(path, "wb");
+        if (f) {
+            ok = fwrite(&fh, sizeof(fh), 1, f) == 1 &&
+                 fwrite(&bi.bmiHeader, sizeof(bi.bmiHeader), 1, f) == 1 &&
+                 fwrite(bits, (size_t)w * hh * 4, 1, f) == 1;
+            ok = (fclose(f) == 0) && ok;
+        }
+    }
+    SelectObject(mem, old);
+    DeleteObject(bmp);
+    DeleteDC(mem);
+    return ok;
+}
+
+/* TurkishDPI.exe --ui-preview <scenario> [--scale F] [--page P] [--shot out.bmp]
+ * Exit codes: 0 ok, 2 bad arguments/scenario, 3 window failed, 4 capture failed. */
+int ui_preview_main(int argc, char **argv) {
+    const char *scenario, *shot = NULL;
+    MSG m;
+
+    if (argc < 3 || argv[2][0] == '-') return 2;
+    scenario = argv[2];
+    for (int i = 3; i < argc; i++) {
+        if (!strcmp(argv[i], "--scale") && i + 1 < argc) {
+            g_force_scale = (float)atof(argv[++i]);
+            if (g_force_scale < 0.5f || g_force_scale > 4.0f) return 2;
+        } else if (!strcmp(argv[i], "--page") && i + 1 < argc) {
+            const char *p = argv[++i];
+            if (strcmp(p, "status") && strcmp(p, "details") && strcmp(p, "settings")) return 2;
+            g_page = !strcmp(p, "details") ? 1 : !strcmp(p, "settings") ? 2 : 0;
+        } else if (!strcmp(argv[i], "--shot") && i + 1 < argc) {
+            shot = argv[++i];
+        } else {
+            return 2;
+        }
+    }
+    g_ui_preview = 1;
+    g_preview_shot = shot != NULL;
+    InitializeCriticalSection(&g_lock);
+    if (!preview_fill(scenario)) return 2;
+    g_anim = 40;   /* fixed spinner angle: screenshots are reproducible */
+    if (!ui_init(GetModuleHandleW(NULL))) return 3;
+    if (shot) {
+        ShowWindow(g_wnd, SW_SHOWNOACTIVATE);
+        UpdateWindow(g_wnd);
+        return preview_capture(g_wnd, shot) ? 0 : 4;
+    }
+    ui_show();
+    while (GetMessageW(&m, NULL, 0, 0) > 0) {
+        if (!IsDialogMessageW(g_wnd, &m)) {
+            TranslateMessage(&m);
+            DispatchMessageW(&m);
+        }
+    }
+    return 0;
 }

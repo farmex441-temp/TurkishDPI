@@ -71,6 +71,8 @@ void ui_refresh(void);
 HWND ui_hwnd(void);
 void ui_tray_menu(HWND owner);
 extern int g_payment_domains;
+extern int g_ui_preview;                     /* --ui-preview: mock state, no actions */
+int  ui_preview_main(int argc, char **argv); /* developer UI preview / screenshots */
 
 /* smart.c */
 void smart_network_changed(void);           /* re-read network identity      */
