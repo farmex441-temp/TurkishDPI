@@ -285,5 +285,9 @@ SHA-256 in the workflow.
   (Elastic Rootkit.WinDivert, Kaspersky not-a-virus RiskTool, Lionic
   Riskware) that every WinDivert-based tool gets. The v1.0 single-file exe was
   3/55 (embedded driver), rc2's exe 3/71 (ML "dropper"); the rc3 changes
-  target those heuristics. Remaining options are code signing and
-  false-positive reports to the vendors (both need the owner).
+  target those heuristics. v1.2.0 (2026-11-08): x64 zip 3/68 (the same three
+  WinDivert labels), `TurkishDPI.exe` alone 1/71 (Elastic ML "Malicious (high
+  Confidence)"; Microsoft, Kaspersky, ESET, BitDefender etc. clean), local
+  Defender scan clean. Remaining options are code signing and false-positive
+  reports to the vendors (both need the owner); do not try to dodge ML
+  detectors with packing/obfuscation.
