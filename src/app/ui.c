@@ -100,6 +100,7 @@ int g_ui_preview = 0;
 static float g_force_scale = 0.0f;   /* preview --scale; 0 = window DPI */
 static int g_preview_shot = 0;       /* render off-screen, capture, exit */
 static int g_preview_focus = 0;      /* --focus: draw this control as focused */
+static int g_preview_press = 0;      /* --press: draw this control as pressed */
 static void preview_action(const wchar_t *what);
 
 enum { PG_STATUS, PG_DETAILS, PG_SETTINGS, PG_ALL = -1 };
@@ -130,23 +131,24 @@ typedef struct {
 } ctl_t;
 
 static ctl_t g_ctl[] = {
-    { ID_TAB0,      PG_ALL,      K_TAB,       150,  14,  66, 28, NULL },
-    { ID_TAB1,      PG_ALL,      K_TAB,       216,  14,  88, 28, NULL },
-    { ID_TAB2,      PG_ALL,      K_TAB,       304,  14,  70, 28, NULL },
+    /* hit areas >= 32 px tall; tabs/small buttons draw a smaller shape */
+    { ID_TAB0,      PG_ALL,      K_TAB,       150,  12,  66, 32, NULL },
+    { ID_TAB1,      PG_ALL,      K_TAB,       216,  12,  88, 32, NULL },
+    { ID_TAB2,      PG_ALL,      K_TAB,       304,  12,  70, 32, NULL },
     { ID_BANNER,    PG_STATUS,   K_BANNER,     24,  60, 352, 36, NULL },
     { ID_POWER,     PG_STATUS,   K_RING,      128, 104, 144, 144, NULL },
     { ID_ACTION,    PG_STATUS,   K_SECONDARY,  80, 440, 240, 36, NULL },
-    { ID_PAYLINE,   PG_STATUS,   K_PAYLINE,    24, 488, 352, 24, NULL },
-    { ID_CHANGE,    PG_DETAILS,  K_SMALL,     288,  62,  88, 24, NULL },
-    { ID_RESCAN,    PG_DETAILS,  K_SMALL,     256, 192, 120, 24, NULL },
+    { ID_PAYLINE,   PG_STATUS,   K_PAYLINE,    24, 484, 352, 32, NULL },
+    { ID_CHANGE,    PG_DETAILS,  K_SMALL,     288,  58,  88, 32, NULL },
+    { ID_RESCAN,    PG_DETAILS,  K_SMALL,     256, 188, 120, 32, NULL },
     { ID_TEST,      PG_DETAILS,  K_PRIMARY,   288, 300,  88, 32, NULL },
     { ID_T_AUTO,    PG_SETTINGS, K_TOGGLE,     24,  60, 352, 56, NULL },
     { ID_T_START,   PG_SETTINGS, K_TOGGLE,     24, 116, 352, 56, NULL },
     { ID_T_PAY,     PG_SETTINGS, K_TOGGLE,     24, 172, 352, 56, NULL },
-    { ID_L_LOG,     PG_SETTINGS, K_LINK,       24, 252, 172, 28, NULL },
-    { ID_L_INI,     PG_SETTINGS, K_LINK,      204, 252, 172, 28, NULL },
-    { ID_L_AV,      PG_SETTINGS, K_LINK,       24, 284, 172, 28, NULL },
-    { ID_L_GH,      PG_SETTINGS, K_LINK,      204, 284, 172, 28, NULL },
+    { ID_L_LOG,     PG_SETTINGS, K_LINK,       24, 248, 172, 32, NULL },
+    { ID_L_INI,     PG_SETTINGS, K_LINK,      204, 248, 172, 32, NULL },
+    { ID_L_AV,      PG_SETTINGS, K_LINK,       24, 282, 172, 32, NULL },
+    { ID_L_GH,      PG_SETTINGS, K_LINK,      204, 282, 172, 32, NULL },
     { ID_UNINSTALL, PG_SETTINGS, K_DANGER,     24, 452, 180, 36, NULL },
     { ID_EXIT,      PG_SETTINGS, K_SECONDARY, 276, 452, 100, 36, NULL },
 };
@@ -443,6 +445,35 @@ static void text(HDC dc, HFONT f, COLORREF c, RECT r, const wchar_t *s, UINT fla
     DrawTextW(dc, s, -1, &r, flags | DT_NOPREFIX);
 }
 
+/* Centered, wrapped text with balanced lines (like CSS text-wrap: balance):
+ * the narrowest width that keeps the same line count, so a short last
+ * word is never left alone on its own line. */
+static void text_balanced(HDC dc, HFONT f, COLORREF c, RECT r, const wchar_t *s) {
+    const UINT fl = DT_CENTER | DT_WORDBREAK | DT_EDITCONTROL | DT_NOPREFIX;
+    int full = r.right - r.left, lo, hi, h0;
+    RECT m = { 0, 0, full, 0 };
+    SelectObject(dc, f);
+    DrawTextW(dc, s, -1, &m, fl | DT_CALCRECT);
+    h0 = m.bottom;
+    lo = full / 2;
+    hi = full;
+    if (h0 > 0) {
+        TEXTMETRICW tm;
+        GetTextMetricsW(dc, &tm);
+        if (h0 > tm.tmHeight) {               /* wraps: search the narrowest width */
+            while (hi - lo > 2) {
+                int mid = (lo + hi) / 2;
+                RECT t = { 0, 0, mid, 0 };
+                DrawTextW(dc, s, -1, &t, fl | DT_CALCRECT);
+                if (t.bottom > h0) lo = mid; else hi = mid;
+            }
+            r.left += (full - hi) / 2;
+            r.right = r.left + hi;
+        }
+    }
+    text(dc, f, c, r, s, fl | DT_END_ELLIPSIS);
+}
+
 static RECT rc(int x, int y, int w, int h) {
     RECT r = { S(x), S(y), S(x + w), S(y + h) };
     return r;
@@ -626,8 +657,7 @@ static void paint_status(HDC dc, const ui_state_t *st) {
     text(dc, f_display, P->text, rc(24, 258, 352, 34), kind_headline(st),
          DT_CENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
     /* errors carry an instruction: allow three lines and drop the card */
-    text(dc, f_body, P->text2, rc(40, 294, 320, err ? 60 : 40), sub,
-         DT_CENTER | DT_WORDBREAK | DT_END_ELLIPSIS | DT_EDITCONTROL);
+    text_balanced(dc, f_body, P->text2, rc(40, 294, 320, err ? 60 : 40), sub);
 
     if (st->kind == ST_ACTIVE || st->kind == ST_STANDBY || st->kind == ST_PARTIAL ||
         st->kind == ST_SCANNING || st->kind == ST_STARTING) {
@@ -710,7 +740,7 @@ static void paint_details(HDC dc, const ui_state_t *st) {
         int y = 220 + i * 20;
         int ok = st->target_ok[i];
         COLORREF gc = ok < 0 ? P->text3 : ok ? P->ok : P->error;
-        glyph(dc, ok < 0 ? GL_DASH : ok ? GL_CHECK : GL_CROSS, SF(31), SF(y + 10.0f), SF(10), SF(1.8f), gc);
+        glyph(dc, ok < 0 ? GL_DASH : ok ? GL_CHECK : GL_CROSS, SF(31), SF(y + 10.0f), SF(10), SF(1.5f), gc);
         text(dc, f_body, P->text, rc(44, y, 240, 20), st->target[i],
              DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
         if (ok < 0) wcscpy(buf, L"—");
@@ -779,10 +809,11 @@ static int toggle_on(int id) {
     return id == ID_T_AUTO ? g_auto : id == ID_T_START ? ui_autostart() : g_payment_protect;
 }
 
-static void draw_ring(HDC dc, RECT r, const ui_state_t *st, int hot, int focus) {
+static void draw_ring(HDC dc, RECT r, const ui_state_t *st, int hot, int focus, int pressed) {
     COLORREF col = state_color(st->kind);
     float cx = (r.left + r.right) / 2.0f, cy = (r.top + r.bottom) / 2.0f;
-    float rad = SF(60), halo = SF(72);
+    float k = pressed ? 0.96f : 1.0f;              /* press feedback */
+    float rad = SF(60) * k, halo = SF(72) * k;
     GpGraphics *g = gp(dc);
     GpBrush *b;
     GpPen *pen;
@@ -817,7 +848,7 @@ static void draw_ring(HDC dc, RECT r, const ui_state_t *st, int hot, int focus) 
     /* hover shows what a click does; otherwise the state glyph */
     gl = hot ? (st->kind == ST_PAUSED ? GL_PLAY : GL_PAUSE) : state_glyph(st->kind);
     if (gl >= 0) {
-        glyph(dc, gl, cx, cy, SF(40), SF(5), hot ? P->text : col);
+        glyph(dc, gl, cx, cy, SF(40) * k, SF(5), hot ? P->text : col);
     } else if (st->scan_total > 0 && st->scan_pos > 0) {
         wchar_t buf[16];
         RECT tr = { (LONG)(cx - SF(50)), (LONG)(cy - SF(14)), (LONG)(cx + SF(50)), (LONG)(cy + SF(14)) };
@@ -829,7 +860,7 @@ static void draw_ring(HDC dc, RECT r, const ui_state_t *st, int hot, int focus) 
 
 static void draw_item(const DRAWITEMSTRUCT *d) {
     ctl_t *c = ctl((int)d->CtlID);
-    RECT r = { 0, 0, d->rcItem.right - d->rcItem.left, d->rcItem.bottom - d->rcItem.top };
+    RECT r = { 0, 0, d->rcItem.right - d->rcItem.left, d->rcItem.bottom - d->rcItem.top }, v;
     HDC mem;
     HBITMAP bmp, old;
     HBRUSH under;
@@ -839,7 +870,7 @@ static void draw_item(const DRAWITEMSTRUCT *d) {
 
     if (!c) return;
     hot = g_hot == c->id;
-    pressed = (d->itemState & ODS_SELECTED) != 0;
+    pressed = (d->itemState & ODS_SELECTED) != 0 || c->id == g_preview_press;
     focus = ((d->itemState & ODS_FOCUS) && !(d->itemState & ODS_NOFOCUSRECT)) ||
             c->id == g_preview_focus;
     GetWindowTextW(d->hwndItem, label, 200);
@@ -853,35 +884,43 @@ static void draw_item(const DRAWITEMSTRUCT *d) {
     DeleteObject(under);
     SetBkMode(mem, TRANSPARENT);
 
+    /* v = visible shape. Tabs and small buttons get a taller hit area than
+     * they look (control rect >= 32 px); pressed buttons shrink to 96 %. */
+    v = r;
+    if (c->kind == K_TAB) InflateRect(&v, 0, -S(2));
+    if (c->kind == K_SMALL) InflateRect(&v, 0, -S(4));
+    if (pressed && c->kind != K_TOGGLE && c->kind != K_LINK && c->kind != K_PAYLINE &&
+        c->kind != K_BANNER && c->kind != K_RING)
+        InflateRect(&v, -(int)((v.right - v.left) * 0.02f + 0.5f), -(int)((v.bottom - v.top) * 0.02f + 0.5f));
+
     switch (c->kind) {
     case K_TAB: {
         static const wchar_t *names[] = { L"Durum", L"Ayrıntılar", L"Ayarlar" };
         int sel = c->id - ID_TAB0 == g_page;
-        if (sel || hot) fill_round(mem, r, 6, sel ? P->hover : mix(P->surface, P->hover, 50), -1, 0);
-        text(mem, sel ? f_label : f_body, sel ? P->text : P->text2, r, names[c->id - ID_TAB0],
+        if (sel || hot) fill_round(mem, v, 6, sel ? P->hover : mix(P->surface, P->hover, 50), -1, 0);
+        text(mem, sel ? f_label : f_body, sel ? P->text : P->text2, v, names[c->id - ID_TAB0],
              DT_CENTER | DT_VCENTER | DT_SINGLELINE);
-        if (focus) focus_ring(mem, r, 6);
+        if (focus) focus_ring(mem, v, 6);
         break;
     }
     case K_RING: {
         ui_state_t st;
         snapshot(&st);
-        draw_ring(mem, r, &st, hot, focus);
+        draw_ring(mem, r, &st, hot, focus, pressed);
         break;
     }
     case K_PRIMARY:
-        fill_round(mem, r, 8, pressed ? P->accent : hot ? P->accent_hover : P->accent, -1, 0);
-        text(mem, f_button, P->on_accent, r, label, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
-        if (focus) focus_ring(mem, r, 8);
+        fill_round(mem, v, 8, hot ? P->accent_hover : P->accent, -1, 0);
+        text(mem, f_button, P->on_accent, v, label, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+        if (focus) focus_ring(mem, v, 8);
         break;
     case K_SECONDARY:
     case K_SMALL:
     case K_DANGER:
-        fill_round(mem, r, c->kind == K_SMALL ? 6 : 8, pressed ? P->bg : hot ? P->hover : P->surface,
-                   (long)P->border, SF(1));
+        fill_round(mem, v, c->kind == K_SMALL ? 6 : 8, hot ? P->hover : P->surface, (long)P->border, SF(1));
         text(mem, c->kind == K_SMALL ? f_caption : f_body, c->kind == K_DANGER ? P->error : P->text,
-             r, label, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
-        if (focus) focus_ring(mem, r, c->kind == K_SMALL ? 6 : 8);
+             v, label, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+        if (focus) focus_ring(mem, v, c->kind == K_SMALL ? 6 : 8);
         break;
     case K_LINK: {
         RECT tr = r;
@@ -931,7 +970,7 @@ static void draw_item(const DRAWITEMSTRUCT *d) {
         bk = banner_kind(&st, &others);
         col = bk == 1 ? P->busy : P->warn;
         fill_round(mem, r, 8, mix(P->bg, col, hot ? 24 : 16), (long)mix(P->bg, col, 40), SF(1));
-        glyph(mem, bk == 1 ? GL_UP : GL_BANG, SF(20), r.bottom / 2.0f, SF(14), SF(2), col);
+        glyph(mem, bk == 1 ? GL_UP : GL_BANG, SF(20), r.bottom / 2.0f, SF(14), SF(1.5f), col);
         tr.left = S(36);
         tr.right -= S(bk == 3 ? (others ? 40 : 12) : (others ? 96 : 64));
         text(mem, f_caption, P->text, tr, label, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
@@ -951,7 +990,7 @@ static void draw_item(const DRAWITEMSTRUCT *d) {
     case K_PAYLINE: {
         RECT tr = r;
         COLORREF col = g_payment_protect ? P->ok : P->warn;
-        glyph(mem, g_payment_protect ? GL_CHECK : GL_BANG, SF(8), r.bottom / 2.0f, SF(10), SF(1.8f), col);
+        glyph(mem, g_payment_protect ? GL_CHECK : GL_BANG, SF(8), r.bottom / 2.0f, SF(10), SF(1.5f), col);
         tr.left = S(20);
         text(mem, f_caption, g_payment_protect ? (hot ? P->text : P->text2) : P->warn, tr, label,
              DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
@@ -1694,6 +1733,9 @@ int ui_preview_main(int argc, char **argv) {
         } else if (!strcmp(argv[i], "--focus") && i + 1 < argc) {
             g_preview_focus = ID_TAB0 + atoi(argv[++i]);   /* index into g_ctl ids */
             if (!ctl(g_preview_focus)) return 2;
+        } else if (!strcmp(argv[i], "--press") && i + 1 < argc) {
+            g_preview_press = ID_TAB0 + atoi(argv[++i]);
+            if (!ctl(g_preview_press)) return 2;
         } else {
             return 2;
         }
