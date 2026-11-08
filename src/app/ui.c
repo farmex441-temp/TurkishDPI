@@ -564,8 +564,10 @@ static void command(int id) {
         app_open_url(L"windowsdefender://threat");
         break;
     case IDM_UNINSTALL:
-        if (MessageBoxW(g_wnd, L"TurkishDPI durdurulacak; Windows başlangıç görevi, ayarlar, öğrenilen "
-                               L"bilgiler, günlük ve WinDivert sürücüsü kaldırılacak.\n\nDevam edilsin mi?",
+        if (MessageBoxW(g_wnd, L"TurkishDPI durdurulacak; Windows başlangıç görevi, Program Files kopyası, "
+                               L"ayarlar, öğrenilen bilgiler, günlük ve WinDivert sürücü hizmeti kaldırılacak.\n\n"
+                               L"Not: GoodbyeDPI veya zapret gibi başka bir WinDivert aracı kullanıyorsanız "
+                               L"onu yeniden başlatmanız gerekebilir.\n\nDevam edilsin mi?",
                         L"Kaldır ve temizle", MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2) == IDYES)
             app_uninstall();
         break;
@@ -767,14 +769,17 @@ int ui_init(HINSTANCE inst) {
     {
         /* We run elevated: UIPI drops messages from the (non-elevated)
          * Explorer unless allowed, so the icon would never come back after
-         * Explorer restarts and tray clicks could be lost. */
+         * Explorer restarts and tray clicks could be lost. Only these two are
+         * let through: WM_COMMAND must NOT be, or any unprivileged program
+         * could post menu commands (exit, autostart, profile...) to us. Our
+         * own menus send WM_COMMAND from inside this process, which UIPI
+         * never blocks. */
         typedef BOOL (WINAPI *filter_fn)(HWND, UINT, DWORD, void *);
         filter_fn f = (filter_fn)(void *)GetProcAddress(GetModuleHandleW(L"user32.dll"),
                                                         "ChangeWindowMessageFilterEx");
         if (f) {
             f(g_wnd, g_taskbar_created, 1 /* MSGFLT_ALLOW */, NULL);
             f(g_wnd, WM_TRAY, 1, NULL);
-            f(g_wnd, WM_COMMAND, 1, NULL);
         }
     }
     tray_add();

@@ -15,9 +15,11 @@
 #include <shellapi.h>
 #include <aclapi.h>
 #include <sddl.h>
+#include <shlobj.h>
 #include <stdio.h>
 #include <string.h>
 #include <wchar.h>
+#include "sysdll.h"
 #include "app.h"
 #include "system.h"
 #include "version.h"
@@ -324,6 +326,103 @@ static void delete_tree(const wchar_t *dir) {
 
 static void remove_tree_safe(const wchar_t *dir) {
     delete_tree(dir);
+}
+
+/* ---------- protected install folder (autostart runs from there) ---------- */
+int sys_install_dir(wchar_t *out, size_t cap) {
+    wchar_t *pf = NULL;
+    int ok = 0;
+    if (SUCCEEDED(SHGetKnownFolderPath(&FOLDERID_ProgramFiles, 0, NULL, &pf))) {
+        ok = _snwprintf(out, cap, L"%ls\\TurkishDPI", pf) > 0;
+        out[cap - 1] = 0;
+        CoTaskMemFree(pf);
+    }
+    return ok;
+}
+
+/* 1 if both files exist and have identical contents. */
+static int same_file_contents(const wchar_t *a, const wchar_t *b) {
+    HANDLE fa = CreateFileW(a, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, 0, NULL);
+    HANDLE fb = CreateFileW(b, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, 0, NULL);
+    int same = 0;
+    if (fa != INVALID_HANDLE_VALUE && fb != INVALID_HANDLE_VALUE) {
+        LARGE_INTEGER sa, sb;
+        if (GetFileSizeEx(fa, &sa) && GetFileSizeEx(fb, &sb) && sa.QuadPart == sb.QuadPart) {
+            static unsigned char ba[65536], bb[65536];   /* controller thread only */
+            DWORD ra, rb;
+            same = 1;
+            while (same && ReadFile(fa, ba, sizeof(ba), &ra, NULL) && ReadFile(fb, bb, sizeof(bb), &rb, NULL)) {
+                if (ra != rb || memcmp(ba, bb, ra) != 0) same = 0;
+                if (!ra) break;
+            }
+        }
+    }
+    if (fa != INVALID_HANDLE_VALUE) CloseHandle(fa);
+    if (fb != INVALID_HANDLE_VALUE) CloseHandle(fb);
+    return same;
+}
+
+/*
+ * Copies the program (exe, WinDivert DLL + driver, licences) into the
+ * admin-only %ProgramFiles%\TurkishDPI and returns the exe path there.
+ *
+ * Why: the logon task starts TurkishDPI elevated without a UAC prompt. If it
+ * pointed at the folder the zip was extracted to (usually Downloads, which
+ * any program of the user can write), replacing TurkishDPI.exe or planting a
+ * DLL there would give that program administrator rights at the next logon.
+ * Unchanged files are left alone (a loaded driver file cannot be replaced).
+ */
+int sys_install_copy(const wchar_t *running_exe, wchar_t *installed_exe, size_t cap) {
+    static const struct { const wchar_t *name; int required; } FILES[] = {
+        { L"TurkishDPI.exe", 1 }, { L"WinDivert.dll", 1 }, { L"WinDivert64.sys", 0 },
+        { L"WinDivert32.sys", 0 }, { L"LICENSE", 0 }, { L"NOTICE", 0 },
+        { L"WinDivert-LICENSE.txt", 0 }, { L"BENIOKU.txt", 0 },
+    };
+    wchar_t dst_dir[MAX_PATH], src_dir[MAX_PATH], src[MAX_PATH], dst[MAX_PATH], tmp[MAX_PATH];
+    wchar_t *slash;
+    int drivers = 0;
+
+    if (!sys_install_dir(dst_dir, MAX_PATH)) return 0;
+    if (!GetFullPathNameW(running_exe, MAX_PATH, src_dir, NULL)) return 0;
+    if (!(slash = wcsrchr(src_dir, L'\\'))) return 0;
+    *slash = 0;
+    if (_snwprintf(installed_exe, cap, L"%ls\\TurkishDPI.exe", dst_dir) < 0) return 0;
+    installed_exe[cap - 1] = 0;
+    if (!_wcsicmp(src_dir, dst_dir)) return 1;        /* already running from there */
+    if (!sys_secure_dir(dst_dir)) return 0;            /* admin-owned, no junctions */
+
+    for (size_t i = 0; i < sizeof(FILES) / sizeof(FILES[0]); i++) {
+        DWORD attr;
+        _snwprintf(src, MAX_PATH, L"%ls\\%ls", src_dir, FILES[i].name);  src[MAX_PATH - 1] = 0;
+        _snwprintf(dst, MAX_PATH, L"%ls\\%ls", dst_dir, FILES[i].name);  dst[MAX_PATH - 1] = 0;
+        attr = GetFileAttributesW(src);
+        if (attr == INVALID_FILE_ATTRIBUTES || (attr & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT))) {
+            if (FILES[i].required) return 0;
+            continue;
+        }
+        if (wcsstr(FILES[i].name, L".sys")) drivers++;
+        if (same_file_contents(src, dst)) continue;
+        /* copy next to the target, then swap it in: never a half-written file */
+        _snwprintf(tmp, MAX_PATH, L"%ls.new", dst);  tmp[MAX_PATH - 1] = 0;
+        if (!CopyFileW(src, tmp, FALSE)) return 0;
+        if (!MoveFileExW(tmp, dst, MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
+            DeleteFileW(tmp);
+            return 0;
+        }
+    }
+    return drivers > 0;
+}
+
+void sys_uninstall_install_dir(const wchar_t *running_exe) {
+    wchar_t dir[MAX_PATH];
+    DWORD attr;
+    (void)running_exe;
+    if (!sys_install_dir(dir, MAX_PATH)) return;
+    attr = GetFileAttributesW(dir);
+    /* the running exe (if it is this copy) goes at the next reboot */
+    if (attr != INVALID_FILE_ATTRIBUTES && (attr & FILE_ATTRIBUTE_DIRECTORY) &&
+        !(attr & FILE_ATTRIBUTE_REPARSE_POINT))
+        delete_tree(dir);
 }
 
 void sys_uninstall(const wchar_t *data_dir) {

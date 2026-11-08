@@ -22,7 +22,23 @@ LDFLAGS := -mwindows -static -Wl,--gc-sections \
 ifeq ($(ARCH),x86_64)
 LDFLAGS += -Wl,--high-entropy-va
 endif
-LIBS    := -lws2_32 -lwinhttp -liphlpapi -lshell32 -lole32 -luser32 -ladvapi32 -luuid -lgdiplus -lcomctl32 -lgdi32
+# winhttp.dll and iphlpapi.dll are deliberately NOT linked: they are not
+# KnownDLLs, so as static imports of this elevated exe they would be looked up
+# in its (possibly user-writable) folder first. src/app/sysdll.c loads them
+# from System32 at run time.
+LIBS    := -lws2_32 -lshell32 -lole32 -luser32 -ladvapi32 -luuid -lgdiplus -lcomctl32 -lgdi32
+
+# SHA-256 of the WinDivert.dll that ships next to the exe; the engine refuses
+# any other DLL (src/engine/windivert_dyn.c). Taken from the WinDivert folder
+# used for the build (CI: the checksum-pinned official archive).
+# REQUIRE_WINDIVERT_HASH=1 (CI) turns a missing DLL into a build error.
+WDARCH := $(if $(filter x86_64,$(ARCH)),x64,x86)
+WINDIVERT_DLL_SHA256 ?= $(shell sha256sum $(WINDIVERT)/$(WDARCH)/WinDivert.dll 2>/dev/null | cut -c1-64)
+ifneq ($(WINDIVERT_DLL_SHA256),)
+CFLAGS += -DWINDIVERT_DLL_SHA256=\"$(WINDIVERT_DLL_SHA256)\"
+else ifeq ($(REQUIRE_WINDIVERT_HASH),1)
+$(error $(WINDIVERT)/$(WDARCH)/WinDivert.dll not found: cannot pin its SHA-256)
+endif
 
 ENGINE_SRC := $(wildcard src/engine/*.c src/engine/utils/*.c)
 APP_SRC    := $(wildcard src/app/*.c)

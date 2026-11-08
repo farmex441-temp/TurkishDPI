@@ -162,17 +162,20 @@ int dns_answer_is_forged(const char *data, unsigned int len) {
  * Ensures redirected DNS changes take effect immediately
  */
 void flush_dns_cache() {
-    INT_PTR WINAPI (*DnsFlushResolverCache)();
-
-    HMODULE dnsapi = LoadLibrary("dnsapi.dll");
+    typedef BOOL (WINAPI *flush_fn)(void);
+    flush_fn flush;
+    /* TurkishDPI: System32 only. dnsapi.dll is not a KnownDLL, so a plain
+     * LoadLibrary would search the (possibly user-writable) exe folder first
+     * from this elevated process. */
+    HMODULE dnsapi = LoadLibraryExW(L"dnsapi.dll", NULL, LOAD_LIBRARY_SEARCH_SYSTEM32);
     if (dnsapi == NULL)
     {
         printf("Can't load dnsapi.dll to flush DNS cache!\n");
         exit(EXIT_FAILURE);
     }
 
-    DnsFlushResolverCache = GetProcAddress(dnsapi, "DnsFlushResolverCache");
-    if (DnsFlushResolverCache == NULL || !DnsFlushResolverCache())
+    flush = (flush_fn)(void *)GetProcAddress(dnsapi, "DnsFlushResolverCache");
+    if (flush == NULL || !flush())
         printf("Can't flush DNS cache!");
     FreeLibrary(dnsapi);
 }

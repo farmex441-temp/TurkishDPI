@@ -19,6 +19,7 @@
 #include <netioapi.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include "sysdll.h"
 #include "app.h"
 #include "presets.h"
 

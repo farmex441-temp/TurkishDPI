@@ -26,6 +26,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <wchar.h>
+#include "sysdll.h"
 #include "app.h"
 #include "presets.h"
 #include "version.h"
@@ -34,6 +35,7 @@
 int gdpi_main(int argc, char *argv[]);
 static DWORD run_hidden(const wchar_t *exe, const wchar_t *args);
 static void autostart_query(void);
+static void autostart_migrate(void);
 
 /* ---------- shared state ---------- */
 CRITICAL_SECTION g_lock;
@@ -63,6 +65,7 @@ static int g_selftest = 0;        /* --selftest: scan, verify, log, exit */
 static wchar_t g_rival_notified[48];
 
 static PROCESS_INFORMATION g_engine;
+static char g_running_args[1024];     /* arguments of the running engine */
 static HANDLE g_engine_active;
 static volatile LONG g_engine_err = 0;
 
@@ -72,15 +75,28 @@ static const wchar_t *g_targets[PROBE_MAX_HOSTS], *g_control[PROBE_MAX_HOSTS];
 static int g_ntargets, g_ncontrol;
 
 /* ---------- logging ---------- */
+#define LOG_MAX_BYTES (1024 * 1024)
+
 static void log_write(const char *data, DWORD len) {
     HANDLE f;
     DWORD w;
+    LARGE_INTEGER size;
+    int rotate = 0;
     EnterCriticalSection(&g_log_lock);
     f = CreateFileW(g_log, FILE_APPEND_DATA, FILE_SHARE_READ | FILE_SHARE_WRITE, NULL,
                     OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
     if (f != INVALID_HANDLE_VALUE) {
         WriteFile(f, data, len, &w, NULL);
+        /* rotated while running too: an instance that stays up for months
+         * must not grow the log without bound */
+        rotate = GetFileSizeEx(f, &size) && size.QuadPart > LOG_MAX_BYTES;
         CloseHandle(f);
+    }
+    if (rotate) {
+        wchar_t old[MAX_PATH];
+        _snwprintf(old, MAX_PATH - 1, L"%ls.old", g_log);
+        old[MAX_PATH - 1] = 0;
+        MoveFileExW(g_log, old, MOVEFILE_REPLACE_EXISTING);
     }
     LeaveCriticalSection(&g_log_lock);
 }
@@ -154,6 +170,39 @@ static int notify(const wchar_t *title, const wchar_t *text) {
     return Shell_NotifyIconW(NIM_MODIFY, &n) ? 1 : 0;
 }
 
+/* Kind of state the user was last told about with a balloon (see notify_state). */
+static state_kind_t g_notified_kind = ST_STARTING;
+
+/* ---------- why the controller is doing what it does ---------- */
+/* Set before each scan/start; written to the log ("decision: ... reason=")
+ * and shown next to the profile name, so a re-tune is never unexplained. */
+typedef enum {
+    WHY_STARTUP, WHY_USER_RESCAN, WHY_USER_AUTO, WHY_USER_PROFILE, WHY_RESUME_PAUSE,
+    WHY_SETTINGS, WHY_NETWORK, WHY_WAKE, WHY_WATCHDOG, WHY_CRASH, WHY_ONLINE, WHY_SITE_TEST
+} why_t;
+
+static const struct { const char *code; const wchar_t *text; } WHY[] = {
+    { "startup",       L"açılışta seçildi" },
+    { "user_rescan",   L"yeniden taramada seçildi" },
+    { "user_auto",     L"otomatik moda geçince seçildi" },
+    { "user_profile",  L"elle seçildi" },
+    { "resume",        L"devam ettirildi" },
+    { "settings",      L"ayar değişince yeniden başlatıldı" },
+    { "network",       L"ağ değişince seçildi" },
+    { "wake",          L"uykudan dönünce seçildi" },
+    { "watchdog",      L"bekçi sorun bulunca seçildi" },
+    { "engine_crash",  L"motor kapanınca yeniden başlatıldı" },
+    { "online",        L"internet gelince seçildi" },
+    { "site_test",     L"site testi için seçildi" },
+};
+static const char *g_reason_code = "startup";
+static const wchar_t *g_reason_text = L"açılışta seçildi";
+
+static void set_reason(why_t w) {
+    g_reason_code = WHY[w].code;
+    g_reason_text = WHY[w].text;
+}
+
 /* ---------- config ---------- */
 static int ini_int(const wchar_t *key, int def) {
     return (int)GetPrivateProfileIntW(L"TurkishDPI", key, def, g_ini);
@@ -199,6 +248,7 @@ static void config_load(void) {
     g_dns_hybrid = ini_int(L"DnsHybrid", 1) != 0;
     g_watchdog_min = ini_int(L"WatchdogMinutes", 10);
     if (g_watchdog_min < 1) g_watchdog_min = 1;
+    if (g_watchdog_min > 240) g_watchdog_min = 240;   /* minutes * 60000 must fit a DWORD */
     GetPrivateProfileStringW(L"TurkishDPI", L"Control", g_control_buf, g_control_buf,
                              sizeof(g_control_buf) / sizeof(wchar_t), g_ini);
     g_ncontrol = split_hosts(g_control_buf, g_control);
@@ -326,6 +376,7 @@ static void engine_stop(void) {
     reader = g_reader;
     g_reader = NULL;
     g_running_preset = -1;
+    g_running_args[0] = 0;
     LeaveCriticalSection(&g_lock);
     /* slow part outside the lock, so painting never waits on it */
     if (pi.hProcess) {
@@ -354,9 +405,16 @@ static int engine_start(int preset, int dns) {
     PROCESS_INFORMATION pi;
     DWORD r;
 
+    build_args(preset, dns, args, sizeof(args));
+    /* Already running with exactly these arguments: keep it. Restarting
+     * would only drop the user's connections for nothing (a watchdog or
+     * rescan that ends on the same preset). */
+    if (g_running_preset >= 0 && engine_alive() && !strcmp(args, g_running_args)) {
+        g_running_preset = preset;
+        return 1;
+    }
     engine_stop();
     if (g_quitting) return 0;
-    build_args(preset, dns, args, sizeof(args));
     MultiByteToWideChar(CP_ACP, 0, args, -1, wargs, 1024);
     swprintf(cmd, 2048, L"\"%ls\" --engine %ls", g_exe, wargs);
     log_line("starting engine: preset %d: %s", preset, args);
@@ -400,7 +458,10 @@ static int engine_start(int preset, int dns) {
     r = WaitForMultipleObjects(2, waits, FALSE, 10000);
     if (r == WAIT_OBJECT_0) {
         g_running_preset = preset;
+        memcpy(g_running_args, args, sizeof(g_running_args));
+        EnterCriticalSection(&g_lock);
         g_ui.started_tick = GetTickCount();
+        LeaveCriticalSection(&g_lock);
         Sleep(300);  /* let the DNS cache flush and filters settle */
         return 1;
     }
@@ -425,6 +486,8 @@ static const wchar_t *windivert_error_text(long e) {
                       L"Onları kapatıp bilgisayarı yeniden başlatın.";
     case 1275: return L"Sürücü bir güvenlik yazılımı tarafından engellendi (ör. Kaspersky).";
     case 1753: return L"Base Filtering Engine (BFE) hizmeti kapalı. Hizmetler'den açın.";
+    case 1006: return L"WinDivert.dll beklenen dosya değil (değiştirilmiş ya da başka bir sürüm). "
+                      L"Güvenlik için yüklenmedi. TurkishDPI'ı resmi zip'ten yeniden çıkarın.";
     default:   return NULL;
     }
 }
@@ -518,6 +581,39 @@ static void learn_block_ips(void) {
     load_block_ips();
 }
 
+static unsigned long long now_seconds(void) {
+    FILETIME ft;
+    ULARGE_INTEGER u;
+    GetSystemTimeAsFileTime(&ft);
+    u.LowPart = ft.dwLowDateTime;
+    u.HighPart = ft.dwHighDateTime;
+    return u.QuadPart / 10000000ull;
+}
+
+/* Learning needs the engine stopped (a moment without protection), so it is
+ * done at most once a day per network; block pages rarely change. */
+#define BLOCK_IP_RELEARN_S (24ull * 3600ull)
+
+static int block_ips_stale(void) {
+    wchar_t sec[80], val[32];
+    unsigned long long t;
+    swprintf(sec, 80, L"net_%ls", smart_network_id());
+    GetPrivateProfileStringW(sec, L"bt", L"", val, 32, g_ini);
+    if (!val[0]) return 1;
+    t = _wcstoui64(val, NULL, 10);
+    return now_seconds() < t || now_seconds() - t > BLOCK_IP_RELEARN_S;
+}
+
+static void learn_block_ips_if_stale(void) {
+    wchar_t sec[80], val[32];
+    if (!block_ips_stale()) { load_block_ips(); return; }
+    engine_stop();   /* the network's real answers must be seen */
+    learn_block_ips();
+    swprintf(sec, 80, L"net_%ls", smart_network_id());
+    _ui64tow(now_seconds(), val, 10);   /* no %llu: msvcrt and ucrt differ */
+    WritePrivateProfileStringW(sec, L"bt", val, g_ini);
+}
+
 /* Block-page addresses stored for the current network. Every value is
  * validated: it ends up on the elevated engine's command line. */
 static void load_block_ips(void) {
@@ -552,9 +648,24 @@ static int engine_fatal(void) {
     g_quiet_start = 0;
     if (g_engine_err != g_last_fatal) {   /* no repeated balloons from the watchdog */
         notify(L"TurkishDPI çalışamıyor", msg);
+        g_notified_kind = ST_ERROR;   /* the next success is news again */
         g_last_fatal = g_engine_err;
     }
     return 1;
+}
+
+/*
+ * Balloon policy: a balloon only when the kind of state the user was last
+ * told about changes (e.g. error -> active, active -> partial). Restarts after
+ * an engine crash, watchdog re-checks, setting changes and rescans that end
+ * where they started stay silent; the log and the window still show them.
+ * A quiet start (--tray) records the state without showing it.
+ */
+
+static void notify_state(state_kind_t kind, const wchar_t *title, const wchar_t *text) {
+    if (kind == g_notified_kind) return;
+    g_notified_kind = kind;
+    notify(title, text);
 }
 
 static void announce(int p, int score) {
@@ -562,16 +673,20 @@ static void announce(int p, int score) {
     g_preset = p;
     g_last_fatal = 0;
     g_last_score = score;
+    EnterCriticalSection(&g_lock);
     g_ui.driver_err = 0;
+    LeaveCriticalSection(&g_lock);
     config_save();
-    swprintf(d, 160, L"%ls", PRESETS[p].name);
+    _snwprintf(d, 159, L"%ls · %ls", PRESETS[p].name, g_reason_text);
+    d[159] = 0;
+    log_line("decision: preset %d (%d/%d) reason=%s", p, score, g_ntargets, g_reason_code);
     if (score >= g_ntargets) {
         set_state(ST_ACTIVE, L"Koruma aktif", d);
-        notify(L"TurkishDPI aktif", PRESETS[p].name);
+        notify_state(ST_ACTIVE, L"TurkishDPI aktif", PRESETS[p].name);
     } else {
         set_state(ST_PARTIAL, L"Kısmen aktif", d);
-        notify(L"TurkishDPI kısmen çalışıyor",
-               L"Bazı test siteleri açılamadı; en iyi sonuç veren profil kullanılıyor.");
+        notify_state(ST_PARTIAL, L"TurkishDPI kısmen çalışıyor",
+                     L"Bazı test siteleri açılamadı; en iyi sonuç veren profil kullanılıyor.");
     }
     g_quiet_start = 0;
 }
@@ -632,8 +747,10 @@ void app_uninstall(void) {
     engine_stop();
     run_hidden(L"schtasks.exe", L"/Delete /F /TN \"TurkishDPI\"");
     sys_uninstall(g_dir);
+    sys_uninstall_install_dir(g_exe);
     probe_flush_dns_cache();
-    MessageBoxW(NULL, L"TurkishDPI kaldırıldı: başlangıç görevi, ayarlar, günlük ve sürücü silindi.\n"
+    MessageBoxW(NULL, L"TurkishDPI kaldırıldı: başlangıç görevi, Program Files kopyası, ayarlar, günlük ve "
+                      L"WinDivert sürücü hizmeti silindi.\n"
                       L"Son olarak TurkishDPI.exe dosyasını silebilirsiniz.", L"TurkishDPI",
                 MB_ICONINFORMATION);
     ExitProcess(0);
@@ -739,20 +856,27 @@ static void auto_scan(void) {
     int known_before[PRESET_COUNT], learned_before;
 
     InterlockedExchange(&g_scan_aborted, 0);
+    log_line("scan: reason=%s", g_reason_code);
     set_state(ST_SCANNING, L"Bağlantı kontrol ediliyor…", L"");
-    engine_stop();
+    /* The running engine (if any) stays on while the connection and the DNS
+     * servers are measured: protection is only interrupted when a different
+     * preset actually has to be tried (engine_start keeps an identical one). */
     probe_flush_dns_cache();
     smart_network_changed();
     system_checks();
 
     if (!control_ok()) {
-        set_state(ST_OFFLINE, L"İnternet bağlantısı yok", L"Bağlantı gelince otomatik başlayacak");
-        log_line("control sites unreachable, waiting for network");
-        return;
+        int had_engine = g_running_preset >= 0;
+        engine_stop();   /* never blame the link for what the engine broke */
+        if (!had_engine || !control_ok()) {
+            set_state(ST_OFFLINE, L"İnternet bağlantısı yok", L"Bağlantı gelince otomatik başlayacak");
+            log_line("control sites unreachable, waiting for network");
+            return;
+        }
     }
     set_state(ST_SCANNING, L"En hızlı DNS ölçülüyor…", L"");
     pick_dns();
-    if (g_dns_hybrid) learn_block_ips();
+    if (g_dns_hybrid) learn_block_ips_if_stale();
     smart_order(order, PRESET_COUNT);
     for (int i = 0; i < PRESET_COUNT; i++) known_before[i] = smart_known(i);
     learned_before = smart_learned_count();
@@ -822,11 +946,20 @@ static void auto_scan(void) {
             g_last_score = 0;
             set_state(ST_ERROR, L"Çalışan profil bulunamadı", L"Günlük dosyasına bakın");
         }
-        if (!was) notify(L"TurkishDPI", L"Hiçbir profil tüm test sitelerini açamadı.");
+        if (!was) notify_state(ST_PARTIAL, L"TurkishDPI", L"Hiçbir profil tüm test sitelerini açamadı.");
     }
 }
 
-static int health_ok(void) {
+/*
+ * record = 1: the result goes into this network's statistics. A failure only
+ * counts once it was confirmed (see watchdog_check). Successes count once an
+ * hour (every 6th check at the default interval): otherwise the watchdog's
+ * own runs would make up nearly all of the history and push the running
+ * preset's success rate towards 100% just for being the one that runs.
+ */
+static int g_health_passes = 0;
+
+static int health_ok(int record) {
     int score, need, s;
     if (g_running_preset >= 0 && !engine_alive()) return 0;
     score = targets_score(NULL);
@@ -834,8 +967,37 @@ static int health_ok(void) {
      * IP block). Only getting worse than that is a reason to rescan. */
     need = (g_ui.kind == ST_PARTIAL && g_last_score >= 0) ? g_last_score : g_ntargets;
     s = score >= need;
-    if (g_running_preset >= 0 && g_ui.kind != ST_PARTIAL) smart_record(g_running_preset, s, 0);
+    if (record && g_running_preset >= 0 && g_ui.kind != ST_PARTIAL &&
+        (!s || ++g_health_passes % 6 == 0))
+        smart_record(g_running_preset, s, 0);
     return s;
+}
+
+/*
+ * Watchdog check with a second strike: one failed probe round (a target site
+ * having a bad minute, a lost packet) is not worth a rescan that interrupts
+ * every connection. A failure is re-checked after a short pause; only a
+ * repeated failure counts. Returns 1 healthy, 0 failed twice, -1 interrupted
+ * by a command or exit (the caller simply goes back to its loop).
+ */
+#define WATCHDOG_RECHECK_MS 20000
+
+static int watchdog_check(void) {
+    HANDLE w[2];
+    DWORD r;
+    if (health_ok(1)) return 1;
+    if (g_running_preset >= 0 && !engine_alive()) return 0;   /* no point waiting */
+    log_line("watchdog: first check failed, re-checking in %d s", WATCHDOG_RECHECK_MS / 1000);
+    w[0] = g_quit_event;
+    w[1] = g_cmd_event;
+    r = WaitForMultipleObjects(2, w, FALSE, WATCHDOG_RECHECK_MS);
+    if (r == WAIT_OBJECT_0 + 1) SetEvent(g_cmd_event);   /* auto-reset: give it back */
+    if (r != WAIT_TIMEOUT || g_quitting) return -1;
+    if (health_ok(1)) {
+        log_line("watchdog: transient failure, second check passed");
+        return 1;
+    }
+    return 0;
 }
 
 static void manual_start(int p) {
@@ -899,7 +1061,35 @@ static void site_test(const wchar_t *raw) {
     }
     if (!control_ok()) { site_result(L"İnternet yok, %ls test edilemedi", host); return; }
 
-    site_result(L"%ls engelli – çözüm aranıyor…", host);
+    /* Why does it not open? Only DNS and TLS/SNI blocks can be fixed by a
+     * different preset; trying all of them for an IP block or a name that
+     * does not exist would just cut the connection for nothing. */
+    {
+        diag_facts_t f;
+        diag_t d;
+        site_result(L"%ls inceleniyor (DNS, bağlantı, TLS)…", host);
+        probe_collect_facts(host, DNS_SERVERS[g_dns].v4, DNS_SERVERS[g_dns].port,
+                            (const char (*)[16])g_block_ips, g_n_block_ips, 4000, &f);
+        d = diag_classify(&f);
+        log_line("site test: diagnosis %s (system dns %d/%d forged, clean dns %d, tcp %d/%d)",
+                 diag_code(d), f.sys_bogus, f.sys_n, f.clean_n, f.tcp_ok, f.tcp_tried);
+        if (!diag_bypassable(d)) {
+            /* short: the result line is one line wide */
+            site_result(d == DIAG_OK ? L"✓ %ls açılıyor"
+                      : d == DIAG_NO_DNS ? L"✗ %ls: alan adı bulunamadı (yazım hatası?)"
+                      : L"✗ %ls: IP engeli ya da sunucu kapalı – DPI ile aşılamaz", host);
+            if (g_scan_aborted && g_auto) auto_scan();   /* a scan we interrupted must still finish */
+            return;
+        }
+        switch (d) {
+        case DIAG_DNS_POISON:
+            site_result(L"%ls: DNS engeli – çözüm aranıyor…", host);
+            break;
+        default:
+            site_result(L"%ls: SNI/TLS engeli – çözüm aranıyor…", host);
+            break;
+        }
+    }
     set_state(ST_SCANNING, L"Site için çözüm aranıyor…", host);
     smart_order(order, PRESET_COUNT);
     for (int k = 0; k < PRESET_COUNT; k++) {
@@ -918,7 +1108,7 @@ static void site_test(const wchar_t *raw) {
             return;
         }
     }
-    site_result(L"✗ %ls açılamadı: IP/sunucu engeli olabilir (DPI ile aşılamaz)", host);
+    site_result(L"✗ %ls: hiçbir profil açamadı (DPI'ın aşamadığı bir engel)", host);
     if (!g_auto)
         manual_start(g_preset);                /* a manual choice stays the user's */
     else if (!g_scan_aborted && prev >= 0 && engine_start(prev, g_dns))
@@ -940,7 +1130,8 @@ static DWORD WINAPI controller(LPVOID unused) {
     NotifyAddrChange(&notify_h, &ov);
 
     smart_network_changed();
-    if (!g_selftest) autostart_query();
+    if (!g_selftest) { autostart_query(); autostart_migrate(); }
+    set_reason(WHY_STARTUP);
     if (g_auto) auto_scan(); else manual_start(g_preset);
     if (g_selftest) selftest_finish();
 
@@ -977,16 +1168,19 @@ static DWORD WINAPI controller(LPVOID unused) {
             if (cmd == CMD_TOGGLE_PAUSE) cmd = g_paused ? CMD_RESUME : CMD_PAUSE;
             if (cmd != CMD_TESTSITE) InterlockedExchange(&g_scan_aborted, 0);
             switch (cmd) {
-            case CMD_RESCAN:  g_paused = 0; auto_scan(); break;
-            case CMD_AUTO:    g_auto = 1; g_paused = 0; config_save(); auto_scan(); break;
+            case CMD_RESCAN:  g_paused = 0; set_reason(WHY_USER_RESCAN); auto_scan(); break;
+            case CMD_AUTO:    g_auto = 1; g_paused = 0; config_save();
+                              set_reason(WHY_USER_AUTO); auto_scan(); break;
             case CMD_SELECT:  if (arg >= 0 && arg < PRESET_COUNT) {
                                   g_auto = 0; g_paused = 0; g_preset = (int)arg;
+                                  set_reason(WHY_USER_PROFILE);
                                   config_save(); manual_start((int)arg);
                               }
                               break;
             case CMD_PAUSE:   g_paused = 1; engine_stop(); probe_flush_dns_cache();
                               set_state(ST_PAUSED, L"Duraklatıldı", L"Açmak için düğmeye basın"); break;
             case CMD_RESTART: /* settings changed: restart what runs, no full rescan */
+                              set_reason(WHY_SETTINGS);
                               if (!g_paused && g_running_preset >= 0) {
                                   int p = g_running_preset;
                                   if (engine_start(p, g_dns)) announce(p, targets_score(NULL));
@@ -995,6 +1189,7 @@ static DWORD WINAPI controller(LPVOID unused) {
                               }
                               /* fall through */
             case CMD_RESUME:  g_paused = 0;
+                              if (cmd == CMD_RESUME) set_reason(WHY_RESUME_PAUSE);
                               if (g_auto) auto_scan(); else manual_start(g_preset);
                               break;
             case CMD_AUTOSTART: autostart_set((int)arg); break;
@@ -1003,6 +1198,7 @@ static DWORD WINAPI controller(LPVOID unused) {
                 EnterCriticalSection(&g_lock);
                 wcscpy(h, g_site_req);
                 LeaveCriticalSection(&g_lock);
+                set_reason(WHY_SITE_TEST);
                 if (!g_paused) site_test(h);
                 break;
             }
@@ -1014,8 +1210,25 @@ static DWORD WINAPI controller(LPVOID unused) {
         if (g_paused || r == WAIT_OBJECT_0) continue;
 
         if (netchg) {
-            Sleep(4000);   /* let DHCP/DNS settle */
-            log_line("network change detected");
+            /* Let DHCP/DNS settle, and fold a burst of address changes (VPN,
+             * Hyper-V/WSL/Docker adapters, IPv4 + IPv6 arriving one by one)
+             * into one check: wait until 4 s pass without another change,
+             * 20 s at most. Commands queued meanwhile run right after. */
+            DWORD settle_start = GetTickCount();
+            int changes = 1, wake = r == WAIT_OBJECT_0 + 2;
+            for (;;) {
+                HANDLE sw[2] = { g_quit_event, g_net_event };
+                DWORD left = 20000 - (GetTickCount() - settle_start), sr;
+                if ((int)left <= 0) break;
+                sr = WaitForMultipleObjects(2, sw, FALSE, left < 4000 ? left : 4000);
+                if (sr == WAIT_OBJECT_0 || g_quitting) return 0;
+                if (sr != WAIT_OBJECT_0 + 1) break;
+                ResetEvent(g_net_event);
+                NotifyAddrChange(&notify_h, &ov);
+                changes++;
+            }
+            log_line("network change detected (%d event(s))%s", changes, wake ? ", after sleep" : "");
+            set_reason(wake ? WHY_WAKE : WHY_NETWORK);
             smart_network_changed();
             if (g_dns_hybrid) load_block_ips();   /* this network's, not the last one's */
             if (!control_ok()) {
@@ -1024,13 +1237,14 @@ static DWORD WINAPI controller(LPVOID unused) {
                 continue;
             }
             /* still fine: stay quiet (no balloon for every address change) */
-            if (!health_ok()) { if (g_auto) auto_scan(); else manual_start(g_preset); }
+            if (!health_ok(1)) { if (g_auto) auto_scan(); else manual_start(g_preset); }
             continue;
         }
         if (eng && r == WAIT_OBJECT_0 + 3) {
             int p = g_running_preset >= 0 ? g_running_preset : g_preset;
             DWORD now = GetTickCount();
             log_line("engine exited unexpectedly");
+            set_reason(WHY_CRASH);
             engine_stop();
             /* crashes count only when they come close together */
             fails = (last_crash && now - last_crash < 10u * 60000u) ? fails + 1 : 1;
@@ -1043,12 +1257,24 @@ static DWORD WINAPI controller(LPVOID unused) {
         }
         /* watchdog */
         system_checks();
-        if (!health_ok()) {
-            log_line("watchdog: health check failed");
-            if (control_ok()) { if (g_auto) auto_scan(); else manual_start(g_preset); }
-            else { engine_stop(); set_state(ST_OFFLINE, L"İnternet bağlantısı yok", L""); }
-        } else if (g_ui.kind == ST_OFFLINE) {
-            if (g_auto) auto_scan(); else manual_start(g_preset);
+        if (g_ui.kind == ST_OFFLINE) {
+            /* offline: only the cheap control check every 30 s */
+            if (control_ok()) {
+                set_reason(WHY_ONLINE);
+                if (g_auto) auto_scan(); else manual_start(g_preset);
+            }
+            continue;
+        }
+        {
+            int h = watchdog_check();
+            if (h < 0) continue;              /* a command or exit came first */
+            if (!h) {
+                log_line("watchdog: health check failed twice");
+                set_reason(WHY_WATCHDOG);
+                if (control_ok()) { if (g_auto) auto_scan(); else manual_start(g_preset); }
+                else { engine_stop(); set_state(ST_OFFLINE, L"İnternet bağlantısı yok", L""); }
+            }
+            continue;
         }
     }
     return 0;
@@ -1144,15 +1370,25 @@ static void xml_escape(const wchar_t *in, wchar_t *out, size_t cap) {
  * defaults "only on AC power", "stop on battery" and "stop after 3 days",
  * which silently turn protection off on laptops.
  */
-void autostart_set(int on) {
+static int autostart_register(int on, int quiet) {
     int ok = 0;
     if (on) {
         wchar_t xml_path[MAX_PATH], exe[MAX_PATH * 2], user[256] = L"", args[MAX_PATH + 64];
-        wchar_t xml[4096];
+        wchar_t xml[4096], installed[MAX_PATH];
         DWORD ulen = 256;
         HANDLE f;
         DWORD w;
-        xml_escape(g_exe, exe, MAX_PATH * 2);
+        /* The task runs elevated without a UAC prompt, so it must never point
+         * at a folder ordinary programs can write to (see sys_install_copy). */
+        if (!sys_install_copy(g_exe, installed, MAX_PATH)) {
+            log_line("autostart: could not install into Program Files (%lu)", GetLastError());
+            if (!quiet)
+                notify(L"Windows ile başlat açılamadı",
+                       L"TurkishDPI, Program Files\\TurkishDPI klasörüne kopyalanamadı. "
+                       L"Güvenlik nedeniyle başlangıç görevi başka bir klasörden çalıştırılmaz.");
+            return 0;
+        }
+        xml_escape(installed, exe, MAX_PATH * 2);
         GetUserNameW(user, &ulen);
         {
             wchar_t dom[128] = L"", uq[300], esc[600];
@@ -1199,9 +1435,34 @@ void autostart_set(int on) {
     } else {
         ok = run_hidden(L"schtasks.exe", L"/Delete /F /TN \"TurkishDPI\"") == 0;
     }
-    if (!ok)
-        MessageBoxW(ui_hwnd(), L"Başlangıç görevi ayarlanamadı.", L"TurkishDPI", MB_ICONWARNING);
+    if (!ok) {
+        log_line("autostart: schtasks failed (on=%d)", on);
+        /* a balloon, not a message box: this runs on the controller thread */
+        if (!quiet) notify(L"TurkishDPI", L"Başlangıç görevi ayarlanamadı.");
+    } else if (on) {
+        log_line("autostart: logon task runs the Program Files copy");
+    }
     autostart_query();
+    return ok;
+}
+
+void autostart_set(int on) {
+    autostart_register(on, 0);
+}
+
+/* Started from somewhere else while the logon task exists (a newer zip, or a
+ * task made by v1.1.0 that still points at the extraction folder): refresh
+ * the protected copy and point the task at it. The user just approved this
+ * exe through UAC, so it is trusted as much as running it is. */
+static void autostart_migrate(void) {
+    wchar_t dir[MAX_PATH], mine[MAX_PATH];
+    size_t n;
+    if (g_autostart_cache != 1 || !sys_install_dir(dir, MAX_PATH)) return;
+    wcscpy(mine, g_exe);
+    n = wcslen(dir);
+    if (!_wcsnicmp(mine, dir, n) && mine[n] == L'\\' && !wcschr(mine + n + 1, L'\\')) return;
+    log_line("autostart: refreshing the protected copy");
+    autostart_register(1, 1);
 }
 
 /* ---------- conflicting tools ---------- */
@@ -1363,6 +1624,13 @@ static void attach_console_if_any(void) {
 }
 
 int main(int argc, char *argv[]) {
+    /* First of all: System32-only DLL search for this elevated process, and
+     * WinHTTP / IP Helper loaded from there (see sysdll.h). */
+    if (!sysdll_init()) {
+        MessageBoxW(NULL, L"Windows sistem kitaplıkları (winhttp.dll, iphlpapi.dll) yüklenemedi.",
+                    L"TurkishDPI", MB_ICONERROR);
+        return 1;
+    }
     if (argc >= 2 && !strcmp(argv[1], "--engine")) {
         extern int gdpi_report_stats;
         gdpi_report_stats = 1;   /* "STATS" lines are for the app only */
