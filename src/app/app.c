@@ -1436,18 +1436,26 @@ static int autostart_register(int on, int quiet) {
         xml_escape(installed, exe, MAX_PATH * 2);
         (void)user; (void)ulen;
         {
-            /* the token's own SID (not USERDOMAIN/USERNAME from the
-             * environment, which the user's programs can change) */
+            /* the account of the token's own SID (not USERDOMAIN/USERNAME
+             * from the environment, which the user's programs can change) */
             wchar_t esc[600] = L"";
             HANDLE tok;
             if (OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &tok)) {
                 BYTE tbuf[256];
                 DWORD tl = 0;
                 LPWSTR sid = NULL;
-                if (GetTokenInformation(tok, TokenUser, tbuf, sizeof(tbuf), &tl) &&
-                    ConvertSidToStringSidW(((TOKEN_USER *)tbuf)->User.Sid, &sid)) {
-                    xml_escape(sid, esc, 600);
-                    LocalFree(sid);
+                (void)sid;
+                if (GetTokenInformation(tok, TokenUser, tbuf, sizeof(tbuf), &tl)) {
+                    /* DOMAIN\user resolved from the token SID (Task Scheduler
+                     * rejects a bare SID string in this XML form) */
+                    wchar_t acct[256], dom[256], uq[520];
+                    DWORD al = 256, dl = 256;
+                    SID_NAME_USE use;
+                    if (LookupAccountSidW(NULL, ((TOKEN_USER *)tbuf)->User.Sid, acct, &al, dom, &dl, &use)) {
+                        _snwprintf(uq, 519, L"%ls\\%ls", dom, acct);
+                        uq[519] = 0;
+                        xml_escape(uq, esc, 600);
+                    }
                 }
                 CloseHandle(tok);
             }
@@ -1481,20 +1489,23 @@ static int autostart_register(int on, int quiet) {
         /* written to the admin-only data folder, removed right after use */
         swprintf(xml_path, MAX_PATH, L"%ls\\autostart.xml", g_dir);
         /* Kept open (others may read, nobody may write or delete) until
-         * schtasks has read it, then deleted through the same handle. */
-        f = CreateFileW(xml_path, GENERIC_WRITE | DELETE, FILE_SHARE_READ, NULL, CREATE_ALWAYS,
+         * schtasks has read it. The handle has no DELETE access on purpose:
+         * with it, schtasks (which does not share delete) could not open
+         * the file. The folder is admin-only, so deleting by name afterwards
+         * is safe. */
+        f = CreateFileW(xml_path, GENERIC_WRITE, FILE_SHARE_READ, NULL, CREATE_ALWAYS,
                         FILE_ATTRIBUTE_NORMAL, NULL);
         if (f != INVALID_HANDLE_VALUE) {
             static const WCHAR bom = 0xFEFF;
-            FILE_DISPOSITION_INFO di;
+            DWORD code;
             WriteFile(f, &bom, sizeof(bom), &w, NULL);
             WriteFile(f, xml, (DWORD)(wcslen(xml) * sizeof(wchar_t)), &w, NULL);
             FlushFileBuffers(f);
             _snwprintf(args, MAX_PATH + 63, L"/Create /F /TN \"TurkishDPI\" /XML \"%ls\"", xml_path);
             args[MAX_PATH + 63] = 0;
-            ok = run_hidden(L"schtasks.exe", args) == 0;
-            di.DeleteFile = TRUE;
-            SetFileInformationByHandle(f, FileDispositionInfo, &di, sizeof(di));
+            code = run_hidden(L"schtasks.exe", args);
+            ok = code == 0;
+            if (!ok) log_line("autostart: schtasks /Create exit code %lu", code);
             CloseHandle(f);
             DeleteFileW(xml_path);
         }
@@ -1503,8 +1514,17 @@ static int autostart_register(int on, int quiet) {
     }
     if (!ok) {
         log_line("autostart: schtasks failed (on=%d)", on);
-        /* a balloon, not a message box: this runs on the controller thread */
-        if (!quiet) notify(L"TurkishDPI", L"Başlangıç görevi ayarlanamadı.");
+        if (on && g_autostart_cache == 1) {
+            /* the old task (possibly pointing at a user-writable copy) must
+             * not survive a failed re-registration */
+            run_hidden(L"schtasks.exe", L"/Delete /F /TN \"TurkishDPI\"");
+            log_line("autostart: existing logon task removed (re-registration failed)");
+            notify(L"Windows ile başlat kapatıldı",
+                   L"Başlangıç görevi güvenli kopyaya taşınamadı ve kaldırıldı. Ayarlar'dan tekrar açabilirsiniz.");
+        } else if (!quiet) {
+            /* a balloon, not a message box: this runs on the controller thread */
+            notify(L"TurkishDPI", L"Başlangıç görevi ayarlanamadı.");
+        }
     } else if (on) {
         log_line("autostart: logon task runs the Program Files copy");
     }
