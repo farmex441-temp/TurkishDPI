@@ -241,7 +241,12 @@ int dns_handle_incoming_hybrid(const uint32_t local_ip[4], uint16_t local_port,
     if (!e) return DNS_IN_NOT_OURS;
     forged = dns_answer_is_forged(data, len);
     if (from_clean(remote_ip, remote_port, is_ipv6)) {
-        if (e->answered || forged) return DNS_IN_DROP;
+        /* The clean resolver's first answer always reaches the program, also
+         * NXDOMAIN or a private address: a name that does not exist (or a LAN
+         * name like plex.direct) must fail or resolve at once instead of
+         * waiting for Windows' DNS timeout. The caller decides about trust
+         * (payment learning skips answers that look forged). */
+        if (e->answered) return DNS_IN_DROP;
         e->answered = 1;
         fill(ci, e);
         return DNS_IN_REWRITE;

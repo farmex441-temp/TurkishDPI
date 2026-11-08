@@ -373,16 +373,29 @@ typedef struct {
   int      growth;                    /* bytes added at/after `from` */
   uint64_t t;                         /* last touched */
   int      used;
+  int      fins;                      /* TurkishDPI: FIN seen, bit 0 out, bit 1 in */
+  uint64_t dead_at;                   /* TurkishDPI: both FINs seen: retire after this */
 } xl_ent;
 static xl_ent g_xl[TCPDPI_XLATE_CAP];
+/* TurkishDPI: slots [0, g_xl_hi) may be used and g_xl_n are, so a lookup in
+ * the per-packet path scans only what is there (nothing at all, usually). */
+static int g_xl_hi, g_xl_n;
+
+static void xl_free(xl_ent *e) {
+  if (!e->used) return;
+  e->used = 0;
+  g_xl_n--;
+  while (g_xl_hi > 0 && !g_xl[g_xl_hi - 1].used) g_xl_hi--;
+}
 
 /* Serial-number comparison (RFC 1982): a is at or after b. */
 static int seq_ge(uint32_t a, uint32_t b) { return (int32_t)(a - b) >= 0; }
 
-void tcpdpi_xlate_reset(void) { memset(g_xl, 0, sizeof(g_xl)); }
+void tcpdpi_xlate_reset(void) { memset(g_xl, 0, sizeof(g_xl)); g_xl_hi = g_xl_n = 0; }
 
 static xl_ent *xl_find(uint32_t sa, uint32_t da, uint16_t sp, uint16_t dp) {
-  for (int i = 0; i < TCPDPI_XLATE_CAP; i++)
+  if (!g_xl_n) return NULL;
+  for (int i = 0; i < g_xl_hi; i++)
     if (g_xl[i].used && g_xl[i].sa == sa && g_xl[i].da == da && g_xl[i].sp == sp && g_xl[i].dp == dp)
       return &g_xl[i];
   return NULL;
@@ -392,16 +405,23 @@ int tcpdpi_xlate_begin(uint32_t saddr, uint32_t daddr, uint16_t sport, uint16_t 
                        uint32_t at_seq, int growth, uint64_t now_ms) {
   if (growth <= 0) return 0;
   xl_ent *e = xl_find(saddr, daddr, sport, dport);
-  if (e) { e->from = at_seq; e->growth = growth; e->t = now_ms; return 1; } /* refresh */
+  if (e) { e->from = at_seq; e->growth = growth; e->t = now_ms; e->fins = 0; e->dead_at = 0; return 1; } /* refresh */
   int free_slot = -1;
   for (int i = 0; i < TCPDPI_XLATE_CAP; i++) {
-    if (!g_xl[i].used) { free_slot = i; continue; }
-    if (now_ms - g_xl[i].t > TCPDPI_XLATE_TTL_MS) { g_xl[i].used = 0; if (free_slot < 0) free_slot = i; }
+    if (!g_xl[i].used) { if (free_slot < 0) free_slot = i; continue; }
+    if (now_ms - g_xl[i].t > TCPDPI_XLATE_TTL_MS ||
+        (g_xl[i].dead_at && now_ms > g_xl[i].dead_at)) {
+      xl_free(&g_xl[i]);
+      if (free_slot < 0 || i < free_slot) free_slot = i;
+    }
   }
   if (free_slot < 0) return 0;              /* full of live connections: do not grow */
   xl_ent *s = &g_xl[free_slot];
+  memset(s, 0, sizeof(*s));
   s->sa = saddr; s->da = daddr; s->sp = sport; s->dp = dport;
   s->from = at_seq; s->growth = growth; s->t = now_ms; s->used = 1;
+  g_xl_n++;
+  if (free_slot >= g_xl_hi) g_xl_hi = free_slot + 1;
   return 1;
 }
 
@@ -429,7 +449,15 @@ int tcpdpi_xlate_in(uint32_t saddr, uint32_t daddr, uint16_t sport, uint16_t dpo
 
 void tcpdpi_xlate_end(uint32_t saddr, uint32_t daddr, uint16_t sport, uint16_t dport) {
   xl_ent *e = xl_find(saddr, daddr, sport, dport);
-  if (e) e->used = 0;
+  if (e) xl_free(e);
+}
+
+void tcpdpi_xlate_fin(uint32_t saddr, uint32_t daddr, uint16_t sport, uint16_t dport,
+                      int inbound, uint64_t now_ms) {
+  xl_ent *e = xl_find(saddr, daddr, sport, dport);
+  if (!e) return;
+  e->fins |= inbound ? 2 : 1;
+  if (e->fins == 3 && !e->dead_at) e->dead_at = now_ms + TCPDPI_XLATE_CLOSE_MS;
 }
 
 int tcpdpi_xlate_live(uint64_t now_ms) {

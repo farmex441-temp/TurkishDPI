@@ -26,7 +26,7 @@ typedef struct conntrack_info {
 /* What to do with an inbound answer in hybrid mode. */
 enum {
     DNS_IN_NOT_OURS = 0,   /* no question of ours: deliver unchanged */
-    DNS_IN_REWRITE = 1,    /* the clean resolver's answer: rewrite to look like the asked one */
+    DNS_IN_REWRITE = 1,    /* the clean resolver's first answer (any rcode): rewrite to look like the asked one */
     DNS_IN_DROP = 2,       /* forged, or a late duplicate: drop */
     DNS_IN_PASS = 3,       /* the asked resolver's own clean answer: deliver, trusted */
     DNS_IN_PASS_OTHER = 4  /* a clean-looking answer from someone else: deliver, not trusted */

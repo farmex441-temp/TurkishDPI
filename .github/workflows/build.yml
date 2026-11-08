@@ -46,6 +46,8 @@ jobs:
             gcc -O2 -Wall -Isrc/engine/core tests/core/test_$t.c $CORE -lws2_32 -o build/test_$t.exe
             ./build/test_$t.exe
           done
+          gcc -O2 -Wall -Isrc/engine/core tests/xlate_test.c src/engine/core/tcpdpi.c -o build/xlate_test.exe
+          ./build/xlate_test.exe
       - name: WinDivert.dll pinning test
         run: |
           # Any harmless DLL stands in for WinDivert.dll: with its own hash it
@@ -109,6 +111,8 @@ jobs:
                 -Isrc/engine/core tests/core/test_$t.c $CORE -o build/test_$t
             ./build/test_$t
           done
+          gcc -g -O1 -fsanitize=address,undefined -fno-sanitize-recover=all -Wall               -Isrc/engine/core tests/xlate_test.c src/engine/core/tcpdpi.c -o build/xlate_test
+          ./build/xlate_test
 
   build:
     needs: [test, test-sanitizers]

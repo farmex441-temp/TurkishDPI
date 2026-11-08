@@ -261,6 +261,22 @@ static int build6(uint8_t *out, int cap, const uint8_t *pkt, int tcphl, uint32_t
     return n;
 }
 
+/* The hop table is keyed by 32 bits: an IPv6 address goes in hashed. A
+ * collision with another address only gives a decoy that one's distance. */
+static uint32_t key6(const uint8_t a[16]) {
+    uint32_t h = 2166136261u;
+    for (int i = 0; i < 16; i++) h = (h ^ a[i]) * 16777619u;
+    return h | 1u;                     /* never 0 */
+}
+
+static int decoy_ttl6(const uint8_t daddr[16]) {
+    if (cfg.autottl) {
+        int hops = tcpdpi_hops_get(key6(daddr), now_ms());
+        if (hops > 0) return tcpdpi_decoy_ttl(hops, cfg.autottl_margin, cfg.autottl_min);
+    }
+    return cfg.fake_ttl;
+}
+
 static int desync6(const uint8_t *pkt, int len, int tcphl, const proto_info *pi, int decoy,
                    const WINDIVERT_ADDRESS *addr) {
     const int poff = 40 + tcphl;
@@ -276,7 +292,7 @@ static int desync6(const uint8_t *pkt, int len, int tcphl, const proto_info *pi,
     if (decoy) {
         uint8_t fake[1700];
         int dlen = decoy_payload(fake, (int)sizeof(fake), pay, plen, pi, 40, tcphl);
-        if (dlen > 0 && (n = build6(out, (int)sizeof(out), pkt, tcphl, seq, cfg.fake_ttl, fake, dlen, 1, addr)) > 0)
+        if (dlen > 0 && (n = build6(out, (int)sizeof(out), pkt, tcphl, seq, decoy_ttl6(pkt + 24), fake, dlen, 1, addr)) > 0)
             send_crafted(out, n, addr, 1);
     }
     if (!cut) return 0;
@@ -355,7 +371,9 @@ static int dns_inbound(uint8_t *pkt, UINT len, int v6, int l4, WINDIVERT_ADDRESS
         WinDivertHelperCalcChecksums(pkt, len, addr, 0);
         if (dns_hybrid_enabled()) InterlockedIncrement(&stats.dns);
     }
-    if (trusted && exclude_enabled()) exclude_learn_dns(data, dlen);
+    /* payment learning: only answers to our questions from the server asked
+     * (or the clean one), and never one that looks forged */
+    if (trusted && exclude_enabled() && !dns_answer_is_forged(data, dlen)) exclude_learn_dns(data, dlen);
     pass(pkt, len, addr);
     return 1;
 }
@@ -424,15 +442,28 @@ static void count_kind(const proto_info *pi) {
     InterlockedIncrement(pi->kind == PROTO_TLS ? &stats.https : &stats.http);
 }
 
-static void run_loop(void) {
+/* SYN, FIN or RST on a segment with data (TCP Fast Open, data + FIN): never
+ * desynced - every crafted part would carry the flag. */
+#define TCP_CTL(flags) ((flags) & 0x07)
+
+static int run_loop(void) {
     static uint8_t pkt[65535];
     WINDIVERT_ADDRESS addr;
     UINT len;
+    int errors = 0;
     for (;;) {
         if (!WinDivertRecv(wd, pkt, sizeof(pkt), &len, &addr)) {
-            if (GetLastError() == ERROR_NO_DATA) break;
+            DWORD e = GetLastError();
+            if (e == ERROR_NO_DATA) return 0;               /* shut down */
+            if (e == ERROR_INSUFFICIENT_BUFFER) continue;   /* a packet too big for us: dropped by WinDivert */
+            if (++errors >= 100) {                          /* the handle is gone: let the app restart us */
+                printf("Engine stopped: receive error %lu\n", (unsigned long)e);
+                return 1;
+            }
+            Sleep(10);
             continue;
         }
+        errors = 0;
         InterlockedIncrement(&stats.packets);
         if (len < 28) { pass(pkt, len, &addr); continue; }
 
@@ -453,24 +484,39 @@ static void run_loop(void) {
             {
                 int tcphl = ((pkt[40 + 12] >> 4) & 0x0f) * 4, poff = 40 + tcphl, handled = 0;
                 if (tcphl < 20 || poff > (int)len) { pass(pkt, len, &addr); continue; }
+                int flags = pkt[40 + 13], plen = (int)len - poff;
                 if (!addr.Outbound) {
-                    if (cfg.drop_rst && (pkt[40 + 13] & 0x04) && tcpdpi_is_injected_rst6(pkt, (int)len) &&
+                    if (cfg.drop_rst && (flags & 0x04) && tcpdpi_is_injected_rst6(pkt, (int)len) &&
                         rawscope_touched(pkt + 8, 16, now_ms()))
                         continue;                                   /* forged reset: dropped */
+                    if (cfg.autottl && (flags & 0x02) && (flags & 0x10)) {   /* SYN-ACK: hop distance */
+                        int hops = tcpdpi_hops_from_ttl(pkt[7]);
+                        if (hops > 0) tcpdpi_hops_put(key6(pkt + 8), hops, now_ms());
+                    }
+                    if (rd16be(pkt + 40) == 443 && plen > 0 &&
+                        rawscope_tls_kind(pkt + poff, plen) != RAWSCOPE_TLS_OTHER)
+                        rawscope_decoy_hurt_in(pkt + 8, 16, 443, rd16be(pkt + 42), pkt + poff, plen, now_ms());
                     pass(pkt, len, &addr);
                     continue;
                 }
-                if ((int)len > poff) {
+                if (plen > 0 && !TCP_CTL(flags)) {
+                    uint64_t now = now_ms();
+                    uint16_t sport = rd16be(pkt + 40), dport = rd16be(pkt + 42);
+                    uint32_t seq = rd32be(pkt + 44);
                     proto_info pi;
-                    proto_inspect(pkt + poff, (size_t)((int)len - poff), &pi);
+                    if (dport == 443) rawscope_decoy_hurt_out(pkt + 24, 16, dport, sport, seq, pkt + poff, plen, now);
+                    proto_inspect(pkt + poff, (size_t)plen, &pi);
                     if (pi.kind != PROTO_UNKNOWN && !rawscope_local6(pkt + 24)) {
                         if (excluded_conn(pkt + poff, &pi, pkt + 24, 1)) {
                             InterlockedIncrement(&stats.excluded);
                         } else {
-                            rawscope_touch(pkt + 24, 16, now_ms());
+                            int decoy = !no_decoy && !rawscope_nodecoy(pkt + 24, 16, now);
+                            rawscope_touch(pkt + 24, 16, now);
+                            if (decoy && pi.kind == PROTO_TLS)
+                                rawscope_decoy_sent(pkt + 24, 16, dport, sport,
+                                                    rawscope_tls_next_seq(seq, pkt + poff, plen), now);
                             count_kind(&pi);
-                            handled = desync6(pkt, (int)len, tcphl, &pi,
-                                              !no_decoy && !rawscope_nodecoy(pkt + 24, 16, now_ms()), &addr);
+                            handled = desync6(pkt, (int)len, tcphl, &pi, decoy, &addr);
                         }
                     }
                 }
@@ -514,16 +560,25 @@ static void run_loop(void) {
                         int hops = tcpdpi_hops_from_ttl(pkt[8]);
                         if (hops > 0) tcpdpi_hops_put(rd32be(pkt + 12), hops, now_ms());
                     }
-                    if (rd16be(tcp) == 443 && plen > 0) {
+                    /* a TLS alert from as far away as the server's own SYN-ACK:
+                     * a decoy that reached it (one injected on the way has
+                     * another hop count and must not switch decoys off) */
+                    if (rd16be(tcp) == 443 && plen > 0 &&
+                        rawscope_tls_kind(pkt + poff, plen) != RAWSCOPE_TLS_OTHER) {
                         int known = tcpdpi_hops_get(rd32be(pkt + 12), now_ms()), h = tcpdpi_hops_from_ttl(pkt[8]);
                         if (known <= 0 || h <= 0 || (h - known <= 1 && known - h <= 1))
                             rawscope_decoy_hurt_in(pkt + 12, 4, 443, rd16be(tcp + 2), pkt + poff, plen, now_ms());
                     }
-                    if (cfg.tlsrec && (tcp[13] & 0x10)) {
+                    if (cfg.tlsrec) {
+                        /* the server acknowledges grown bytes: take the growth
+                         * back off. The translation goes on through the close
+                         * (FIN and its ACK carry shifted numbers too); only a
+                         * reset ends it at once. */
                         uint32_t sa = rd32be(pkt + 12), da = rd32be(pkt + 16), ack = rd32be(pkt + ihl + 8);
                         uint16_t sp = rd16be(tcp), dp = rd16be(tcp + 2);
-                        int changed = tcpdpi_xlate_in(sa, da, sp, dp, &ack, now_ms());
-                        if (tcp[13] & 0x05) tcpdpi_xlate_end(da, sa, dp, sp);
+                        int changed = (tcp[13] & 0x10) && tcpdpi_xlate_in(sa, da, sp, dp, &ack, now_ms());
+                        if (tcp[13] & 0x04) tcpdpi_xlate_end(da, sa, dp, sp);
+                        else if (tcp[13] & 0x01) tcpdpi_xlate_fin(da, sa, dp, sp, 1, now_ms());
                         if (changed) {
                             wr32be(pkt + ihl + 8, ack);
                             WinDivertHelperCalcChecksums(pkt, len, &addr, 0);
@@ -536,8 +591,13 @@ static void run_loop(void) {
                 if (cfg.tlsrec) {
                     uint32_t sa = rd32be(pkt + 12), da = rd32be(pkt + 16), s = rd32be(pkt + ihl + 4);
                     uint16_t sp = rd16be(tcp), dp = rd16be(tcp + 2);
-                    int changed = tcpdpi_xlate_out(sa, da, sp, dp, &s, now_ms());
-                    if (tcp[13] & 0x05) tcpdpi_xlate_end(sa, da, sp, dp);
+                    int changed;
+                    /* a new connection on a four-tuple seen before: the old
+                     * translation must not touch it */
+                    if ((tcp[13] & 0x02) && !(tcp[13] & 0x10)) tcpdpi_xlate_end(sa, da, sp, dp);
+                    changed = tcpdpi_xlate_out(sa, da, sp, dp, &s, now_ms());
+                    if (tcp[13] & 0x04) tcpdpi_xlate_end(sa, da, sp, dp);
+                    else if (tcp[13] & 0x01) tcpdpi_xlate_fin(sa, da, sp, dp, 0, now_ms());
                     if (changed) {
                         wr32be(pkt + ihl + 4, s);
                         WinDivertHelperCalcChecksums(pkt, len, &addr, 0);
@@ -545,7 +605,7 @@ static void run_loop(void) {
                         continue;
                     }
                 }
-                if (plen > 0) {
+                if (plen > 0 && !TCP_CTL(tcp[13])) {
                     uint64_t now = now_ms();
                     uint16_t sport = rd16be(tcp), dport = rd16be(tcp + 2);
                     uint32_t seq = rd32be(pkt + ihl + 4);
@@ -595,8 +655,9 @@ static void usage(void) {
 }
 
 static int parse_port(const char *s, uint16_t *out) {
-    long v = strtol(s, NULL, 10);
-    if (v <= 0 || v > 65535) return 0;
+    char *end = NULL;
+    long v = strtol(s, &end, 10);
+    if (!end || end == s || *end || v <= 0 || v > 65535) return 0;
     *out = htons((uint16_t)v);
     return 1;
 }
@@ -616,7 +677,8 @@ int engine_main(int argc, char *argv[]) {
 
     for (int i = 1; i < argc && !bad; i++) {
         const char *a = argv[i], *v = i + 1 < argc ? argv[i + 1] : NULL;
-#define NEED() do { if (!v) { bad = a; break; } i++; } while (0)
+        /* a missing value ends the parse (break leaves the for loop) */
+#define NEED() if (!v) { bad = a; break; } i++
         if (!strcmp(a, "--fake-ttl")) { NEED(); cfg.fake_ttl = atoi(v); if (cfg.fake_ttl < 1 || cfg.fake_ttl > 255) bad = a; }
         else if (!strcmp(a, "--autottl")) { NEED(); cfg.autottl = atoi(v) ? 1 : 0; }
         else if (!strcmp(a, "--drop-rst")) { NEED(); cfg.drop_rst = atoi(v) ? 1 : 0; }
@@ -638,7 +700,7 @@ int engine_main(int argc, char *argv[]) {
         }
         else if (!strcmp(a, "--seqovl")) { NEED(); cfg.seqovl = atoi(v); if (cfg.seqovl < 0 || cfg.seqovl > 1000) bad = a; }
         else if (!strcmp(a, "--tlsrec")) { NEED(); cfg.tlsrec = atoi(v) ? 1 : 0; }
-        else if (!strcmp(a, "--decoy-name")) { NEED(); proto_decoy_name_add(v); }
+        else if (!strcmp(a, "--decoy-name")) { NEED(); if (proto_decoy_name_add(v) != 0) bad = a; }
         else if (!strcmp(a, "--udp-fake")) { NEED(); cfg.udp_fake = atoi(v) ? 1 : 0; }
         else if (!strcmp(a, "--no-quic-block")) cfg.quic_block = 0;
         else if (!strcmp(a, "--dns-addr")) {
@@ -704,7 +766,9 @@ int engine_main(int argc, char *argv[]) {
         HANDLE t = CreateThread(NULL, 64 * 1024, stats_reporter, NULL, STACK_SIZE_PARAM_IS_A_RESERVATION, NULL);
         if (t) CloseHandle(t);
     }
-    run_loop();
-    WinDivertClose(wd);
-    return 0;
+    {
+        int rc = run_loop();
+        WinDivertClose(wd);
+        return rc;
+    }
 }

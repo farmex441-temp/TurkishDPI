@@ -252,8 +252,18 @@ int  tcpdpi_xlate_out(uint32_t saddr, uint32_t daddr, uint16_t sport, uint16_t d
 int  tcpdpi_xlate_in(uint32_t saddr, uint32_t daddr, uint16_t sport, uint16_t dport,
                      uint32_t *ack, uint64_t now_ms);
 
-/* Forget a connection (its FIN or RST was seen), by its outbound four-tuple. */
+/* Forget a connection (its RST was seen, or a new SYN reuses the four-tuple),
+ * by its outbound four-tuple. */
 void tcpdpi_xlate_end(uint32_t saddr, uint32_t daddr, uint16_t sport, uint16_t dport);
+
+/* TurkishDPI: a FIN went out (inbound 0) or came in (inbound 1), by the
+ * outbound four-tuple. The translation must go on through the close - the
+ * FIN itself, its acknowledgement and the other side's FIN all carry shifted
+ * numbers - so the entry is only retired TCPDPI_XLATE_CLOSE_MS after FINs
+ * were seen both ways (it is reclaimed by the next _begin after that). */
+#define TCPDPI_XLATE_CLOSE_MS 60000
+void tcpdpi_xlate_fin(uint32_t saddr, uint32_t daddr, uint16_t sport, uint16_t dport,
+                      int inbound, uint64_t now_ms);
 
 /* How many connections are currently remembered (for the raw_stats line). */
 int  tcpdpi_xlate_live(uint64_t now_ms);
