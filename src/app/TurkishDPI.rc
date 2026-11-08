@@ -7,6 +7,7 @@
 12 ICON "res/tray_scan.ico"
 13 ICON "res/tray_paused.ico"
 14 ICON "res/tray_error.ico"
+15 ICON "res/tray_warn.ico"
 
 VS_VERSION_INFO VERSIONINFO
 FILEVERSION     TURKISHDPI_VER_MAJOR,TURKISHDPI_VER_MINOR,TURKISHDPI_VER_PATCH,0

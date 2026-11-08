@@ -77,6 +77,26 @@ int main(void) {
         EXPECT(dns_handle_incoming_hybrid(local, lport, clean, cport, (char *)m, (unsigned)n, &ci, 0) == DNS_IN_REWRITE, "clean answer rewritten");
         EXPECT(ci.dstip[0] == isp[0] && ci.dstport == p53 && ci.srcport == lport, "rewrite targets original resolver");
 
+        /* 2b) a clean-looking answer from a third address neither wins the race
+         *     nor counts as trusted; the real resolver's answer still passes */
+        {
+            uint32_t other[4] = { 0 };
+            inet_pton(AF_INET, "10.9.9.9", other);
+            EXPECT(dns_handle_outgoing(local, lport, isp, p53, (char *)q, 29, 0), "tracked for 2b");
+            n = build(m, 0x1234, 0, 1, real, 4);
+            EXPECT(dns_handle_incoming_hybrid(local, lport, other, p53, (char *)m, (unsigned)n, &ci, 0) == DNS_IN_PASS_OTHER,
+                   "third-party answer is untrusted");
+            EXPECT(dns_handle_incoming_hybrid(local, lport, isp, p53, (char *)m, (unsigned)n, &ci, 0) == DNS_IN_PASS,
+                   "resolver answer still wins after a third-party one");
+            /* query tracking used without redirection */
+            EXPECT(dns_handle_outgoing(local, lport, isp, p53, (char *)q, 29, 0), "tracked for match");
+            EXPECT(dns_answer_matches(local, lport, isp, p53, (char *)m, (unsigned)n, 0), "answer matches its query");
+            EXPECT(!dns_answer_matches(local, lport, other, p53, (char *)m, (unsigned)n, 0), "other sender does not match");
+            /* malformed answers are never trusted */
+            n = build(m, 0x1234, 0, 1, real, 4);
+            EXPECT(dns_answer_is_forged((char *)m, (unsigned)n - 2), "truncated answer is untrusted");
+        }
+
         /* 3) wrong transaction ID is not ours */
         EXPECT(dns_handle_outgoing(local, lport, isp, p53, (char *)q, 29, 0), "tracked again");
         n = build(m, 0x9999, 0, 1, real, 4);

@@ -7,37 +7,102 @@ on:
   pull_request:
   workflow_dispatch:
 
+# Read-only by default; only the release job (tags) may write.
 permissions:
-  contents: write
+  contents: read
 
 env:
   WINDIVERT_URL: https://github.com/basil00/WinDivert/releases/download/v2.2.2/WinDivert-2.2.2-A.zip
   WINDIVERT_SHA256: 63cb41763bb4b20f600b6de04e991a9c2be73279e317d4d82f237b150c5f3f15
   WINDIVERT_DIR: WinDivert-2.2.2-A
 
+# Third-party actions are pinned to full commit SHAs (the tag in the comment
+# is only for humans): a moved tag cannot change what runs here.
 jobs:
   test:
     # Unit tests run natively on Windows (DNS race, forged-answer detection,
-    # payment exclusion), with the sanitizer-free MinGW that ships on the runner.
+    # payment exclusion, site diagnosis, WinDivert.dll pinning), with the
+    # sanitizer-free MinGW that ships on the runner.
     runs-on: windows-latest
     defaults:
       run:
         shell: bash
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
       - name: Unit tests
         run: |
           mkdir -p build
           gcc -O2 -Wall -Isrc/engine tests/exclude_test.c src/engine/exclude.c src/engine/utils/getline.c -o build/exclude_test.exe
           gcc -O2 -Wall -Isrc/engine tests/dns_test.c src/engine/dnsredir.c -lws2_32 -o build/dns_test.exe
+          gcc -O2 -Wall -Isrc/app tests/diag_test.c src/app/diag.c -o build/diag_test.exe
           ./build/exclude_test.exe
           ./build/dns_test.exe
+          ./build/diag_test.exe
+      - name: WinDivert.dll pinning test
+        run: |
+          # Any harmless DLL stands in for WinDivert.dll: with its own hash it
+          # is loaded (no WinDivert exports -> 126), with another hash it is
+          # refused before loading (1006). The driver is never touched.
+          for c in ok bad; do
+            mkdir -p build/h$c
+            cp /c/Windows/System32/version.dll build/h$c/WinDivert.dll
+          done
+          H=$(sha256sum build/hok/WinDivert.dll | cut -c1-64)
+          B=0000000000000000000000000000000000000000000000000000000000000000
+          for c in ok bad; do
+            [ $c = ok ] && X=$H || X=$B
+            gcc -O2 -Wall -DWINDIVERTEXPORT=extern -DWINDIVERT_DLL_SHA256="\"$X\"" \
+                -Ithird_party/WinDivert/include -Isrc/engine \
+                tests/windivert_hash_test.c src/engine/windivert_dyn.c -o build/h$c/t.exe
+          done
+          ./build/hok/t.exe 126
+          ./build/hbad/t.exe 1006
+          # The drivers are pinned the same way: a WinDivert64.sys with another
+          # hash stops loading before WinDivert.dll could install it (1006).
+          for c in sysok sysbad; do
+            mkdir -p build/h$c
+            cp /c/Windows/System32/version.dll build/h$c/WinDivert.dll
+            cp /c/Windows/System32/version.dll build/h$c/WinDivert64.sys
+          done
+          for c in sysok sysbad; do
+            [ $c = sysok ] && S=$H || S=$B
+            gcc -O2 -Wall -DWINDIVERTEXPORT=extern -DWINDIVERT_DLL_SHA256="\"$H\"" \
+                -DWINDIVERT_SYS64_SHA256="\"$S\"" \
+                -Ithird_party/WinDivert/include -Isrc/engine \
+                tests/windivert_hash_test.c src/engine/windivert_dyn.c -o build/h$c/t.exe
+          done
+          ./build/hsysok/t.exe 126
+          ./build/hsysbad/t.exe 1006
+          # the driver this system uses must exist once it is pinned: a missing
+          # one could be planted after the check (2)
+          mkdir -p build/hsysmissing
+          cp /c/Windows/System32/version.dll build/hsysmissing/WinDivert.dll
+          gcc -O2 -Wall -DWINDIVERTEXPORT=extern -DWINDIVERT_DLL_SHA256="\"$H\""               -DWINDIVERT_SYS64_SHA256="\"$H\""               -Ithird_party/WinDivert/include -Isrc/engine               tests/windivert_hash_test.c src/engine/windivert_dyn.c -o build/hsysmissing/t.exe
+          ./build/hsysmissing/t.exe 2
 
-  build:
-    needs: test
+  test-sanitizers:
+    # Platform-independent code under AddressSanitizer + UBSan.
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - name: diag (ASan/UBSan)
+        run: |
+          mkdir -p build
+          gcc -g -O1 -fsanitize=address,undefined -fno-sanitize-recover=all -Wall -Wextra \
+              -Isrc/app tests/diag_test.c src/app/diag.c -o build/diag_test
+          ./build/diag_test
+
+  build:
+    needs: [test, test-sanitizers]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
 
       - name: Install MinGW-w64
         run: sudo apt-get update && sudo apt-get install -y --no-install-recommends gcc-mingw-w64 zip
@@ -56,8 +121,23 @@ jobs:
 
       - name: Build
         run: |
+          # REQUIRE_WINDIVERT_HASH: the exe pins the SHA-256 of the WinDivert.dll
+          # it ships with (taken from the checksum-verified archive above).
           for a in x86_64 i686; do
-            make ARCH=$a WINDIVERT=$WINDIVERT_DIR OUT=build/$a -j4
+            make ARCH=$a WINDIVERT=$WINDIVERT_DIR OUT=build/$a REQUIRE_WINDIVERT_HASH=1 -j4
+          done
+
+      - name: Check imports
+        run: |
+          # winhttp/iphlpapi/dnsapi/bcrypt/gdiplus must not be static imports: they are not
+          # KnownDLLs and would be searched in the exe's (user-writable) folder
+          # first. src/app/sysdll.c loads them from System32 instead.
+          for a in x86_64 i686; do
+            imports=$($a-w64-mingw32-objdump -p build/$a/TurkishDPI.exe | grep "DLL Name" | tr 'A-Z' 'a-z')
+            echo "$a: $(echo $imports | tr '\n' ' ')"
+            if echo "$imports" | grep -E "winhttp|iphlpapi|dnsapi|bcrypt|gdiplus"; then
+              echo "::error::forbidden static import in $a build"; exit 1
+            fi
           done
 
       - name: Package
@@ -80,14 +160,24 @@ jobs:
           (cd dist && sha256sum * > SHA256SUMS.txt)
           ls -la dist
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: TurkishDPI
           path: dist/*
 
+  release:
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: TurkishDPI
+          path: dist
       - name: Release
-        if: startsWith(github.ref, 'refs/tags/v')
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
         with:
           files: dist/*
           generate_release_notes: true

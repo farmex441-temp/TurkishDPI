@@ -18,6 +18,13 @@
 #include <windows.h>
 #include "windivert.h"
 
+#ifndef LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR
+#define LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR 0x00000100
+#endif
+#ifndef LOAD_LIBRARY_SEARCH_SYSTEM32
+#define LOAD_LIBRARY_SEARCH_SYSTEM32 0x00000800
+#endif
+
 typedef HANDLE (*pOpen)(const char *, WINDIVERT_LAYER, INT16, UINT64);
 typedef BOOL   (*pRecv)(HANDLE, VOID *, UINT, UINT *, WINDIVERT_ADDRESS *);
 typedef BOOL   (*pSend)(HANDLE, const VOID *, UINT, UINT *, const WINDIVERT_ADDRESS *);
@@ -32,19 +39,216 @@ typedef BOOL   (*pCalc)(VOID *, UINT, WINDIVERT_ADDRESS *, UINT64);
 static struct {
     INIT_ONCE once;
     BOOL ok;
+    DWORD err;   /* why loading failed, reported by WinDivertOpen */
     pOpen open; pRecv recv; pSend send; pShutdown shutdown; pClose close;
     pParse parse; pCalc calc;
-} wd = { INIT_ONCE_STATIC_INIT, FALSE, 0, 0, 0, 0, 0, 0, 0 };
+} wd = { INIT_ONCE_STATIC_INIT, FALSE, ERROR_MOD_NOT_FOUND, 0, 0, 0, 0, 0, 0, 0 };
+
+#if defined(WINDIVERT_DLL_SHA256) || defined(WINDIVERT_SYS64_SHA256) || defined(WINDIVERT_SYS32_SHA256)
+#define WD_PINNED 1
+/*
+ * The DLL next to the exe is loaded into an elevated process, and that folder
+ * may be writable by ordinary users (a zip extracted to Downloads). Its
+ * SHA-256 is fixed at build time (Makefile: taken from the checksum-pinned
+ * WinDivert archive) and checked here on an open handle that denies writes
+ * and deletes, so the file cannot be swapped between the check and the load.
+ */
+typedef LONG (WINAPI *bc_open_t)(void **, LPCWSTR, LPCWSTR, ULONG);
+typedef LONG (WINAPI *bc_create_t)(void *, void **, PUCHAR, ULONG, PUCHAR, ULONG, ULONG);
+typedef LONG (WINAPI *bc_data_t)(void *, PUCHAR, ULONG, ULONG);
+typedef LONG (WINAPI *bc_finish_t)(void *, PUCHAR, ULONG, ULONG);
+typedef LONG (WINAPI *bc_destroy_t)(void *);
+typedef LONG (WINAPI *bc_close_t)(void *, ULONG);
+
+static BOOL sha256_of_handle(HANDLE f, unsigned char out[32]) {
+    HMODULE bc = LoadLibraryExW(L"bcrypt.dll", NULL, LOAD_LIBRARY_SEARCH_SYSTEM32);
+    bc_open_t bopen; bc_create_t bcreate; bc_data_t bdata; bc_finish_t bfinish;
+    bc_destroy_t bdestroy; bc_close_t bclose;
+    void *alg = NULL, *hash = NULL;
+    unsigned char buf[16384];
+    DWORD got;
+    BOOL ok = FALSE;
+    if (!bc) return FALSE;
+    bopen = (bc_open_t)(void *)GetProcAddress(bc, "BCryptOpenAlgorithmProvider");
+    bcreate = (bc_create_t)(void *)GetProcAddress(bc, "BCryptCreateHash");
+    bdata = (bc_data_t)(void *)GetProcAddress(bc, "BCryptHashData");
+    bfinish = (bc_finish_t)(void *)GetProcAddress(bc, "BCryptFinishHash");
+    bdestroy = (bc_destroy_t)(void *)GetProcAddress(bc, "BCryptDestroyHash");
+    bclose = (bc_close_t)(void *)GetProcAddress(bc, "BCryptCloseAlgorithmProvider");
+    if (bopen && bcreate && bdata && bfinish && bdestroy && bclose &&
+        bopen(&alg, L"SHA256", NULL, 0) == 0) {
+        if (bcreate(alg, &hash, NULL, 0, NULL, 0, 0) == 0) {
+            ok = TRUE;
+            while (ok && ReadFile(f, buf, sizeof(buf), &got, NULL) && got)
+                ok = bdata(hash, buf, got, 0) == 0;
+            ok = ok && bfinish(hash, out, 32, 0) == 0;
+            bdestroy(hash);
+        }
+        bclose(alg, 0);
+    }
+    FreeLibrary(bc);
+    return ok;
+}
+
+static BOOL hash_matches(const unsigned char h[32], const char *hex) {
+    static const char digits[] = "0123456789abcdef";
+    for (int i = 0; i < 32; i++) {
+        char hi = hex[2 * i], lo;
+        if (!hi) return FALSE;                 /* never read past a short string */
+        lo = hex[2 * i + 1];
+        if (!lo) return FALSE;
+        if (hi >= 'A' && hi <= 'F') hi += 32;
+        if (lo >= 'A' && lo <= 'F') lo += 32;
+        if (hi != digits[h[i] >> 4] || lo != digits[h[i] & 15]) return FALSE;
+    }
+    return hex[64] == 0;
+}
+
+/*
+ * Pins of the files WinDivert loads from the exe's folder. The drivers matter
+ * as much as the DLL: WinDivert.dll installs whatever WinDivert64.sys /
+ * WinDivert32.sys sits next to it as a kernel driver. Any signed driver
+ * would load - so a user-writable folder must not be able to swap in a
+ * different (e.g. a vulnerable) one.
+ */
+static const char *pin_for(const wchar_t *name) {
+#ifdef WINDIVERT_DLL_SHA256
+    if (!lstrcmpiW(name, L"WinDivert.dll")) return WINDIVERT_DLL_SHA256;
+#endif
+#ifdef WINDIVERT_SYS64_SHA256
+    if (!lstrcmpiW(name, L"WinDivert64.sys")) return WINDIVERT_SYS64_SHA256;
+#endif
+#ifdef WINDIVERT_SYS32_SHA256
+    if (!lstrcmpiW(name, L"WinDivert32.sys")) return WINDIVERT_SYS32_SHA256;
+#endif
+    (void)name;
+    return NULL;
+}
+
+static const wchar_t *base_name(const wchar_t *path) {
+    const wchar_t *b = path;
+    for (const wchar_t *p = path; *p; p++)
+        if (*p == L'\\' || *p == L'/') b = p + 1;
+    return b;
+}
+
+/* Opens path denying writes and deletes and checks its pin. Returns the open
+ * handle (keep it open as long as the file must not change) or
+ * INVALID_HANDLE_VALUE with *err set: ERROR_FILE_NOT_FOUND, ERROR_FILE_INVALID
+ * (another file) or the open error. A file without a pin is accepted. */
+static HANDLE open_pinned(const wchar_t *path, DWORD *err) {
+    const char *pin = pin_for(base_name(path));
+    unsigned char digest[32];
+    HANDLE f = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING,
+                           FILE_ATTRIBUTE_NORMAL | FILE_FLAG_SEQUENTIAL_SCAN, NULL);
+    if (f == INVALID_HANDLE_VALUE) {
+        *err = GetLastError();
+        return INVALID_HANDLE_VALUE;
+    }
+    if (pin && (!sha256_of_handle(f, digest) || !hash_matches(digest, pin))) {
+        CloseHandle(f);
+        *err = ERROR_FILE_INVALID;
+        return INVALID_HANDLE_VALUE;
+    }
+    return f;
+}
+#endif
+
+/* 1 if a pin for this WinDivert file name is compiled in. */
+int windivert_file_pinned(const wchar_t *name) {
+#ifdef WD_PINNED
+    return pin_for(name) != NULL;
+#else
+    (void)name;
+    return 0;
+#endif
+}
+
+/* 1 if the open file f (read access) holds the pinned contents for name; a
+ * file without a pin is accepted. Checked on the handle the caller then
+ * copies from, so a check-then-reopen race is impossible. The file pointer
+ * is left at the start. */
+int windivert_handle_ok(HANDLE f, const wchar_t *name) {
+#ifdef WD_PINNED
+    const char *pin = pin_for(name);
+    unsigned char digest[32];
+    LARGE_INTEGER zero;
+    int ok;
+    zero.QuadPart = 0;
+    if (!pin) return 1;
+    if (!SetFilePointerEx(f, zero, NULL, FILE_BEGIN)) return 0;
+    ok = sha256_of_handle(f, digest) && hash_matches(digest, pin);
+    SetFilePointerEx(f, zero, NULL, FILE_BEGIN);
+    return ok;
+#else
+    (void)f; (void)name;
+    return 1;
+#endif
+}
+
+/* The driver WinDivert itself will load on this system. */
+static const wchar_t *driver_in_use(void) {
+#ifdef _WIN64
+    return L"WinDivert64.sys";
+#else
+    typedef BOOL (WINAPI *wow_fn)(HANDLE, PBOOL);
+    BOOL wow = FALSE;
+    wow_fn f = (wow_fn)(void *)GetProcAddress(GetModuleHandleW(L"kernel32.dll"), "IsWow64Process");
+    if (f) f(GetCurrentProcess(), &wow);
+    return wow ? L"WinDivert64.sys" : L"WinDivert32.sys";
+#endif
+}
 
 static BOOL CALLBACK wd_load(PINIT_ONCE o, PVOID p, PVOID *c) {
     wchar_t path[MAX_PATH];
     DWORD n = GetModuleFileNameW(NULL, path, MAX_PATH);
     HMODULE h;
+    HANDLE pin = INVALID_HANDLE_VALUE;
     (void)o; (void)p; (void)c;
+    /* a truncated path could name a different (plantable) file */
+    if (n == 0 || n >= MAX_PATH) return TRUE;
     while (n > 0 && path[n - 1] != L'\\') n--;
-    if (n == 0 || n + 14 >= MAX_PATH) return TRUE;
+    if (n == 0 || n + 16 >= MAX_PATH) return TRUE;
+#ifdef WD_PINNED
+    {
+        /* The driver WinDivert will install on this system: checked, then
+         * held open (no writes, no deletes) for the rest of this process, so
+         * the file loaded into the kernel is the one that was checked. When
+         * its pin is compiled in it must exist: otherwise it could be planted
+         * between this check and the moment WinDivert installs it. */
+        static HANDLE sys_hold = INVALID_HANDLE_VALUE;
+        const wchar_t *drv = driver_in_use();
+        if (sys_hold == INVALID_HANDLE_VALUE && pin_for(drv)) {
+            DWORD err = 0;
+            lstrcpyW(path + n, drv);
+            sys_hold = open_pinned(path, &err);
+            if (sys_hold == INVALID_HANDLE_VALUE) {
+                /* missing: WinDivert's own "driver not found" (2); locked or
+                 * quarantined by an antivirus: one clear code (1920) */
+                wd.err = err == ERROR_FILE_NOT_FOUND || err == ERROR_PATH_NOT_FOUND ? ERROR_FILE_NOT_FOUND
+                       : err == ERROR_FILE_INVALID ? ERROR_FILE_INVALID : ERROR_CANT_ACCESS_FILE;
+                return TRUE;
+            }
+        }
+    }
     lstrcpyW(path + n, L"WinDivert.dll");
-    h = LoadLibraryExW(path, NULL, LOAD_WITH_ALTERED_SEARCH_PATH);
+    {
+        DWORD err = 0;
+        pin = open_pinned(path, &err);
+        if (pin == INVALID_HANDLE_VALUE) {
+            /* 1006: "WinDivert files are not the expected ones" in the app */
+            wd.err = err == ERROR_FILE_NOT_FOUND ? ERROR_MOD_NOT_FOUND
+                   : err == ERROR_FILE_INVALID ? ERROR_FILE_INVALID : ERROR_CANT_ACCESS_FILE;
+            return TRUE;
+        }
+    }
+#else
+    lstrcpyW(path + n, L"WinDivert.dll");
+#endif
+    /* Absolute path; its own imports (kernel32, advapi32) from System32 only. */
+    h = LoadLibraryExW(path, NULL, LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_SYSTEM32);
+    if (!h) wd.err = GetLastError();   /* e.g. 193: DLL of the wrong architecture */
+    if (pin != INVALID_HANDLE_VALUE) CloseHandle(pin);   /* mapped now: cannot change */
     if (!h) return TRUE;
 #define WD_SYM(field, type, name) wd.field = (type)(void *)GetProcAddress(h, name)
     WD_SYM(open, pOpen, "WinDivertOpen");
@@ -66,7 +270,7 @@ static BOOL wd_ready(void) {
 
 HANDLE WinDivertOpen(const char *filter, WINDIVERT_LAYER layer, INT16 priority, UINT64 flags) {
     if (!wd_ready()) {
-        SetLastError(ERROR_MOD_NOT_FOUND);
+        SetLastError(wd.err);
         return INVALID_HANDLE_VALUE;
     }
     return wd.open(filter, layer, priority, flags);

@@ -1,6 +1,7 @@
 #ifndef TURKISHDPI_PROBE_H
 #define TURKISHDPI_PROBE_H
 #include <windows.h>
+#include "diag.h"
 
 #define PROBE_MAX_HOSTS 8
 
@@ -16,5 +17,14 @@ int  probe_dns_ms(const char *server_v4, unsigned short port, const char *name, 
 /* Block-page IPv4 addresses the network's resolver answers with (see probe.c). */
 int  probe_learn_block_ips(const char *clean_v4, unsigned short clean_port, char out[][16], int max);
 void probe_flush_dns_cache(void);
+/* TCP connection set-up to ip:port (ip in network byte order): ms, -1 if it
+ * failed, -2 if no socket could be created. */
+int  probe_tcp_connect_ms(unsigned long ip, unsigned short port, DWORD timeout_ms);
+/* Facts for diag_classify about one host: the network's and the clean
+ * resolver's answers (block_ips: learned block pages), TCP to port 443 of the
+ * real addresses, and a full HTTPS request. */
+void probe_collect_facts(const wchar_t *host, const char *clean_v4, unsigned short clean_port,
+                         const char (*block_ips)[16], int nblock, DWORD timeout_ms,
+                         diag_facts_t *out);
 
 #endif

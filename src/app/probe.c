@@ -14,6 +14,7 @@
 #include <winhttp.h>
 #include <stdio.h>
 #include <string.h>
+#include "sysdll.h"
 #include "probe.h"
 
 typedef struct {
@@ -59,7 +60,9 @@ static int https_once(const wchar_t *host, DWORD timeout_ms) {
     HINTERNET s = NULL, c = NULL, r = NULL;
 
     QueryPerformanceFrequency(&freq);
-    s = WinHttpOpen(L"Mozilla/5.0 (Windows NT 10.0; Win64; x64) TurkishDPI-probe",
+    /* A plain browser-like agent: the probed sites need not learn that
+     * TurkishDPI is in use (the ISP cannot see it anyway, it is inside TLS). */
+    s = WinHttpOpen(L"Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
                     WINHTTP_ACCESS_TYPE_NO_PROXY, WINHTTP_NO_PROXY_NAME,
                     WINHTTP_NO_PROXY_BYPASS, 0);
     if (!s) goto out;
@@ -147,6 +150,15 @@ int probe_https_many(const wchar_t **hosts, int count, DWORD timeout_ms, int *re
 int probe_https(const wchar_t *host, DWORD timeout_ms) {
     const wchar_t *h[1] = { host };
     return probe_https_many(h, 1, timeout_ms, NULL, NULL) == 1;
+}
+
+/* RtlGenRandom (advapi32!SystemFunction036), resolved by hand: its header
+ * declaration differs between the MinGW and Microsoft SDKs. */
+static int random_bytes(void *buf, ULONG len) {
+    typedef BOOLEAN (WINAPI *rtlgen_fn)(PVOID, ULONG);
+    HMODULE adv = GetModuleHandleW(L"advapi32.dll");   /* linked, always loaded */
+    rtlgen_fn f = adv ? (rtlgen_fn)(void *)GetProcAddress(adv, "SystemFunction036") : NULL;
+    return f && f(buf, len);
 }
 
 /* Build a minimal DNS query for an A record. Returns its length. */
@@ -261,11 +273,15 @@ int probe_dns_ms(const char *server_v4, unsigned short port, const char *name, D
     struct sockaddr_in sa;
     unsigned char q[512], a[1500];
     int qlen, alen, ms = -1;
-    unsigned short id = (unsigned short)((GetTickCount() ^ GetCurrentThreadId()) & 0xFFFF);
+    unsigned short id;
     DWORD tmo = timeout_ms;
     LARGE_INTEGER f, t0, t1;
 
     if (naddrs) *naddrs = 0;
+    /* Unpredictable transaction ID (an off-path sender must not be able to
+     * forge the answer that decides which resolver is used). */
+    if (!random_bytes(&id, sizeof(id)))
+        id = (unsigned short)((GetTickCount() ^ GetCurrentThreadId()) & 0xFFFF);
     qlen = dns_build_query(q, sizeof(q), name, id);
     if (!qlen) return -1;
 
@@ -280,10 +296,16 @@ int probe_dns_ms(const char *server_v4, unsigned short port, const char *name, D
         closesocket(s);
         return -1;
     }
+    /* Connected socket: answers from any other address/port are discarded
+     * by the stack. */
+    if (connect(s, (struct sockaddr *)&sa, sizeof(sa)) != 0) {
+        closesocket(s);
+        return -1;
+    }
     QueryPerformanceFrequency(&f);
     for (int attempt = 0; attempt < 2 && ms < 0; attempt++) {
         QueryPerformanceCounter(&t0);
-        if (sendto(s, (const char *)q, qlen, 0, (struct sockaddr *)&sa, sizeof(sa)) != qlen)
+        if (send(s, (const char *)q, qlen, 0) != qlen)
             break;
         alen = recv(s, (char *)a, sizeof(a), 0);
         QueryPerformanceCounter(&t1);
@@ -312,33 +334,49 @@ int probe_dns(const char *server_v4, unsigned short port, const char *name, DWOR
  * for two or more different sites, which the clean resolver never gives for
  * them, is a block page. Writes up to max IPv4 addresses (dotted strings).
  */
-int probe_learn_block_ips(const char *clean_v4, unsigned short clean_port,
-                          char out[][16], int max) {
+#define SYSDNS_BYPASS_CACHE 0x00000008u   /* DNS_QUERY_BYPASS_CACHE */
+#define SYSDNS_TCP_ONLY     0x00000002u   /* DNS_QUERY_USE_TCP_ONLY */
+
+/*
+ * A records of name from the system's (= the network's) resolver, cache
+ * bypassed. Returns the number of addresses (0..max), or -1 if the query
+ * itself failed. The one place that loads dnsapi.dll and walks DNS_RECORDA,
+ * whose layout is declared by hand (verified for x86 and x64):
+ * pNext, pName, wType, wDataLength, Flags, dwTtl, dwReserved, Data.
+ */
+static int system_dns_a(const char *name, DWORD flags, unsigned long *ips, int max) {
     typedef LONG (WINAPI *dnsq_fn)(PCSTR, WORD, DWORD, PVOID, PVOID *, PVOID *);
     typedef VOID (WINAPI *dnsfree_fn)(PVOID, int);
+    struct rec { struct rec *next; char *name; WORD type, len; DWORD flags, ttl, res; DWORD ip; };
+    HMODULE h = LoadLibraryExW(L"dnsapi.dll", NULL, LOAD_LIBRARY_SEARCH_SYSTEM32);
+    dnsq_fn q;
+    dnsfree_fn fr;
+    PVOID list = NULL;
+    int n = -1;
+    if (!h) return -1;
+    q = (dnsq_fn)(void *)GetProcAddress(h, "DnsQuery_A");
+    fr = (dnsfree_fn)(void *)GetProcAddress(h, "DnsRecordListFree");
+    if (q && fr && q(name, 1 /* A */, flags | SYSDNS_BYPASS_CACHE, NULL, &list, NULL) == 0) {
+        n = 0;
+        for (struct rec *r = (struct rec *)list; r && n < max; r = r->next)
+            if (r->type == 1) ips[n++] = r->ip;
+        if (list) fr(list, 1);
+    }
+    FreeLibrary(h);
+    return n;
+}
+
+int probe_learn_block_ips(const char *clean_v4, unsigned short clean_port,
+                          char out[][16], int max) {
     static const char *canary[] = { "discord.com", "www.wattpad.com", "www.roblox.com",
                                     "pastebin.com", "imgur.com" };
     unsigned long isp[5][16], cand[16];
     int nisp[5] = { 0 }, ncand = 0, nout = 0;
-    HMODULE h = LoadLibraryExW(L"dnsapi.dll", NULL, LOAD_LIBRARY_SEARCH_SYSTEM32);
-    dnsq_fn q;
-    dnsfree_fn fr;
-    if (!h) return 0;
-    q = (dnsq_fn)(void *)GetProcAddress(h, "DnsQuery_A");
-    fr = (dnsfree_fn)(void *)GetProcAddress(h, "DnsRecordListFree");
-    if (!q || !fr) { FreeLibrary(h); return 0; }
 
     for (int i = 0; i < 5; i++) {
-        /* DNS_RECORDA layout: pNext, pName, wType, wDataLength, Flags, dwTtl, dwReserved, Data */
-        struct rec { struct rec *next; char *name; WORD type, len; DWORD flags, ttl, res; DWORD ip; };
-        PVOID list = NULL;
-        if (q(canary[i], 1 /* A */, 0x8 /* BYPASS_CACHE */, NULL, &list, NULL) == 0 && list) {
-            for (struct rec *r = (struct rec *)list; r && nisp[i] < 16; r = r->next)
-                if (r->type == 1) isp[i][nisp[i]++] = r->ip;
-            fr(list, 1);
-        }
+        int n = system_dns_a(canary[i], 0, isp[i], 16);
+        nisp[i] = n > 0 ? n : 0;
     }
-    FreeLibrary(h);
 
     for (int i = 0; i < 5; i++)
         for (int k = 0; k < nisp[i]; k++) {
@@ -377,4 +415,108 @@ void probe_flush_dns_cache(void) {
         if (f) f();
         FreeLibrary(h);
     }
+}
+
+/* ---------- facts for diagnosing one site (classified in diag.c) ---------- */
+
+/* TCP connection set-up to ip:port (ip in network byte order). ms, or -1;
+ * -2 if no socket could be created (cannot tell). */
+int probe_tcp_connect_ms(unsigned long ip, unsigned short port, DWORD timeout_ms) {
+    SOCKET s = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    struct sockaddr_in sa;
+    u_long nb = 1;
+    fd_set w, e;
+    struct timeval tv;
+    LARGE_INTEGER f, t0, t1;
+    int ms = -1;
+    if (s == INVALID_SOCKET) return -2;
+    memset(&sa, 0, sizeof(sa));
+    sa.sin_family = AF_INET;
+    sa.sin_port = htons(port);
+    sa.sin_addr.s_addr = ip;
+    ioctlsocket(s, FIONBIO, &nb);
+    QueryPerformanceFrequency(&f);
+    QueryPerformanceCounter(&t0);
+    connect(s, (struct sockaddr *)&sa, sizeof(sa));
+    FD_ZERO(&w); FD_SET(s, &w);
+    FD_ZERO(&e); FD_SET(s, &e);
+    tv.tv_sec = (long)(timeout_ms / 1000);
+    tv.tv_usec = (long)((timeout_ms % 1000) * 1000);
+    if (select(0, NULL, &w, &e, &tv) == 1 && FD_ISSET(s, &w)) {
+        int err = 0, l = sizeof(err);
+        getsockopt(s, SOL_SOCKET, SO_ERROR, (char *)&err, &l);
+        if (err == 0) {
+            QueryPerformanceCounter(&t1);
+            ms = (int)((t1.QuadPart - t0.QuadPart) * 1000 / f.QuadPart);
+            if (ms < 1) ms = 1;
+        }
+    }
+    closesocket(s);
+    return ms;
+}
+
+static int in_list(unsigned long ip, const char (*list)[16], int n) {
+    for (int i = 0; i < n; i++) {
+        struct in_addr a;
+        if (inet_pton(AF_INET, list[i], &a) == 1 && a.s_addr == ip) return 1;
+    }
+    return 0;
+}
+
+typedef struct { const wchar_t *host; DWORD timeout_ms; int ok; } https_bg_t;
+
+static DWORD WINAPI https_bg(LPVOID p) {
+    https_bg_t *j = (https_bg_t *)p;
+    const wchar_t *hs[1] = { j->host };
+    j->ok = probe_https_many(hs, 1, j->timeout_ms, NULL, NULL) == 1;
+    return 0;
+}
+
+void probe_collect_facts(const wchar_t *host, const char *clean_v4, unsigned short clean_port,
+                         const char (*block_ips)[16], int nblock, DWORD timeout_ms,
+                         diag_facts_t *out) {
+    char name[256];
+    unsigned long sys_ip[16], clean_ip[16], try_ip[2];
+    int ntry = 0, n;
+    https_bg_t job = { host, timeout_ms, 0 };
+    HANDLE th;
+
+    memset(out, 0, sizeof(*out));
+    if (WideCharToMultiByte(CP_ACP, 0, host, -1, name, sizeof(name), NULL, NULL) <= 0) return;
+
+    /* The full HTTPS request takes longest: it runs while the facts below
+     * are collected instead of after them. */
+    th = CreateThread(NULL, 64 * 1024, https_bg, &job, STACK_SIZE_PARAM_IS_A_RESERVATION, NULL);
+
+    /* The network's own resolver. Over TCP first: the engine diverts only UDP
+     * port 53, so this sees the network's real (possibly forged) answers even
+     * while protection runs (in hybrid mode the engine drops forged UDP
+     * answers before the system sees them). Resolvers that refuse TCP fall
+     * back to the normal query. */
+    n = system_dns_a(name, SYSDNS_TCP_ONLY, sys_ip, 16);
+    if (n < 0) n = system_dns_a(name, 0, sys_ip, 16);
+    out->sys_n = n > 0 ? n : 0;
+    for (int i = 0; i < out->sys_n; i++)
+        if (bogus_ipv4((const unsigned char *)&sys_ip[i]) || in_list(sys_ip[i], block_ips, nblock))
+            out->sys_bogus++;
+    /* the clean resolver */
+    probe_dns_ms(clean_v4, clean_port, name, timeout_ms, clean_ip, &out->clean_n);
+
+    /* TCP to the real addresses: the clean resolver's, else the network's
+     * non-forged ones. Two are enough to tell "this address is dead". */
+    for (int i = 0; i < out->clean_n && ntry < 2; i++) try_ip[ntry++] = clean_ip[i];
+    for (int i = 0; i < out->sys_n && ntry < 2; i++)
+        if (!bogus_ipv4((const unsigned char *)&sys_ip[i]) && !in_list(sys_ip[i], block_ips, nblock))
+            try_ip[ntry++] = sys_ip[i];
+    for (int i = 0; i < ntry; i++) {
+        out->tcp_tried++;
+        if (probe_tcp_connect_ms(try_ip[i], 443, timeout_ms) >= 0) { out->tcp_ok = 1; break; }
+    }
+    if (th) {
+        WaitForSingleObject(th, INFINITE);
+        CloseHandle(th);
+    } else {
+        https_bg(&job);
+    }
+    out->https_ok = job.ok;
 }
