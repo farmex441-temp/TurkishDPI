@@ -20,31 +20,35 @@ typedef struct {
 } preset_t;
 
 static const preset_t PRESETS[] = {
-    /* Measured on a Turk Telekom line (2026-11-08): the decoy must pass the
-     * filter (hop-distance TTL; a fixed TTL of 3-5 dies before it), and the
-     * real data must not follow the decoy in order - the filter then drops
-     * the real first segment and Windows resends it after 300 ms. Sent out
-     * of order (fakeddisorder) it costs nothing: ~155 ms vs ~150 ms. */
-    { L"Sahte + ters bölme (önerilen)",
-      "--desync fakeddisorder --autottl 1 --fake-ttl 4 --drop-rst 1 {DNS}" },
-    { L"Sahte paket + bölme",
-      "--desync fake --split on --autottl 1 --fake-ttl 4 --drop-rst 1 {DNS}" },
+    /* Measured on a Turk Telekom line, 5 runs x 4 sites per technique
+     * (2026-11-08): cutting the first request after its 2nd byte and sending
+     * the pieces in reverse order opens every blocked site, every time, at no
+     * extra latency (~150 ms) - the filter gets a piece too short to classify
+     * and a piece without a TLS record header. Cutting inside the site name
+     * was unreliable (roblox 1/5); a decoy with the hop-distance TTL followed
+     * by the real data costs ~300 ms (the filter drops the real first segment
+     * and Windows resends it after its minimum RTO); a cut after byte 1 does
+     * not work at all. The decoy variants stay for networks that need one. */
+    { L"Ters bölme (önerilen)",
+      "--desync none --split disorder --split-pos 2 --drop-rst 1 {DNS}" },
+    { L"Ters bölme + sahte paket (TTL 5)",
+      "--desync fake --split disorder --split-pos 2 --autottl 0 --fake-ttl 5 --drop-rst 1 {DNS}" },
+    { L"Sahte + ters bölünmüş (ölçülen TTL)",
+      "--desync fakeddisorder --split-pos 2 --autottl 1 --fake-ttl 5 --drop-rst 1 {DNS}" },
+    { L"Sıralı bölme + sahte paket (TTL 5)",
+      "--desync fake --split on --split-pos 2 --autottl 0 --fake-ttl 5 --drop-rst 1 {DNS}" },
     { L"TLS kaydı bölme (Superonline)",
       "--desync fake --split on --tlsrec 1 --autottl 1 --fake-ttl 4 --drop-rst 1 {DNS}" },
-    { L"Sahte paket + ters sıralı bölme",
-      "--desync fake --split disorder --autottl 1 --fake-ttl 4 --drop-rst 1 {DNS}" },
-    { L"Sahte + bölünmüş (fakedsplit)",
-      "--desync fakedsplit --autottl 1 --fake-ttl 4 --drop-rst 1 {DNS}" },
-    { L"Sahte + ters bölme, sabit TTL 4",
-      "--desync fakeddisorder --autottl 0 --fake-ttl 4 --drop-rst 1 {DNS}" },
-    { L"Yalnız bölme (sahte paketsiz)",
-      "--desync none --split on --drop-rst 1 {DNS}" },
-    { L"Sahte + ters bölme (DNS yönlendirmesiz)",
-      "--desync fakeddisorder --autottl 1 --fake-ttl 4 --drop-rst 1" },
+    { L"Ad içinden bölme + sahte paket",
+      "--desync fake --split on --autottl 1 --fake-ttl 4 --drop-rst 1 {DNS}" },
+    { L"Ad içinden ters bölme + sahte",
+      "--desync fakeddisorder --autottl 1 --fake-ttl 4 --drop-rst 1 {DNS}" },
+    { L"Ters bölme (DNS yönlendirmesiz)",
+      "--desync none --split disorder --split-pos 2 --drop-rst 1" },
+    { L"Ters bölme + sahte (DNS yönlendirmesiz)",
+      "--desync fake --split disorder --split-pos 2 --autottl 0 --fake-ttl 5 --drop-rst 1" },
     { L"TLS kaydı bölme (DNS yönlendirmesiz)",
       "--desync fake --split on --tlsrec 1 --autottl 1 --fake-ttl 4 --drop-rst 1" },
-    { L"Yalnız bölme (DNS yönlendirmesiz)",
-      "--desync none --split on --drop-rst 1" },
 };
 #define PRESET_COUNT ((int)(sizeof(PRESETS) / sizeof(PRESETS[0])))
 

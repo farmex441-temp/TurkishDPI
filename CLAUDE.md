@@ -149,13 +149,16 @@ Runtime data: `%ProgramData%\TurkishDPI\` (admin-owned, protected DACL):
   resolver's exact IP:port; inbound RST / SYN-ACK / TLS alerts from 80/443.
   Do not widen this without a reason: every diverted packet costs two
   context switches.
-- **Presets** (presets.h, measured on Türk Telekom 2026-11-08): the decoy must
-  pass the filter (hop-distance TTL, `--autottl 1`; fixed 3-5 dies before it)
-  and real data must not follow the decoy in order (`fake`+in-order split adds
-  ~300 ms: the filter drops the real first segment, Windows resends after its
-  300 ms minimum RTO). `fakeddisorder` costs nothing, so it is preset 0.
-  Learned stats use keys `e<N>` in `[net_<id>]` (the 1.x `p<N>` keys belong to
-  the old presets and are ignored); reordering presets invalidates them.
+- **Presets** (presets.h, measured on Türk Telekom 2026-11-08, 5 runs x 4
+  sites per technique): cutting the first request after byte 2
+  (`--split-pos 2`) and sending the pieces in reverse order opens every
+  blocked site every time at no extra latency (~150 ms) - preset 0, no decoy.
+  Cutting inside the site name (Shroudly's default) was unreliable (roblox
+  1/5); a hop-distance-TTL decoy followed by real data costs ~300 ms (the
+  filter drops the real first segment, Windows resends after its 300 ms
+  minimum RTO); a cut after byte 1 fails; fixed-TTL 5 decoys with the
+  byte-2 cut work. Learned stats use keys `e<N>` in `[net_<id>]` (1.x `p<N>`
+  keys are ignored); reordering presets invalidates them.
 - **Payment protection** (default on, `--no-payment-exclude` / ini
   `PaymentProtection=0` to disable): ~100 bank/payment/3-D Secure domains are
   never modified, matched by SNI/Host and by addresses learned from DNS answers.

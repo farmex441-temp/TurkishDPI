@@ -92,8 +92,8 @@ Sürüm 2.0'dan itibaren **kendi paket motorunu** kullanır: motorun IPv4 paket 
 
 Bir web bağlantısının ilk paketinde (TLS ClientHello ya da HTTP isteği) sitenin adı açıkça yazar; ISS'nin filtresi bu adı okuyup bağlantıyı keser. Motor bu paketi yakalar ve:
 
-- önce **sahte bir kopyasını** gönderir: filtreye ulaşır ama sunucuya varmadan ölür (ağdaki uzaklık ölçülerek ayarlanan düşük TTL, bozuk TCP sağlama toplamı, adı değiştirilmiş);
-- gerçek paketi, hiçbir parçada sitenin adı tam görünmeyecek şekilde **böler** (gerekirse ters sırada gönderir);
+- gerçek paketi **böler** ve parçaları **ters sırada** gönderir: önerilen profilde ilk parça yalnızca 2 bayttır, filtre ne sınıflandırabileceği kadar veri ne de bir TLS başlığı görür; sunucu parçaları yine doğru sırayla birleştirir;
+- gereken ağlarda önce **sahte bir kopyasını** gönderir: filtreye ulaşır ama sunucuya varmadan ölür (düşük TTL, bozuk TCP sağlama toplamı, adı değiştirilmiş);
 - filtrenin bağlantıyı kesmek için uydurduğu **RST paketlerini** düşürür;
 - QUIC/HTTP3'ü engeller ki tarayıcı bu tekniklerin işlediği TCP'ye geçsin;
 - DNS sorgularını temiz bir DNS'e de gönderir (hibrit yarış).
@@ -104,16 +104,28 @@ Banka ve ödeme bağlantılarına hiç dokunulmaz.
 
 | Profil | Motor argümanları |
 |---|---|
-| Sahte + ters bölme (önerilen) | `--desync fakeddisorder --autottl 1` + DNS |
-| Sahte paket + bölme | `--desync fake --split on --autottl 1` + DNS |
+| Ters bölme (önerilen) | `--desync none --split disorder --split-pos 2` + DNS |
+| Ters bölme + sahte paket (TTL 5) | `--desync fake --split disorder --split-pos 2 --autottl 0 --fake-ttl 5` + DNS |
+| Sahte + ters bölünmüş (ölçülen TTL) | `--desync fakeddisorder --split-pos 2 --autottl 1` + DNS |
+| Sıralı bölme + sahte paket (TTL 5) | `--desync fake --split on --split-pos 2 --fake-ttl 5` + DNS |
 | TLS kaydı bölme (Superonline) | `--desync fake --split on --tlsrec 1 --autottl 1` + DNS |
-| Sahte paket + ters sıralı bölme | `--desync fake --split disorder --autottl 1` + DNS |
-| Sahte + bölünmüş | `--desync fakedsplit --autottl 1` + DNS |
-| Sahte + ters bölme, sabit TTL 4 | `--desync fakeddisorder --autottl 0 --fake-ttl 4` + DNS |
-| Yalnız bölme | `--desync none --split on` + DNS |
-| … DNS yönlendirmesiz | aynı tekniklerin DNS'e dokunmayan varyantları |
+| Ad içinden bölme + sahte paket | `--desync fake --split on --autottl 1` + DNS |
+| Ad içinden ters bölme + sahte | `--desync fakeddisorder --autottl 1` + DNS |
+| … DNS yönlendirmesiz | ilk iki profil ve TLS kaydı bölmenin DNS'e dokunmayan varyantları |
 
-Hepsi `--drop-rst 1` ile sahte RST'leri düşürür ve QUIC'i engeller. Türk Telekom hattında ölçüldü: sahte paket filtreyi geçecek kadar uzağa gitmeli (ölçülen TTL; sabit 3-5 yetmiyor) ve gerçek veri sahtenin ardından sırayla gitmemeli; aksi hâlde filtre gerçek ilk parçayı düşürür ve Windows onu 300 ms sonra yeniden gönderir. Bu yüzden ters sıralı profil ilk sıradadır.
+Hepsi `--drop-rst 1` ile sahte RST'leri düşürür ve QUIC'i engeller.
+
+**Ölçüm (Türk Telekom hattı, her teknik 5 deneme × 4 site):** İlk isteği 2. bayttan sonra bölüp parçaları ters sırada göndermek her engelli siteyi her seferinde açtı ve gecikme eklemedi (~150 ms; motor kapalıyken engelsiz siteler ~115 ms). Bölmeyi sitenin adının içinden yapmak güvenilmezdi (roblox 1/5); ölçülen TTL'li sahte paketin ardından gerçek verinin gelmesi ~300 ms ekledi (filtre gerçek ilk parçayı düşürüyor, Windows 300 ms sonra yeniden gönderiyor); 1. bayttan sonra bölmek hiç işe yaramadı. Sahte paketli profiller, sahte paket gerektiren ağlar için yedekte durur; otomatik tarama her ağda en hızlı çalışanı seçer.
+
+### v2.0.0 ölçümü (`--selftest`, Türk Telekom)
+
+| | Sonuç |
+|---|---|
+| Engelli test siteleri (discord, roblox, wattpad) | 3/3, ~160 ms |
+| Discord (site, ağ geçidi, CDN, güncelleyici) | hepsi açık, 150–165 ms |
+| TurkishDPI'ın eklediği gecikme (kontrol siteleri) | 0 ms (84 / 84 ms) |
+| Ödeme siteleri (PayPal, Garanti, iyzico) | açıldı, bağlantılara dokunulmadı |
+| Var olmayan alan adı (NXDOMAIN) | 44–191 ms'de hata (beklemeden) |
 
 ### Ayarlar
 

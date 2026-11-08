@@ -57,6 +57,7 @@ int engine_report_stats = 0;
 /* ---------- configuration ---------- */
 static raw_config cfg;
 static int no_decoy;                        /* only the cut, never a decoy */
+static int split_pos;                       /* >0: cut the request at this byte, not at the name */
 static int dns4, dns6;                       /* redirect DNS to the clean resolver */
 static uint32_t dns4_addr;                   /* network order */
 static uint16_t dns4_port;
@@ -129,6 +130,18 @@ static int decoy_payload(uint8_t *out, int cap, const uint8_t *pay, int plen,
     return plen;
 }
 
+/* Where the real request is cut: a fixed early byte (--split-pos: the
+ * filter then sees a piece too short to classify, and a piece without a TLS
+ * record header), or - by default - inside the site name (Shroudly). */
+static int cut_points(const uint8_t *pay, int plen, const proto_info *pi, int cuts[2]) {
+    if (split_pos > 0) {
+        if (plen < 2) return 0;
+        cuts[0] = split_pos < plen ? split_pos : plen - 1;
+        return 1;
+    }
+    return tcpdpi_split_points(pay, plen, pi->host_off, pi->host_len, cuts);
+}
+
 /* ================= IPv4 (adapted from Shroudly raw_windows.c) ============= */
 static int decoy_ttl4(uint32_t daddr) {
     if (cfg.autottl) {
@@ -152,7 +165,7 @@ static void send_fake4(const uint8_t *pkt, int len, int ihl, int tcphl, int poff
 
 static int send_cut4(const uint8_t *pkt, int ihl, int tcphl, int poff, int plen,
                      const proto_info *pi, int disorder, const WINDIVERT_ADDRESS *addr) {
-    int cuts[2], nc = tcpdpi_split_points(pkt + poff, plen, pi->host_off, pi->host_len, cuts);
+    int cuts[2], nc = cut_points(pkt + poff, plen, pi, cuts);
     tcpdpi_seg segs[3];
     int ns = 0;
     if (nc > 0 && tcpdpi_build_multisplit4(segs, &ns, pkt, ihl, pkt + ihl, tcphl, ipid,
@@ -194,7 +207,8 @@ static int desync4(const uint8_t *pkt, int len, int ihl, int tcphl, int poff,
                          cfg.split == RAW_SPLIT_DISORDER || cfg.desync_mode == RAW_DESYNC_FAKEDDISORDER, addr);
     }
     if (faked) {
-        int split = (pi->host_off > 0 && pi->host_off < plen) ? pi->host_off : (plen > 2 ? 2 : 1);
+        int split = split_pos > 0 ? (split_pos < plen ? split_pos : plen - 1)
+                  : (pi->host_off > 0 && pi->host_off < plen) ? pi->host_off : (plen > 2 ? 2 : 1);
         tcpdpi_seg segs[3];
         int ns = 0;
         if (tcpdpi_build_fakedsplit4(segs, &ns, pkt, ihl, pkt + ihl, tcphl, ipid, seq, otl,
@@ -296,7 +310,7 @@ static int desync6(const uint8_t *pkt, int len, int tcphl, const proto_info *pi,
             send_crafted(out, n, addr, 1);
     }
     if (!cut) return 0;
-    nc = tcpdpi_split_points(pay, plen, pi->host_off, pi->host_len, cuts);
+    nc = cut_points(pay, plen, pi, cuts);
     if (nc <= 0) return 0;
     {
         int from[3], to[3], ns = 0, start = 0;
@@ -639,6 +653,7 @@ static void usage(void) {
            "  --autottl 0|1           decoy TTL from the measured hop distance (default 1)\n"
            "  --drop-rst 0|1          drop the resets the filter forges (default 1)\n"
            "  --split off|on|disorder cut the real request so no segment holds the whole name\n"
+           "  --split-pos N           cut it after byte N instead (e.g. 2), not inside the name\n"
            "  --desync fake|fakedsplit|fakeddisorder|none   decoy technique (none: only the cut)\n"
            "  --seqovl N              overlap the first segment by N bytes (IPv4)\n"
            "  --tlsrec 0|1            split the ClientHello's TLS record in two (IPv4)\n"
@@ -698,6 +713,7 @@ int engine_main(int argc, char *argv[]) {
             else if (!strcmp(v, "none")) { cfg.desync_mode = RAW_DESYNC_FAKE; no_decoy = 1; }
             else bad = a;
         }
+        else if (!strcmp(a, "--split-pos")) { NEED(); split_pos = atoi(v); if (split_pos < 1 || split_pos > 1000) bad = a; }
         else if (!strcmp(a, "--seqovl")) { NEED(); cfg.seqovl = atoi(v); if (cfg.seqovl < 0 || cfg.seqovl > 1000) bad = a; }
         else if (!strcmp(a, "--tlsrec")) { NEED(); cfg.tlsrec = atoi(v) ? 1 : 0; }
         else if (!strcmp(a, "--decoy-name")) { NEED(); if (proto_decoy_name_add(v) != 0) bad = a; }
@@ -739,13 +755,13 @@ int engine_main(int argc, char *argv[]) {
     rawscope_nodecoy_reset();
 
     printf("TurkishDPI engine %s\n", TURKISHDPI_VERSION_A);
-    printf("decoy=%s ttl=%d autottl=%d split=%s drop_rst=%d seqovl=%d tlsrec=%d quic_block=%d "
+    printf("decoy=%s ttl=%d autottl=%d split=%s split_pos=%d drop_rst=%d seqovl=%d tlsrec=%d quic_block=%d "
            "dns=%s payment_exclude=%d\n",
            no_decoy ? "none" : cfg.desync_mode == RAW_DESYNC_FAKEDSPLIT ? "fakedsplit"
                              : cfg.desync_mode == RAW_DESYNC_FAKEDDISORDER ? "fakeddisorder" : "fake",
            cfg.fake_ttl, cfg.autottl,
            cfg.split == RAW_SPLIT_OFF ? "off" : cfg.split == RAW_SPLIT_DISORDER ? "disorder" : "on",
-           cfg.drop_rst, cfg.seqovl, cfg.tlsrec, cfg.quic_block,
+           split_pos, cfg.drop_rst, cfg.seqovl, cfg.tlsrec, cfg.quic_block,
            dns4 || dns6 ? (dns_hybrid_enabled() ? "hybrid" : "redirect") : "system", payment);
 
     /* A filter the driver refuses (87) is retried without the TLS-alert
