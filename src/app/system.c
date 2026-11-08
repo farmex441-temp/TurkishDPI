@@ -22,6 +22,7 @@
 #include "sysdll.h"
 #include "app.h"
 #include "system.h"
+#include "probe.h"
 #include "version.h"
 
 /* ---------- other bypass / VPN tools ---------- */
@@ -69,28 +70,11 @@ int sys_find_rival(wchar_t *name_out, size_t cap) {
 static const wchar_t *INET_KEY = L"Software\\Microsoft\\Windows\\CurrentVersion\\Internet Settings";
 
 static int port_listening(const char *host, unsigned short port) {
-    SOCKET s = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
-    struct sockaddr_in sa;
-    u_long nb = 1;
-    fd_set w;
-    struct timeval tv = { 0, 400000 };
-    int ok = 0;
-    if (s == INVALID_SOCKET) return 1;   /* cannot tell: assume fine */
-    memset(&sa, 0, sizeof(sa));
-    sa.sin_family = AF_INET;
-    sa.sin_port = htons(port);
-    inet_pton(AF_INET, host, &sa.sin_addr);
-    ioctlsocket(s, FIONBIO, &nb);
-    connect(s, (struct sockaddr *)&sa, sizeof(sa));
-    FD_ZERO(&w);
-    FD_SET(s, &w);
-    if (select(0, NULL, &w, NULL, &tv) == 1) {
-        int err = 0, l = sizeof(err);
-        getsockopt(s, SOL_SOCKET, SO_ERROR, (char *)&err, &l);
-        ok = err == 0;
-    }
-    closesocket(s);
-    return ok;
+    struct in_addr a;
+    int ms;
+    if (inet_pton(AF_INET, host, &a) != 1) return 1;   /* cannot tell: assume fine */
+    ms = probe_tcp_connect_ms(a.s_addr, port, 400);
+    return ms >= 0 || ms == -2;                        /* no socket: assume fine */
 }
 
 /* 1 if the user's manual proxy points at this computer and nothing listens there. */
@@ -394,7 +378,7 @@ static int install_one(HANDLE src, const wchar_t *dst) {
     return same || copy_from_handle(src, dst);   /* a loaded driver file cannot be replaced */
 }
 
-int windivert_dll_ok(const wchar_t *path);   /* src/engine/windivert_dyn.c */
+int windivert_file_ok(const wchar_t *path);   /* src/engine/windivert_dyn.c */
 
 /*
  * Copies the program (exe, WinDivert DLL + driver, licences) into the
@@ -450,7 +434,8 @@ int sys_install_copy(HANDLE self_exe, const wchar_t *running_exe, wchar_t *insta
                 continue;
             }
         }
-        if (i == 0 && !windivert_dll_ok(src)) {      /* never install a foreign DLL */
+        /* never install a foreign DLL or driver (pinned at build time) */
+        if ((i == 0 || wcsstr(FILES[i].name, L".sys")) && !windivert_file_ok(src)) {
             CloseHandle(h);
             return 0;
         }

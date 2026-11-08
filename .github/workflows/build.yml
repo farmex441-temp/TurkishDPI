@@ -57,6 +57,22 @@ jobs:
           done
           ./build/hok/t.exe 126
           ./build/hbad/t.exe 1006
+          # The drivers are pinned the same way: a WinDivert64.sys with another
+          # hash stops loading before WinDivert.dll could install it (1006).
+          for c in sysok sysbad; do
+            mkdir -p build/h$c
+            cp /c/Windows/System32/version.dll build/h$c/WinDivert.dll
+            cp /c/Windows/System32/version.dll build/h$c/WinDivert64.sys
+          done
+          for c in sysok sysbad; do
+            [ $c = sysok ] && S=$H || S=$B
+            gcc -O2 -Wall -DWINDIVERTEXPORT=extern -DWINDIVERT_DLL_SHA256="\"$H\"" \
+                -DWINDIVERT_SYS64_SHA256="\"$S\"" \
+                -Ithird_party/WinDivert/include -Isrc/engine \
+                tests/windivert_hash_test.c src/engine/windivert_dyn.c -o build/h$c/t.exe
+          done
+          ./build/hsysok/t.exe 126
+          ./build/hsysbad/t.exe 1006
 
   test-sanitizers:
     # Platform-independent code under AddressSanitizer + UBSan.

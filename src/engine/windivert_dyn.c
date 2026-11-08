@@ -44,7 +44,8 @@ static struct {
     pParse parse; pCalc calc;
 } wd = { INIT_ONCE_STATIC_INIT, FALSE, ERROR_MOD_NOT_FOUND, 0, 0, 0, 0, 0, 0, 0 };
 
-#ifdef WINDIVERT_DLL_SHA256
+#if defined(WINDIVERT_DLL_SHA256) || defined(WINDIVERT_SYS64_SHA256) || defined(WINDIVERT_SYS32_SHA256)
+#define WD_PINNED 1
 /*
  * The DLL next to the exe is loaded into an elevated process, and that folder
  * may be writable by ordinary users (a zip extracted to Downloads). Its
@@ -102,20 +103,67 @@ static BOOL hash_matches(const unsigned char h[32], const char *hex) {
     }
     return hex[64] == 0;
 }
+
+/*
+ * Pins of the files WinDivert loads from the exe's folder. The drivers matter
+ * as much as the DLL: WinDivert.dll installs whatever WinDivert64.sys /
+ * WinDivert32.sys sits next to it as a kernel driver. Any signed driver
+ * would load - so a user-writable folder must not be able to swap in a
+ * different (e.g. a vulnerable) one.
+ */
+static const char *pin_for(const wchar_t *name) {
+#ifdef WINDIVERT_DLL_SHA256
+    if (!lstrcmpiW(name, L"WinDivert.dll")) return WINDIVERT_DLL_SHA256;
+#endif
+#ifdef WINDIVERT_SYS64_SHA256
+    if (!lstrcmpiW(name, L"WinDivert64.sys")) return WINDIVERT_SYS64_SHA256;
+#endif
+#ifdef WINDIVERT_SYS32_SHA256
+    if (!lstrcmpiW(name, L"WinDivert32.sys")) return WINDIVERT_SYS32_SHA256;
+#endif
+    (void)name;
+    return NULL;
+}
+
+static const wchar_t *base_name(const wchar_t *path) {
+    const wchar_t *b = path;
+    for (const wchar_t *p = path; *p; p++)
+        if (*p == L'\\' || *p == L'/') b = p + 1;
+    return b;
+}
+
+/* Opens path denying writes and deletes and checks its pin. Returns the open
+ * handle (keep it open as long as the file must not change) or
+ * INVALID_HANDLE_VALUE with *err set: ERROR_FILE_NOT_FOUND, ERROR_FILE_INVALID
+ * (another file) or the open error. A file without a pin is accepted. */
+static HANDLE open_pinned(const wchar_t *path, DWORD *err) {
+    const char *pin = pin_for(base_name(path));
+    unsigned char digest[32];
+    HANDLE f = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING,
+                           FILE_ATTRIBUTE_NORMAL | FILE_FLAG_SEQUENTIAL_SCAN, NULL);
+    if (f == INVALID_HANDLE_VALUE) {
+        *err = GetLastError();
+        return INVALID_HANDLE_VALUE;
+    }
+    if (pin && (!sha256_of_handle(f, digest) || !hash_matches(digest, pin))) {
+        CloseHandle(f);
+        *err = ERROR_FILE_INVALID;
+        return INVALID_HANDLE_VALUE;
+    }
+    return f;
+}
 #endif
 
-/* 1 if the file at path is the pinned WinDivert.dll (always 1 in a build
- * without a pin). Used before the app copies the DLL into Program Files. */
-int windivert_dll_ok(const wchar_t *path) {
-#ifdef WINDIVERT_DLL_SHA256
-    unsigned char digest[32];
-    BOOL ok;
-    HANDLE f = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING,
-                           FILE_FLAG_SEQUENTIAL_SCAN, NULL);
+/* 1 if the file at path is the pinned WinDivert file of that name (a file
+ * without a pin, or any file in a build without pins, is accepted). Used
+ * before the app copies the files into Program Files. */
+int windivert_file_ok(const wchar_t *path) {
+#ifdef WD_PINNED
+    DWORD err;
+    HANDLE f = open_pinned(path, &err);
     if (f == INVALID_HANDLE_VALUE) return 0;
-    ok = sha256_of_handle(f, digest) && hash_matches(digest, WINDIVERT_DLL_SHA256);
     CloseHandle(f);
-    return ok;
+    return 1;
 #else
     (void)path;
     return 1;
@@ -129,23 +177,38 @@ static BOOL CALLBACK wd_load(PINIT_ONCE o, PVOID p, PVOID *c) {
     HANDLE pin = INVALID_HANDLE_VALUE;
     (void)o; (void)p; (void)c;
     while (n > 0 && path[n - 1] != L'\\') n--;
-    if (n == 0 || n + 14 >= MAX_PATH) return TRUE;
-    lstrcpyW(path + n, L"WinDivert.dll");
-#ifdef WINDIVERT_DLL_SHA256
+    if (n == 0 || n + 16 >= MAX_PATH) return TRUE;
+#ifdef WD_PINNED
     {
-        unsigned char digest[32];
-        pin = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING,
-                          FILE_ATTRIBUTE_NORMAL | FILE_FLAG_SEQUENTIAL_SCAN, NULL);
-        if (pin == INVALID_HANDLE_VALUE) {
-            wd.err = GetLastError() == ERROR_FILE_NOT_FOUND ? ERROR_MOD_NOT_FOUND : GetLastError();
-            return TRUE;
+        /* Drivers first: checked, then held open (no writes, no deletes) for
+         * the rest of this process, so the file WinDivert installs as a
+         * driver is the one that was checked. A missing driver is left to
+         * WinDivert's own error (2) when it tries to load it. */
+        static HANDLE sys_hold[2] = { INVALID_HANDLE_VALUE, INVALID_HANDLE_VALUE };
+        static const wchar_t *sys_names[2] = { L"WinDivert64.sys", L"WinDivert32.sys" };
+        for (int i = 0; i < 2; i++) {
+            DWORD err = 0;
+            if (sys_hold[i] != INVALID_HANDLE_VALUE) continue;
+            lstrcpyW(path + n, sys_names[i]);
+            sys_hold[i] = open_pinned(path, &err);
+            if (sys_hold[i] == INVALID_HANDLE_VALUE && err != ERROR_FILE_NOT_FOUND) {
+                wd.err = err == ERROR_FILE_INVALID ? ERROR_FILE_INVALID : err;
+                return TRUE;
+            }
         }
-        if (!sha256_of_handle(pin, digest) || !hash_matches(digest, WINDIVERT_DLL_SHA256)) {
-            wd.err = ERROR_FILE_INVALID;   /* app: "WinDivert.dll is not the expected file" */
-            CloseHandle(pin);
+    }
+    lstrcpyW(path + n, L"WinDivert.dll");
+    {
+        DWORD err = 0;
+        pin = open_pinned(path, &err);
+        if (pin == INVALID_HANDLE_VALUE) {
+            /* 1006: "WinDivert files are not the expected ones" in the app */
+            wd.err = err == ERROR_FILE_NOT_FOUND ? ERROR_MOD_NOT_FOUND : err;
             return TRUE;
         }
     }
+#else
+    lstrcpyW(path + n, L"WinDivert.dll");
 #endif
     /* Absolute path; its own imports (kernel32, advapi32) from System32 only. */
     h = LoadLibraryExW(path, NULL, LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_SYSTEM32);

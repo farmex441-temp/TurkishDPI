@@ -1232,6 +1232,7 @@ static void command(int id) {
             L"bir kayıt varsa 'Geri yükle' deyin.\n"
             L"2) Aynı yerde Ayarları yönet > Dışlamalar > Klasör olarak şunları ekleyin:\n"
             L"     C:\\ProgramData\\TurkishDPI\n"
+            L"     C:\\Program Files\\TurkishDPI (Windows ile başlat açıksa)\n"
             L"     TurkishDPI.exe'nin bulunduğu klasör\n"
             L"3) Kaspersky kullanıyorsanız kaldırmanız gerekebilir.\n\n"
             L"Tamam'a basınca Windows Güvenliği açılır.", L"Antivirüs yardımı", MB_ICONINFORMATION);

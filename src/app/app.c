@@ -492,8 +492,9 @@ static const wchar_t *windivert_error_text(long e) {
     case 1753: return L"Base Filtering Engine (BFE) hizmeti kapalı. Hizmetler'den açın.";
     case 193:  return L"WinDivert.dll bu sistemin mimarisine uymuyor (x64/x86 zip'leri karışmış olabilir). "
                       L"Doğru zip'i yeniden çıkarın.";
-    case 1006: return L"WinDivert.dll beklenen dosya değil (değiştirilmiş ya da başka bir sürüm). "
-                      L"Güvenlik için yüklenmedi. TurkishDPI'ı resmi zip'ten yeniden çıkarın.";
+    case 1006: return L"WinDivert dosyaları (WinDivert.dll ya da sürücü) beklenen dosyalar değil: "
+                      L"değiştirilmiş ya da başka bir sürüm. Güvenlik için yüklenmedi. "
+                      L"TurkishDPI'ı resmi zip'ten yeniden çıkarın.";
     default:   return NULL;
     }
 }
@@ -883,6 +884,11 @@ static void auto_scan(void) {
         }
     }
     set_state(ST_SCANNING, L"En hızlı DNS ölçülüyor…", L"");
+    /* Without hybrid DNS the engine drops every DNS answer it did not ask for,
+     * including the probes to the clean server it uses: measured with the
+     * engine running, that server would look dead and the choice would flap
+     * (and restart the engine) on every scan. */
+    if (!g_dns_hybrid) engine_stop();
     pick_dns();
     if (g_dns_hybrid) learn_block_ips_if_stale();
     smart_order(order, PRESET_COUNT);

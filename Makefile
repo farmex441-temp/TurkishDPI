@@ -41,6 +41,23 @@ CFLAGS += -DWINDIVERT_DLL_SHA256=\"$(WINDIVERT_DLL_SHA256)\"
 else ifeq ($(REQUIRE_WINDIVERT_HASH),1)
 $(error $(WINDIVERT_DLL) not found: cannot pin its SHA-256)
 endif
+# The drivers are pinned too: WinDivert.dll installs whichever .sys sits next
+# to it as a kernel driver. x64 packages ship WinDivert64.sys; x86 packages
+# ship both (WinDivert64.sys is used on 64-bit Windows).
+WINDIVERT_SYS64 := $(WINDIVERT)/$(WDARCH)/WinDivert64.sys
+WINDIVERT_SYS32 := $(WINDIVERT)/$(WDARCH)/WinDivert32.sys
+WINDIVERT_SYS64_SHA256 ?= $(shell sha256sum < $(WINDIVERT_SYS64) 2>/dev/null | cut -c1-64)
+WINDIVERT_SYS32_SHA256 ?= $(shell sha256sum < $(WINDIVERT_SYS32) 2>/dev/null | cut -c1-64)
+ifneq ($(WINDIVERT_SYS64_SHA256),)
+CFLAGS += -DWINDIVERT_SYS64_SHA256=\"$(WINDIVERT_SYS64_SHA256)\"
+else ifeq ($(REQUIRE_WINDIVERT_HASH),1)
+$(error $(WINDIVERT_SYS64) not found: cannot pin its SHA-256)
+endif
+ifneq ($(WINDIVERT_SYS32_SHA256),)
+CFLAGS += -DWINDIVERT_SYS32_SHA256=\"$(WINDIVERT_SYS32_SHA256)\"
+else ifeq ($(REQUIRE_WINDIVERT_HASH)$(WDARCH),1x86)
+$(error $(WINDIVERT_SYS32) not found: cannot pin its SHA-256)
+endif
 
 ENGINE_SRC := $(wildcard src/engine/*.c src/engine/utils/*.c)
 APP_SRC    := $(wildcard src/app/*.c)
@@ -54,7 +71,7 @@ $(OUT)/obj/%.o: src/%.c $(wildcard src/*/*.h)
 	$(CC) $(CFLAGS) -c $< -o $@
 
 # the pinned hash is compiled in: rebuild when the DLL changes
-$(OUT)/obj/engine/windivert_dyn.o: $(wildcard $(WINDIVERT_DLL))
+$(OUT)/obj/engine/windivert_dyn.o: $(wildcard $(WINDIVERT_DLL) $(WINDIVERT_SYS64) $(WINDIVERT_SYS32))
 
 $(OUT)/obj/res.o: src/app/TurkishDPI.rc src/app/TurkishDPI.exe.manifest $(wildcard src/app/res/*.ico) src/app/version.h
 	@mkdir -p $(dir $@)
