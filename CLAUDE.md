@@ -322,7 +322,10 @@ SHA-256 in the workflow.
   Defender scan clean. v1.2.1: x64 zip 3/68 (same WinDivert labels), exe
   alone 2/71: Elastic ML plus Microsoft cloud ML `Trojan:Win32/Wacatac.B!ml`
   (a generic label for new unsigned binaries; local Defender without cloud
-  protection is clean) - needs a false-positive submission to Microsoft
-  (owner, signed in). Remaining options are code signing and false-positive
+  protection is clean). It blocks the download in Edge and Chrome (Chrome
+  hands downloads to Defender; Google Safe Browsing itself reports the URL
+  clean). False-positive report sent 2026-11-08, submission ID
+  89a9c5f0-2095-46ea-b5b0-f9f4a55ae401 (status at https://www.microsoft.com/en-us/wdsi/submission/89a9c5f0-2095-46ea-b5b0-f9f4a55ae401;
+  cloud label then `Program:Win32/Wacapew.A!ml`, determination pending). Remaining options are code signing and false-positive
   reports to the vendors (both need the owner); do not try to dodge ML
   detectors with packing/obfuscation.
