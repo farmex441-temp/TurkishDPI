@@ -918,7 +918,11 @@ static void auto_scan(void) {
     for (int k = 0; k < PRESET_COUNT; k++) {
         int p = order[k], score, ms;
         wchar_t st[64];
-        if (cmd_pending()) { InterlockedExchange(&g_scan_aborted, 1); return; }
+        if (cmd_pending()) {
+            log_line("scan: interrupted by a command");
+            InterlockedExchange(&g_scan_aborted, 1);
+            return;
+        }
         if (winner >= 0 && (known_before[p] || extra >= 2)) break;
         EnterCriticalSection(&g_lock);
         g_ui.scan_pos = k + 1;
@@ -1204,6 +1208,10 @@ static DWORD WINAPI controller(LPVOID unused) {
         if (r == WAIT_OBJECT_0 + 2) netchg = 1;   /* resumed from sleep */
 
         if ((cmd = cmd_pop(&arg)) != CMD_NONE) {
+            /* auto_scan gives way to any queued command; a command that does
+             * not replace the scan must finish it afterwards, otherwise the
+             * engine stays on whatever preset was being tried. */
+            int interrupted = g_scan_aborted != 0;
             if (cmd == CMD_TOGGLE_PAUSE) cmd = g_paused ? CMD_RESUME : CMD_PAUSE;
             if (cmd != CMD_TESTSITE) InterlockedExchange(&g_scan_aborted, 0);
             switch (cmd) {
@@ -1220,7 +1228,8 @@ static DWORD WINAPI controller(LPVOID unused) {
                               set_state(ST_PAUSED, L"Duraklatıldı", L"Açmak için düğmeye basın"); break;
             case CMD_RESTART: /* settings changed: restart what runs, no full rescan */
                               set_reason(WHY_SETTINGS);
-                              if (!g_paused && g_running_preset >= 0) {
+                              /* mid-scan the running preset is only a candidate */
+                              if (!g_paused && g_running_preset >= 0 && !interrupted) {
                                   int p = g_running_preset;
                                   if (engine_start(p, g_dns)) announce(p, targets_score(NULL));
                                   else if (!engine_fatal()) { if (g_auto) auto_scan(); else manual_start(g_preset); }
@@ -1231,7 +1240,9 @@ static DWORD WINAPI controller(LPVOID unused) {
                               if (cmd == CMD_RESUME) set_reason(WHY_RESUME_PAUSE);
                               if (g_auto) auto_scan(); else manual_start(g_preset);
                               break;
-            case CMD_AUTOSTART: autostart_set((int)arg); break;
+            case CMD_AUTOSTART: autostart_set((int)arg);
+                              if (interrupted && g_auto && !g_paused) auto_scan();
+                              break;
             case CMD_TESTSITE: {
                 wchar_t h[256];
                 EnterCriticalSection(&g_lock);

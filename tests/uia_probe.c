@@ -158,6 +158,9 @@ int wmain(int argc, wchar_t **argv) {
         IUnknown *p = NULL;
         if (!e) { out(L"not found: "); out(argv[2]); out(L"\n"); return 4; }
         describe(e, 0);
+        /* BM_CLICK (behind Invoke) can be dropped while the window is not
+         * active, e.g. under a full-screen game: bring it to the front first */
+        IUIAutomationElement_SetFocus(win);
         if (SUCCEEDED(IUIAutomationElement_GetCurrentPattern(e, UIA_TogglePatternId, &p)) && p) {
             rc = FAILED(IUIAutomationTogglePattern_Toggle((IUIAutomationTogglePattern *)p)) ? 5 : 0;
         } else if (SUCCEEDED(IUIAutomationElement_GetCurrentPattern(e, UIA_InvokePatternId, &p)) && p) {
