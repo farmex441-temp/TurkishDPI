@@ -1663,6 +1663,8 @@ int main(int argc, char *argv[]) {
             L"TurkishDPI", MB_ICONINFORMATION);
         return 0;
     }
+    if (argc >= 2 && !strcmp(argv[1], "--ui-preview"))
+        return ui_preview_main(argc, argv);   /* UI only: no data folder, engine or network */
     if (argc >= 2 && !strcmp(argv[1], "--selftest")) {
         g_selftest = 1;
         return app_main(1);

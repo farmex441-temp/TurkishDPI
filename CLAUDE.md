@@ -23,7 +23,12 @@ automatic, self-learning controller, its own UI and ideas taken from
    Old GoodbyeDPI `.cmd` scripts and `sc create` services work with it unchanged.
 
 Other modes: `--selftest` (scan, verify payment pass-through, write `SELFTEST …`
-lines to the log, exit; exits 3 if another instance runs), `--help`.
+lines to the log, exit; exits 3 if another instance runs), `--help`,
+`--ui-preview <scenario> [--scale F] [--page status|details|settings]
+[--focus N] [--shot out.bmp]` (developer tool, not in `--help`: the window with
+mock `g_ui` data, no data folder/engine/network/tray, every action gated in
+`do_click`/`command`; own window class so the real app never finds it; runs
+without admin via `__COMPAT_LAYER=RunAsInvoker`; scenarios in `preview_fill`).
 
 Engine -> app protocol (stdout lines): `Filter activated…`,
 `Error opening filter: <code>`, `STATS packets=… https=… http=… excluded=… dns=…`
@@ -37,8 +42,11 @@ src/app/            the app (controller, UI, probes, learning)
                     auto_scan / manual_start / site_test, controller thread,
                     command queue, autostart (schtasks), conflict + uninstall
   app.h             shared ui_state_t g_ui (guarded by g_lock), commands, prototypes
-  ui.c              hand-drawn dark window (GDI+ flat API + GDI text), tray icon,
-                    menus, site-test box; never blocks on the controller
+  ui.c              400x520 dark window, pages Durum / Ayrıntılar / Ayarlar
+                    (docs/design/), GDI+ flat API + GDI text; clickable items
+                    are owner-drawn native BUTTONs (Tab/Space/Enter, screen
+                    readers); palette_t colours; tray icon, --ui-preview;
+                    never blocks on the controller
   smart.c           per-network learning: network id = gateway MAC, stats per
                     preset (trials, ok, avg ms) in [net_<id>] of the ini
   probe.c/.h        WinHTTP HTTPS probes (TCP+TLS set-up time via status
@@ -65,7 +73,12 @@ tests/              unit tests (no admin): exclude_test.c, dns_test.c,
                     stand-in DLL, never the driver); probe_test.c is a manual
                     network/latency/diagnosis check
 third_party/WinDivert/include/windivert.h   header only; DLL/SYS are not in git
-tools/make_icons.py generates src/app/res/*.ico and assets/logo.png (Pillow)
+tools/make_icons.py generates src/app/res/*.ico and assets/logo.png (Pillow):
+                    flat shield; tray shields coloured by state (ok, busy,
+                    idle, warn "!", error "x"); uncompressed BMP frames <=128 px
+tools/ui_shots.ps1  --ui-preview screenshots (scenario x page x scale) ->
+                    docs/design/screenshots/ (tools/bmp_to_png.py converts)
+docs/design/        UI audit, design system, screens, preview plan
 .github/workflows/build.yml   CI: tests on windows-latest, build x64/x86 on
                     Ubuntu MinGW, package zips, GitHub Release on v* tags
 ```
