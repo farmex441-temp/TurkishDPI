@@ -44,7 +44,13 @@ jobs:
 
       - name: Download WinDivert
         run: |
-          curl -sSL -o windivert.zip "$WINDIVERT_URL"
+          # GitHub's release CDN occasionally cuts a download short: retry until
+          # the pinned checksum matches (never use an unverified archive).
+          for i in 1 2 3 4 5; do
+            curl -fsSL --retry 3 --retry-all-errors --max-time 120 -o windivert.zip "$WINDIVERT_URL" &&
+              echo "$WINDIVERT_SHA256  windivert.zip" | sha256sum -c && break
+            echo "attempt $i failed, retrying"; rm -f windivert.zip; sleep 10
+          done
           echo "$WINDIVERT_SHA256  windivert.zip" | sha256sum -c
           unzip -q windivert.zip
 
