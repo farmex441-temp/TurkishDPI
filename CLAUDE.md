@@ -173,7 +173,9 @@ SHA-256 in the workflow.
     the logon task always runs the protected copy in
     `%ProgramFiles%\TurkishDPI` (`sys_install_copy`, refreshed when started
     from elsewhere, `autostart_migrate`); a failed copy means no task, never a
-    task pointing at the extraction folder;
+    task pointing at the extraction folder. The exe is copied from
+    `g_self_exe` (the running image's file, opened at start without delete
+    sharing), never re-opened by name; WinDivert.dll only if its hash matches;
   - WinDivert.dll only from the exe's own folder, and only if its SHA-256
     matches the one pinned at build time (`WINDIVERT_DLL_SHA256`, Makefile,
     from the checksum-pinned archive; CI sets `REQUIRE_WINDIVERT_HASH=1`);
