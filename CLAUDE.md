@@ -69,7 +69,7 @@ src/engine/         GoodbyeDPI engine (upstream code + TurkishDPI changes)
   windivert_dyn.c   loads WinDivert.dll at runtime from the exe's folder only
   fakepackets.c, ttltrack.c, blackwhitelist.c, service.c, utils/   upstream
 tests/              unit tests (no admin): exclude_test.c, dns_test.c,
-                    diag_test.c, windivert_hash_test.c (DLL pinning, uses a
+                    diag_test.c, windivert_hash_test.c (DLL + driver pinning, uses a
                     stand-in DLL, never the driver); probe_test.c is a manual
                     network/latency/diagnosis check
 third_party/WinDivert/include/windivert.h   header only; DLL/SYS are not in git
@@ -188,12 +188,17 @@ SHA-256 in the workflow.
     from elsewhere, `autostart_migrate`); a failed copy means no task, never a
     task pointing at the extraction folder. The exe is copied from
     `g_self_exe` (the running image's file, opened at start without delete
-    sharing), never re-opened by name; WinDivert.dll only if its hash matches;
-  - WinDivert.dll only from the exe's own folder, and only if its SHA-256
-    matches the one pinned at build time (`WINDIVERT_DLL_SHA256`, Makefile,
-    from the checksum-pinned archive; CI sets `REQUIRE_WINDIVERT_HASH=1`);
-    checked on a handle that denies writes until the DLL is mapped; error
-    1006 otherwise;
+    sharing), never re-opened by name; WinDivert files only if their hashes match;
+  - WinDivert.dll **and the drivers** (`WinDivert64.sys`, `WinDivert32.sys`)
+    only from the exe's own folder, and only if their SHA-256 match the ones
+    pinned at build time (`WINDIVERT_DLL_SHA256`, `WINDIVERT_SYS64_SHA256`,
+    `WINDIVERT_SYS32_SHA256`; Makefile computes them from the checksum-pinned
+    archive; CI sets `REQUIRE_WINDIVERT_HASH=1`). Checked on handles that deny
+    writes/deletes: the DLL's until it is mapped, the drivers' for the whole
+    engine process (WinDivert.dll installs whatever .sys sits next to it as a
+    kernel driver - an unpinned driver would allow loading any signed,
+    possibly vulnerable driver). Error 1006 otherwise. `windivert_file_ok()`
+    guards the Program Files copy the same way;
   - no static imports of non-KnownDLLs (winhttp, iphlpapi, dnsapi, bcrypt):
     `sysdll.c` / `LoadLibraryExW(..., LOAD_LIBRARY_SEARCH_SYSTEM32)`; CI's
     "Check imports" step fails the build otherwise; `schtasks.exe`/`notepad.exe`
