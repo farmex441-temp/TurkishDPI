@@ -45,8 +45,12 @@ src/app/            the app (controller, UI, probes, learning)
   ui.c              400x520 dark window, pages Durum / Ayrıntılar / Ayarlar
                     (docs/design/), GDI+ flat API + GDI text; clickable items
                     are owner-drawn native BUTTONs (Tab/Space/Enter, screen
-                    readers); palette_t colours; tray icon, --ui-preview;
-                    never blocks on the controller
+                    readers); painted text is mirrored into invisible STATIC
+                    controls (`g_a11y`, empty window region, `a11y_update`) so
+                    Narrator/NVDA read status, details and site results;
+                    palette_t colours; tray icon (NIM_ADD retried on a timer
+                    while Explorer is not ready), --ui-preview; never blocks on
+                    the controller
   smart.c           per-network learning: network id = gateway MAC, stats per
                     preset (trials, ok, avg ms) in [net_<id>] of the ini
   probe.c/.h        WinHTTP HTTPS probes (TCP+TLS set-up time via status
@@ -55,7 +59,8 @@ src/app/            the app (controller, UI, probes, learning)
   diag.c/.h         site diagnosis verdict (ok / no_dns / dns_poison /
                     tls_block / ip_block); pure C, no Win32, unit tested
   sysdll.c/.h       winhttp.dll + iphlpapi.dll resolved at run time from
-                    System32 (not linked), SetDefaultDllDirectories
+                    System32 (not linked), SetDefaultDllDirectories;
+                    `sysdll_winhttp_tls` turns on TLS 1.2 on Windows 7/8.0
   system.c/.h       rival tools, broken system proxy repair, GitHub update check,
                     admin-only data folder (sys_secure_dir), protected
                     Program Files copy for autostart (sys_install_copy), uninstall
@@ -66,18 +71,27 @@ src/engine/         GoodbyeDPI engine (upstream code + TurkishDPI changes)
   goodbyedpi.c      option parsing (gdpi_main), WinDivert filters, packet loop
   dnsredir.c/.h     DNS redirection conntrack + TurkishDPI hybrid DNS race
   exclude.c/.h      payment/bank "never touch" list (SNI + IPs learned from DNS)
-  windivert_dyn.c   loads WinDivert.dll at runtime from the exe's folder only
+  windivert_dyn.c   loads WinDivert.dll at runtime from the exe's folder only;
+                    ARM64 Windows is refused with error 50 (no WinDivert driver)
+  syslib.h          load_system_dll / load_dll_path: System32-only loading
+                    that also works on Windows 7 without KB2533623
   fakepackets.c, ttltrack.c, blackwhitelist.c, service.c, utils/   upstream
 tests/              unit tests (no admin): exclude_test.c, dns_test.c,
                     diag_test.c, windivert_hash_test.c (DLL + driver pinning, uses a
-                    stand-in DLL, never the driver); probe_test.c is a manual
-                    network/latency/diagnosis check
+                    stand-in DLL, never the driver); manual tools:
+                    probe_test.c (network/latency/diagnosis), hosts_test.c
+                    (DNS answer + TCP+TLS per host, e.g. Discord endpoints),
+                    uia_probe.c (native UI Automation dump/invoke/tray rect -
+                    what a screen reader sees)
 third_party/WinDivert/include/windivert.h   header only; DLL/SYS are not in git
 tools/make_icons.py generates src/app/res/*.ico and assets/logo.png (Pillow):
                     flat shield; tray shields coloured by state (ok, busy,
                     idle, warn "!", error "x"); uncompressed BMP frames <=128 px
 tools/ui_shots.ps1  --ui-preview screenshots (scenario x page x scale) ->
                     docs/design/screenshots/ (tools/bmp_to_png.py converts)
+tools/uia_e2e.ps1   elevated end-to-end check of the real app: --selftest,
+                    UIA tree per page, autostart toggle on/off + task check,
+                    tray icon, exit through the window (needs uia_probe.exe)
 docs/design/        UI audit, design system, screens, preview plan
 .github/workflows/build.yml   CI: tests on windows-latest, build x64/x86 on
                     Ubuntu MinGW, package zips, GitHub Release on v* tags
@@ -213,8 +227,10 @@ SHA-256 in the workflow.
     quarantined 1920;
   - no static imports of non-KnownDLLs (winhttp, iphlpapi, dnsapi, bcrypt,
     gdiplus - the last is not a KnownDLL on Windows 7/8): `sysdll.c`,
-    `gdiplus_load()` in ui.c, `LoadLibraryExW(..., LOAD_LIBRARY_SEARCH_SYSTEM32)`;
-    CI's "Check imports" step fails the build otherwise;
+    `gdiplus_load()` in ui.c, `load_system_dll()` from syslib.h (never a bare
+    `LoadLibraryExW(..., LOAD_LIBRARY_SEARCH_SYSTEM32)`: unpatched Windows 7
+    rejects the flag with error 87); CI's "Check imports" step fails the
+    build otherwise;
   - never `ShellExecute` from the elevated process (it resolves file types via
     the user-writable HKCU\Software\Classes): `launch()` = `CreateProcessW`
     with an absolute path (`explorer.exe` for URLs so the browser is not
@@ -224,9 +240,12 @@ SHA-256 in the workflow.
   - window messages: only `TaskbarCreated` and `WM_TRAY` pass UIPI; `WM_TRAY`
     is acted on only when the cursor is on our icon (`tray_click_genuine`) and
     never re-entered while a menu is open; never allow `WM_COMMAND`;
-  - logon task XML: `<UserId>` is the token user's SID (not environment
-    variables); the XML file is held open deny-write until schtasks has read
-    it, then deleted through the handle;
+  - logon task XML: `<UserId>` is DOMAIN\user resolved from the token user's
+    SID (`LookupAccountSidW`, not environment variables); the XML is written
+    to the admin-only data folder and **closed before schtasks runs** -
+    schtasks opens it without FILE_SHARE_WRITE, so any handle of ours with
+    write access makes /Create fail with exit code 1 (the v1.2.0 bug); the
+    file is deleted right after;
   - DNS learning for payment exclusion trusts only answers that match a
     tracked query (txid, port, the server it went to) or come from the clean
     resolver (`dns_trusted`); malformed answers count as forged.
@@ -243,7 +262,12 @@ SHA-256 in the workflow.
   `ip.SrcAddr == X and udp.SrcPort == P` clause (`add_dns_answer_filter`); a
   plain port rule would catch mDNS (5353) or QUIC (443).
 - Known limits (be honest in docs/UI): IP-level blocks cannot be bypassed by
-  DPI tricks; Discord voice (UDP) and Discord's desktop updater are not handled;
+  DPI tricks; no Windows service mode (logon task instead - a service would
+  need an IPC channel between session 0 and the UI, new attack surface);
+  Windows only (WinDivert), no ARM64 (no WinDivert ARM64 driver). Discord was
+  measured on 2026-11-08: web, gateway, CDN and updater (updates.discord.com)
+  are DNS/SNI-blocked and open with the engine; voice (*.discord.media, UDP)
+  is not blocked in Turkey and connects;
   WinDivert's signed driver itself gets generic "WinDivert" detections on
   VirusTotal (see Status), same as GoodbyeDPI/zapret. Payment protection
   relies on the SNI in the first TLS segment or addresses seen in plain DNS
@@ -267,6 +291,13 @@ SHA-256 in the workflow.
   self-exe lock check, no ShellExecute, private-namespace mutex, WM_TRAY
   guard, trusted-only DNS learning, gdiplus from System32, SID task user,
   persist-credentials: false in CI).
+- v1.2.1: "start with Windows" fixed (the XML was still open for writing
+  while schtasks read it -> exit code 1 on every toggle); screen-reader text
+  for the painted pages and a name for the site box (checked with native UIA
+  via tests/uia_probe.c); tray icon retried until Explorer accepts it;
+  Windows 7 without KB2533623 (syslib.h) and TLS 1.2 for WinHTTP on 7/8.0;
+  clear ARM64 message. Verified elevated with tools/uia_e2e.ps1: selftest
+  PASS, task created/removed, tray icon on the taskbar, clean exit.
 - After rc2 (on main, not yet tagged): second bug-hunting round - app layer
   (17 findings: folder-security race, laptop autostart, tray icon after
   Explorer restart, manual mode overridden by site test, watchdog balloon

@@ -21,6 +21,9 @@
 /* Restricts the process DLL search path to System32, then loads the libraries.
  * Returns 1 when every function was found. Safe to call more than once. */
 int sysdll_init(void);
+/* Windows 7/8.0: WinHTTP offers only TLS 1.0 by default, which today's sites
+ * refuse; turn on TLS 1.2 for this session. No-op on Windows 8.1 and later. */
+void sysdll_winhttp_tls(void *session);
 
 typedef HINTERNET (WINAPI *sd_WinHttpOpen_t)(LPCWSTR, DWORD, LPCWSTR, LPCWSTR, DWORD);
 typedef BOOL (WINAPI *sd_WinHttpCloseHandle_t)(HINTERNET);

@@ -21,6 +21,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <wchar.h>
+#include "syslib.h"
 #include "app.h"
 #include "presets.h"
 #include "version.h"
@@ -106,7 +107,7 @@ static GdipDeletePath_t p_GdipDeletePath;
 #define GdipDeletePath p_GdipDeletePath
 
 static int gdiplus_load(void) {
-    HMODULE h = LoadLibraryExW(L"gdiplus.dll", NULL, LOAD_LIBRARY_SEARCH_SYSTEM32);
+    HMODULE h = load_system_dll(L"gdiplus.dll");
     if (!h) return 0;
     p_GdiplusStartup = (GdiplusStartup_t)(void *)GetProcAddress(h, "GdiplusStartup");
     p_GdipCreateFromHDC = (GdipCreateFromHDC_t)(void *)GetProcAddress(h, "GdipCreateFromHDC");
@@ -246,6 +247,34 @@ static RECT ctl_rect(const ctl_t *c) {
     return r;
 }
 
+/*
+ * Screen-reader text. The pages are painted with GDI, so the status, the
+ * details rows and the site-check result would be invisible to Narrator/NVDA.
+ * Each block gets a STATIC child with the same text, placed over the painted
+ * area and in reading order. Its window region is empty: it paints nothing
+ * and takes no clicks (WS_CLIPCHILDREN keeps the parent's drawing), but its
+ * bounds are on screen, so screen readers read it in place.
+ */
+enum { A_STATUS, A_DETAILS, A_TARGETS, A_SITE_LABEL, A_SITE_RESULT, A_SETTINGS, A_COUNT };
+static HWND g_a11y[A_COUNT];
+static WNDPROC g_static_proc;
+
+/* Never draws (also not into PrintWindow), never takes the mouse. */
+static LRESULT CALLBACK a11y_proc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
+    switch (msg) {
+    case WM_PAINT: {
+        PAINTSTRUCT ps;
+        BeginPaint(h, &ps);
+        EndPaint(h, &ps);
+        return 0;
+    }
+    case WM_ERASEBKGND: return 1;
+    case WM_PRINT: case WM_PRINTCLIENT: return 0;
+    case WM_NCHITTEST: return HTTRANSPARENT;
+    }
+    return CallWindowProcW(g_static_proc, h, msg, wp, lp);
+}
+
 /* ---------- state helpers ---------- */
 static void snapshot(ui_state_t *st) {
     EnterCriticalSection(&g_lock);
@@ -344,7 +373,7 @@ static int action_for(const ui_state_t *st) {
         if (st->driver_err == 2 || st->driver_err == 126 || st->driver_err == 1275 ||
             st->driver_err == 1920) return A_FIX;
         if (st->driver_err == 193 || st->driver_err == 1006) return A_DOWNLOAD;
-        if (st->driver_err == 654) return A_NONE;
+        if (st->driver_err == 654 || st->driver_err == 50) return A_NONE;
         return A_RETRY;
     default:         return A_NONE;
     }
@@ -625,6 +654,123 @@ static void fonts_create(void) {
 }
 
 /* ---------- layout ---------- */
+static RECT a11y_rect(int i, int sy) {
+    switch (i) {
+    case A_STATUS:      return rc(24, 258, 352, 166);
+    case A_DETAILS:     return rc(24, 62, 256, 120);
+    case A_TARGETS:     return rc(24, 192, 224, sy - 6 - 192 > 20 ? sy - 6 - 192 : 20);
+    case A_SITE_LABEL:  return rc(24, sy, 256, 20);
+    case A_SITE_RESULT: return rc(24, sy + 62, 352, 52);
+    default:            return rc(24, 334, 352, 104);
+    }
+}
+
+static int a11y_page(int i) {
+    return i == A_STATUS ? PG_STATUS : i == A_SETTINGS ? PG_SETTINGS : PG_DETAILS;
+}
+
+static void a11y_set(int i, const wchar_t *text) {
+    wchar_t cur[600];
+    if (!g_a11y[i]) return;
+    GetWindowTextW(g_a11y[i], cur, 600);
+    if (wcscmp(cur, text)) SetWindowTextW(g_a11y[i], text);   /* raises a name-change event */
+    ShowWindow(g_a11y[i], a11y_page(i) == g_page ? SW_SHOWNA : SW_HIDE);
+}
+
+/* The same words the paint_* functions draw, as sentences. */
+static void a11y_update(const ui_state_t *st) {
+    wchar_t b[600], line[200];
+    size_t n;
+    const wchar_t *sub = kind_sub(st);
+
+    /* status page */
+    _snwprintf(b, 599, L"Durum: %ls.%ls%ls", kind_headline(st), sub[0] ? L" " : L"", sub);
+    b[599] = 0;
+    if (st->kind == ST_ACTIVE || st->kind == ST_STANDBY || st->kind == ST_PARTIAL ||
+        st->kind == ST_SCANNING || st->kind == ST_STARTING) {
+        n = wcslen(b);
+        _snwprintf(b + n, 599 - n, L" Ağ: %ls.", st->network[0] ? st->network : L"bilinmiyor");
+        b[599] = 0;
+        n = wcslen(b);
+        if (st->kind == ST_SCANNING || st->kind == ST_STARTING) {
+            if (st->scan_total > 0 && st->scan_pos > 0)
+                _snwprintf(b + n, 599 - n, L" İlerleme: %d / %d.",
+                           st->scan_pos > st->scan_total ? st->scan_total : st->scan_pos, st->scan_total);
+            else
+                _snwprintf(b + n, 599 - n, L" İlerleme: hazırlanıyor.");
+        } else if (st->kind == ST_PARTIAL) {
+            _snwprintf(b + n, 599 - n, L" Açılan siteler: %d / %d.", ok_count(st), st->ntargets);
+        } else if (st->avg_ms > 0) {
+            _snwprintf(b + n, 599 - n, L" Hız: %d ms, %ls.", st->avg_ms, speed_word(st->avg_ms));
+        }
+        b[599] = 0;
+    }
+    a11y_set(A_STATUS, b);
+
+    /* details: rows */
+    if (st->preset >= 0 && st->preset < PRESET_COUNT)
+        _snwprintf(b, 599, L"Yöntem: %ls.", PRESETS[st->preset].name);
+    else
+        wcscpy(b, L"Yöntem: yok.");
+    b[599] = 0;
+    n = wcslen(b);
+    if (st->preset >= 0 && st->reason[0])
+        _snwprintf(b + n, 599 - n, L" Mod: %ls, %ls.", g_auto ? L"otomatik" : L"elle", st->reason);
+    else
+        _snwprintf(b + n, 599 - n, L" Mod: %ls.", g_auto ? L"otomatik" : L"elle seçildi");
+    b[599] = 0;
+    n = wcslen(b);
+    if (st->preset >= 0 && st->dns >= 0 && st->dns < DNS_SERVER_COUNT) {
+        wchar_t ip[32];
+        MultiByteToWideChar(CP_ACP, 0, DNS_SERVERS[st->dns].v4, -1, ip, 32);
+        ip[31] = 0;
+        if (st->dns_ms > 0)
+            _snwprintf(b + n, 599 - n, L" DNS: %ls%ls, %d ms.", st->hybrid ? L"hibrit, " : L"", ip, st->dns_ms);
+        else
+            _snwprintf(b + n, 599 - n, L" DNS: %ls%ls.", st->hybrid ? L"hibrit, " : L"", ip);
+    } else {
+        _snwprintf(b + n, 599 - n, L" DNS: yok.");
+    }
+    b[599] = 0;
+    n = wcslen(b);
+    if (st->avg_ms > 0)
+        _snwprintf(b + n, 599 - n, L" Bağlantı: %d ms, TCP ve TLS ortalaması.", st->avg_ms);
+    b[599] = 0;
+    n = wcslen(b);
+    _snwprintf(b + n, 599 - n, L" Öğrenilen: %d / %d yöntem bu ağda denendi.", st->learned, PRESET_COUNT);
+    b[599] = 0;
+    a11y_set(A_DETAILS, b);
+
+    /* details: test sites */
+    wcscpy(b, L"Test siteleri:");
+    for (int i = 0; i < st->ntargets && i < PROBE_MAX_HOSTS; i++) {
+        int ok = st->target_ok[i];
+        if (ok < 0) _snwprintf(line, 199, L" %ls, denenmedi;", st->target[i]);
+        else if (ok) _snwprintf(line, 199, L" %ls, açık, %d ms;", st->target[i], st->target_ms[i]);
+        else _snwprintf(line, 199, L" %ls, engelli;", st->target[i]);
+        line[199] = 0;
+        if (wcslen(b) + wcslen(line) < 599) wcscat(b, line);
+    }
+    if (!st->ntargets) wcscat(b, L" yok.");
+    a11y_set(A_TARGETS, b);
+
+    a11y_set(A_SITE_LABEL, L"Site kontrolü, site adresi");
+    _snwprintf(b, 599, L"%ls", st->site_result[0] ? st->site_result
+               : L"Açılmayan bir siteyi yazın; TurkishDPI uygun yöntemi arar.");
+    b[599] = 0;
+    if (st->st_packets) {
+        n = wcslen(b);
+        _snwprintf(b + n, 599 - n, L" İstatistik: %lu paket, %lu HTTPS, %lu HTTP, %lu DNS, %lu ödeme atlandı.",
+                   st->st_packets, st->st_https, st->st_http, st->st_dns, st->st_excluded);
+        b[599] = 0;
+    }
+    a11y_set(A_SITE_RESULT, b);
+
+    a11y_set(A_SETTINGS, L"TurkishDPI " TURKISHDPI_VERSION_W L", Apache-2.0, GoodbyeDPI tabanlı. "
+             L"Kaldırma: TurkishDPI durdurulur; başlangıç görevi, ayarlar, öğrenilen bilgiler, günlük ve "
+             L"sürücü bu bilgisayardan silinir.");
+}
+
 static void layout(void) {
     int sy = details_site_y(g_layout_n);
     ctl(ID_TEST)->y = sy + 24;
@@ -632,6 +778,10 @@ static void layout(void) {
         RECT r = ctl_rect(&g_ctl[i]);
         if (g_ctl[i].hwnd)
             MoveWindow(g_ctl[i].hwnd, r.left, r.top, r.right - r.left, r.bottom - r.top, FALSE);
+    }
+    for (int i = 0; i < A_COUNT; i++) {
+        RECT r = a11y_rect(i, sy);
+        if (g_a11y[i]) MoveWindow(g_a11y[i], r.left, r.top, r.right - r.left, r.bottom - r.top, FALSE);
     }
     if (g_edit) {
         RECT r = rc(36, sy + 24, 236, 32);
@@ -712,6 +862,7 @@ static void update_controls(void) {
         ShowWindow(c->hwnd, show ? SW_SHOWNA : SW_HIDE);
     }
     ShowWindow(g_edit, g_page == PG_DETAILS ? SW_SHOWNA : SW_HIDE);
+    a11y_update(&st);
     if (!focus && GetForegroundWindow() == g_wnd) SetFocus(ctl(ID_TAB0 + g_page)->hwnd);
     RedrawWindow(g_wnd, NULL, NULL, RDW_INVALIDATE | RDW_ALLCHILDREN);
 }
@@ -1141,6 +1292,12 @@ static int tray_click_genuine(void) {
     return PtInRect(&r, pt);
 }
 
+/* NIM_ADD fails while Explorer is still starting (logon task) or busy; the
+ * TaskbarCreated broadcast may already be over by then, so retry on a timer
+ * (TIMER_TRAY, every 2 s for up to 2 minutes) instead of staying iconless. */
+#define TIMER_TRAY 2
+static int g_tray_tries;
+
 static void tray_add(void) {
     ZeroMemory(&g_nid, sizeof(g_nid));
     g_nid.cbSize = sizeof(g_nid);
@@ -1150,7 +1307,16 @@ static void tray_add(void) {
     g_nid.uCallbackMessage = WM_TRAY;
     g_nid.hIcon = g_tray_icons[2];
     wcscpy(g_nid.szTip, L"TurkishDPI");
-    Shell_NotifyIconW(NIM_ADD, &g_nid);
+    if (!Shell_NotifyIconW(NIM_ADD, &g_nid)) {
+        /* already there (e.g. a second TaskbarCreated): update it instead */
+        if (!Shell_NotifyIconW(NIM_MODIFY, &g_nid)) {
+            if (g_tray_tries++ < 60) SetTimer(g_wnd, TIMER_TRAY, 2000, NULL);
+            else KillTimer(g_wnd, TIMER_TRAY);
+            return;
+        }
+    }
+    KillTimer(g_wnd, TIMER_TRAY);
+    g_tray_tries = 0;
     g_nid.uVersion = NOTIFYICON_VERSION;
     Shell_NotifyIconW(NIM_SETVERSION, &g_nid);
 }
@@ -1159,7 +1325,7 @@ static void tray_add(void) {
 static void dark_menus(void) {
     /* Undocumented but stable since Win10 1903: uxtheme #135 SetPreferredAppMode. */
     typedef int (WINAPI *set_mode_fn)(int);
-    HMODULE ux = LoadLibraryExW(L"uxtheme.dll", NULL, LOAD_LIBRARY_SEARCH_SYSTEM32);
+    HMODULE ux = load_system_dll(L"uxtheme.dll");
     if (ux) {
         set_mode_fn f = (set_mode_fn)(void *)GetProcAddress(ux, MAKEINTRESOURCEA(135));
         if (f) f(2);
@@ -1414,7 +1580,7 @@ static void fit_window(void) {
 
 static void dark_titlebar(HWND h) {
     typedef HRESULT (WINAPI *dwm_fn)(HWND, DWORD, LPCVOID, DWORD);
-    HMODULE m = LoadLibraryExW(L"dwmapi.dll", NULL, LOAD_LIBRARY_SEARCH_SYSTEM32);
+    HMODULE m = load_system_dll(L"dwmapi.dll");
     if (m) {
         dwm_fn f = (dwm_fn)(void *)GetProcAddress(m, "DwmSetWindowAttribute");
         BOOL on = TRUE;
@@ -1443,10 +1609,28 @@ static void create_controls(HWND h) {
     g_edit_proc = (WNDPROC)SetWindowLongPtrW(g_edit, GWLP_WNDPROC, (LONG_PTR)edit_proc);
     /* tab order follows creation order; the edit belongs before "Kontrol et" */
     SetWindowPos(g_edit, ctl(ID_RESCAN)->hwnd, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+
+    /* screen-reader text, inserted into the reading (z-) order after the
+     * control that precedes it on screen; the label right before the edit
+     * also becomes the edit's accessible name */
+    {
+        static const int after[A_COUNT] = { ID_POWER, ID_TAB2, ID_RESCAN, 0, ID_TEST, ID_L_GH };
+        for (int i = 0; i < A_COUNT; i++) {
+            g_a11y[i] = CreateWindowExW(0, L"STATIC", L"", WS_CHILD | SS_LEFT | SS_NOPREFIX,
+                                        0, 0, 10, 10, h, NULL, g_inst, NULL);
+            SetWindowRgn(g_a11y[i], CreateRectRgn(0, 0, 0, 0), FALSE);
+            g_static_proc = (WNDPROC)SetWindowLongPtrW(g_a11y[i], GWLP_WNDPROC, (LONG_PTR)a11y_proc);
+        }
+        for (int i = 0; i < A_COUNT; i++) {
+            HWND prev = i == A_SITE_LABEL ? g_a11y[A_TARGETS] : ctl(after[i])->hwnd;
+            SetWindowPos(g_a11y[i], prev, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+        }
+        SetWindowPos(g_edit, g_a11y[A_SITE_LABEL], 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+    }
 }
 
 static LRESULT CALLBACK wndproc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
-    if (msg == g_taskbar_created && msg) { tray_add(); tray_update(); return 0; }
+    if (msg == g_taskbar_created && msg) { g_tray_tries = 0; tray_add(); tray_update(); return 0; }
     switch (msg) {
     case WM_CREATE:
         g_wnd = h;
@@ -1530,6 +1714,7 @@ static LRESULT CALLBACK wndproc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
         spinner_update();
         return 0;
     case WM_TIMER:
+        if (wp == TIMER_TRAY) { tray_add(); tray_update(); return 0; }
         g_anim = (g_anim + 9) % 360;
         InvalidateRect(ctl(ID_POWER)->hwnd, NULL, FALSE);
         return 0;

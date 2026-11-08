@@ -4,6 +4,7 @@
  */
 #define WIN32_LEAN_AND_MEAN
 #define SYSDLL_NO_REDIRECT
+#include "syslib.h"
 #include "sysdll.h"
 
 #ifndef LOAD_LIBRARY_SEARCH_SYSTEM32
@@ -43,8 +44,8 @@ static BOOL CALLBACK load_all(PINIT_ONCE o, PVOID p, PVOID *c) {
     if (set_dirs)
         set_dirs(LOAD_LIBRARY_SEARCH_SYSTEM32);
 
-    http = LoadLibraryExW(L"winhttp.dll", NULL, LOAD_LIBRARY_SEARCH_SYSTEM32);
-    iph = LoadLibraryExW(L"iphlpapi.dll", NULL, LOAD_LIBRARY_SEARCH_SYSTEM32);
+    http = load_system_dll(L"winhttp.dll");
+    iph = load_system_dll(L"iphlpapi.dll");
     if (!http || !iph)
         return TRUE;
 #define SD(mod, name) sd_##name = (sd_##name##_t)(void *)GetProcAddress(mod, #name)
@@ -70,6 +71,23 @@ static BOOL CALLBACK load_all(PINIT_ONCE o, PVOID p, PVOID *c) {
            sd_WinHttpSetTimeouts && sd_NotifyAddrChange && sd_GetBestRoute2 &&
            sd_ResolveIpNetEntry2 && sd_GetIfEntry2;
     return TRUE;
+}
+
+void sysdll_winhttp_tls(void *session) {
+    OSVERSIONINFOEXW v;
+    DWORDLONG mask = 0;
+    DWORD p;
+    if (!session || !sd_WinHttpSetOption) return;
+    ZeroMemory(&v, sizeof(v));
+    v.dwOSVersionInfoSize = sizeof(v);
+    v.dwMajorVersion = 6;
+    v.dwMinorVersion = 3;   /* 8.1 (the manifest lists it, so the answer is not shimmed) */
+    mask = VerSetConditionMask(mask, VER_MAJORVERSION, VER_GREATER_EQUAL);
+    mask = VerSetConditionMask(mask, VER_MINORVERSION, VER_GREATER_EQUAL);
+    if (VerifyVersionInfoW(&v, VER_MAJORVERSION | VER_MINORVERSION, mask)) return;
+    /* WINHTTP_FLAG_SECURE_PROTOCOL_TLS1_1 | _TLS1_2; needs KB3140245 on Windows 7 */
+    p = 0x00000200 | 0x00000800;
+    sd_WinHttpSetOption((HINTERNET)session, 84 /* WINHTTP_OPTION_SECURE_PROTOCOLS */, &p, sizeof(p));
 }
 
 int sysdll_init(void) {
