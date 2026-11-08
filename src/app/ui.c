@@ -214,7 +214,9 @@ static const wchar_t *kind_headline(const ui_state_t *st) {
     case ST_STANDBY:  return L"Engel yok";
     case ST_PAUSED:   return L"Duraklatıldı";
     case ST_OFFLINE:  return L"İnternet yok";
-    default:          return driver_problem(st) ? L"Sürücü başlatılamadı" : L"Çalışamıyor";
+    default:
+        if (st->driver_err == 193 || st->driver_err == 1006) return L"Dosyalar uygun değil";
+        return driver_problem(st) ? L"Sürücü başlatılamadı" : L"Çalışamıyor";
     }
 }
 
@@ -229,8 +231,16 @@ static const wchar_t *kind_sub(const ui_state_t *st) {
     case ST_STANDBY:  return L"Gerekirse kendiliğinden devreye girer.";
     case ST_PAUSED:   return L"Koruma kapalı.";
     case ST_OFFLINE:  return L"Bağlantı gelince kendiliğinden başlar.";
-    default:          /* driver errors: the controller's actionable text */
-        return driver_problem(st) ? st->detail : st->status;
+    default: {        /* errors: the controller's actionable text */
+        static wchar_t msg[300];   /* UI thread only */
+        if (driver_problem(st)) return st->detail;
+        if (st->detail[0] && wcscmp(st->detail, st->status) != 0) {
+            _snwprintf(msg, 299, L"%ls. %ls", st->status, st->detail);
+            msg[299] = 0;
+            return msg;
+        }
+        return st->status;
+    }
     }
 }
 
@@ -238,7 +248,7 @@ static const wchar_t *speed_word(int ms) {
     return ms < 250 ? L"iyi" : ms < 600 ? L"orta" : L"yavaş";
 }
 
-enum { A_NONE, A_SITE, A_RETRY, A_FIX, A_RESUME };
+enum { A_NONE, A_SITE, A_RETRY, A_FIX, A_RESUME, A_DOWNLOAD };
 
 static int action_for(const ui_state_t *st) {
     switch (st->kind) {
@@ -247,7 +257,13 @@ static int action_for(const ui_state_t *st) {
     case ST_PARTIAL: return A_RETRY;
     case ST_PAUSED:  return A_RESUME;
     case ST_ERROR:
-        if (st->driver_err == 2 || st->driver_err == 126 || st->driver_err == 1275) return A_FIX;
+        /* missing / blocked files: antivirus help; wrong or altered files:
+         * the download page; another WinDivert loaded: needs a reboot, a
+         * retry cannot help */
+        if (st->driver_err == 2 || st->driver_err == 126 || st->driver_err == 1275 ||
+            st->driver_err == 1920) return A_FIX;
+        if (st->driver_err == 193 || st->driver_err == 1006) return A_DOWNLOAD;
+        if (st->driver_err == 654) return A_NONE;
         return A_RETRY;
     default:         return A_NONE;
     }
@@ -259,6 +275,7 @@ static const wchar_t *action_label(int a) {
     case A_RETRY:  return L"Yeniden dene";
     case A_FIX:    return L"Nasıl düzeltilir?";
     case A_RESUME: return L"Korumayı aç";
+    case A_DOWNLOAD: return L"İndirme sayfası";
     default:       return L"";
     }
 }
@@ -624,7 +641,7 @@ static void spinner_update(void) {
     int want;
     snapshot(&st);
     SystemParametersInfoW(SPI_GETCLIENTAREAANIMATION, 0, &anim, 0);
-    want = anim && !g_preview_shot && IsWindowVisible(g_wnd) && g_page == PG_STATUS &&
+    want = anim && !g_preview_shot && IsWindowVisible(g_wnd) && !IsIconic(g_wnd) && g_page == PG_STATUS &&
            (st.kind == ST_SCANNING || st.kind == ST_STARTING);
     if (want && !g_spinning) SetTimer(g_wnd, 1, 50, NULL);
     if (!want && g_spinning) KillTimer(g_wnd, 1);
@@ -657,7 +674,7 @@ static void paint_status(HDC dc, const ui_state_t *st) {
     text(dc, f_display, P->text, rc(24, 258, 352, 34), kind_headline(st),
          DT_CENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
     /* errors carry an instruction: allow three lines and drop the card */
-    text_balanced(dc, f_body, P->text2, rc(40, 294, 320, err ? 60 : 40), sub);
+    text_balanced(dc, f_body, P->text2, rc(40, 294, 320, err ? 84 : 40), sub);
 
     if (st->kind == ST_ACTIVE || st->kind == ST_STANDBY || st->kind == ST_PARTIAL ||
         st->kind == ST_SCANNING || st->kind == ST_STARTING) {
@@ -709,7 +726,13 @@ static void paint_details(HDC dc, const ui_state_t *st) {
         info_row(dc, 62, L"Yöntem", PRESETS[st->preset].name, P->text, 164);
     else
         info_row(dc, 62, L"Yöntem", L"—", P->text2, 164);
-    info_row(dc, 86, L"Mod", g_auto ? L"Otomatik" : L"Elle seçildi", P->text, 260);
+    if (st->preset >= 0 && st->reason[0]) {
+        _snwprintf(buf, 199, L"%ls · %ls", g_auto ? L"Otomatik" : L"Elle", st->reason);
+        buf[199] = 0;
+        info_row(dc, 86, L"Mod", buf, P->text, 260);
+    } else {
+        info_row(dc, 86, L"Mod", g_auto ? L"Otomatik" : L"Elle seçildi", P->text, 260);
+    }
     if (st->preset >= 0 && st->dns >= 0 && st->dns < DNS_SERVER_COUNT) {
         wchar_t ip[32];
         MultiByteToWideChar(CP_ACP, 0, DNS_SERVERS[st->dns].v4, -1, ip, 32);
@@ -1162,6 +1185,7 @@ static void do_click(int id) {
         case A_RETRY:  post_cmd(CMD_RESCAN, 0); break;
         case A_FIX:    command(IDM_AVHELP); break;
         case A_RESUME: post_cmd(CMD_TOGGLE_PAUSE, 0); break;
+        case A_DOWNLOAD: command(IDM_UPDATE); break;
         }
         break;
     case ID_BANNER: {
@@ -1405,6 +1429,9 @@ static LRESULT CALLBACK wndproc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
         }
         return 0;
     }
+    case WM_SIZE:            /* minimize/restore: start or stop the spinner */
+        spinner_update();
+        return 0;
     case WM_TIMER:
         g_anim = (g_anim + 9) % 360;
         InvalidateRect(ctl(ID_POWER)->hwnd, NULL, FALSE);

@@ -35,7 +35,7 @@ LIBS    := -lws2_32 -lshell32 -lole32 -luser32 -ladvapi32 -luuid -lgdiplus -lcom
 WDARCH := $(if $(filter x86_64,$(ARCH)),x64,x86)
 WINDIVERT_DLL := $(WINDIVERT)/$(WDARCH)/WinDivert.dll
 # read from stdin: sha256sum escapes its output line when the path holds a backslash
-WINDIVERT_DLL_SHA256 ?= $(shell sha256sum < $(WINDIVERT_DLL) 2>/dev/null | cut -c1-64)
+WINDIVERT_DLL_SHA256 ?= $(shell [ -f "$(WINDIVERT_DLL)" ] && sha256sum < "$(WINDIVERT_DLL)" | cut -c1-64)
 ifneq ($(WINDIVERT_DLL_SHA256),)
 CFLAGS += -DWINDIVERT_DLL_SHA256=\"$(WINDIVERT_DLL_SHA256)\"
 else ifeq ($(REQUIRE_WINDIVERT_HASH),1)
@@ -46,8 +46,8 @@ endif
 # ship both (WinDivert64.sys is used on 64-bit Windows).
 WINDIVERT_SYS64 := $(WINDIVERT)/$(WDARCH)/WinDivert64.sys
 WINDIVERT_SYS32 := $(WINDIVERT)/$(WDARCH)/WinDivert32.sys
-WINDIVERT_SYS64_SHA256 ?= $(shell sha256sum < $(WINDIVERT_SYS64) 2>/dev/null | cut -c1-64)
-WINDIVERT_SYS32_SHA256 ?= $(shell sha256sum < $(WINDIVERT_SYS32) 2>/dev/null | cut -c1-64)
+WINDIVERT_SYS64_SHA256 ?= $(shell [ -f "$(WINDIVERT_SYS64)" ] && sha256sum < "$(WINDIVERT_SYS64)" | cut -c1-64)
+WINDIVERT_SYS32_SHA256 ?= $(shell [ -f "$(WINDIVERT_SYS32)" ] && sha256sum < "$(WINDIVERT_SYS32)" | cut -c1-64)
 ifneq ($(WINDIVERT_SYS64_SHA256),)
 CFLAGS += -DWINDIVERT_SYS64_SHA256=\"$(WINDIVERT_SYS64_SHA256)\"
 else ifeq ($(REQUIRE_WINDIVERT_HASH),1)
@@ -71,7 +71,18 @@ $(OUT)/obj/%.o: src/%.c $(wildcard src/*/*.h)
 	$(CC) $(CFLAGS) -c $< -o $@
 
 # the pinned hash is compiled in: rebuild when the DLL changes
-$(OUT)/obj/engine/windivert_dyn.o: $(wildcard $(WINDIVERT_DLL) $(WINDIVERT_SYS64) $(WINDIVERT_SYS32))
+# A stamp holding the pins, rewritten only when they change: the object is
+# rebuilt when a pin appears, disappears or changes - file dates alone miss
+# that (a zip keeps old dates).
+WDPIN_STAMP := $(OUT)/obj/wdpin.stamp
+$(WDPIN_STAMP): FORCE
+	@mkdir -p $(dir $@)
+	@echo "$(WINDIVERT_DLL_SHA256) $(WINDIVERT_SYS64_SHA256) $(WINDIVERT_SYS32_SHA256)" > $@.tmp
+	@cmp -s $@.tmp $@ || cp -f $@.tmp $@
+	@rm -f $@.tmp
+$(OUT)/obj/engine/windivert_dyn.o: $(WDPIN_STAMP)
+.PHONY: FORCE
+FORCE:
 
 $(OUT)/obj/res.o: src/app/TurkishDPI.rc src/app/TurkishDPI.exe.manifest $(wildcard src/app/res/*.ico) src/app/version.h
 	@mkdir -p $(dir $@)

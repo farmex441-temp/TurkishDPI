@@ -192,7 +192,9 @@ static BOOL CALLBACK wd_load(PINIT_ONCE o, PVOID p, PVOID *c) {
             lstrcpyW(path + n, sys_names[i]);
             sys_hold[i] = open_pinned(path, &err);
             if (sys_hold[i] == INVALID_HANDLE_VALUE && err != ERROR_FILE_NOT_FOUND) {
-                wd.err = err == ERROR_FILE_INVALID ? ERROR_FILE_INVALID : err;
+                /* locked or quarantined by an antivirus, or in use: one clear
+                 * code for the app instead of e.g. "access denied" */
+                wd.err = err == ERROR_FILE_INVALID ? ERROR_FILE_INVALID : ERROR_CANT_ACCESS_FILE;
                 return TRUE;
             }
         }
@@ -203,7 +205,8 @@ static BOOL CALLBACK wd_load(PINIT_ONCE o, PVOID p, PVOID *c) {
         pin = open_pinned(path, &err);
         if (pin == INVALID_HANDLE_VALUE) {
             /* 1006: "WinDivert files are not the expected ones" in the app */
-            wd.err = err == ERROR_FILE_NOT_FOUND ? ERROR_MOD_NOT_FOUND : err;
+            wd.err = err == ERROR_FILE_NOT_FOUND ? ERROR_MOD_NOT_FOUND
+                   : err == ERROR_FILE_INVALID ? ERROR_FILE_INVALID : ERROR_CANT_ACCESS_FILE;
             return TRUE;
         }
     }

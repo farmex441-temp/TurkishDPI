@@ -301,10 +301,23 @@ static void delete_tree(const wchar_t *dir) {
                 else DeleteFileW(path);
             }
             else if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) delete_tree(path);
-            else if (!DeleteFileW(path)) MoveFileExW(path, NULL, MOVEFILE_DELAY_UNTIL_REBOOT);
+            else if (!DeleteFileW(path)) {
+                /* In use (the running exe): move it aside first and delete the
+                 * renamed file at reboot. Scheduling the original name would
+                 * also delete a fresh copy installed there before the reboot. */
+                wchar_t aside[MAX_PATH];
+                _snwprintf(aside, MAX_PATH - 1, L"%ls.%lu.del", path, GetTickCount());
+                aside[MAX_PATH - 1] = 0;
+                if (MoveFileExW(path, aside, 0))
+                    MoveFileExW(aside, NULL, MOVEFILE_DELAY_UNTIL_REBOOT);
+                else
+                    MoveFileExW(path, NULL, MOVEFILE_DELAY_UNTIL_REBOOT);
+            }
         } while (FindNextFileW(h, &fd));
         FindClose(h);
     }
+    /* a folder that still holds a renamed file goes at reboot - but only if
+     * it is empty then (a reinstall in the meantime keeps it) */
     if (!RemoveDirectoryW(dir)) MoveFileExW(dir, NULL, MOVEFILE_DELAY_UNTIL_REBOOT);
 }
 

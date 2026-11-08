@@ -202,7 +202,10 @@ static const struct { const char *code; const wchar_t *text; } WHY[] = {
 static const char *g_reason_code = "startup";
 static const wchar_t *g_reason_text = L"açılışta seçildi";
 
+static why_t g_reason_why = WHY_STARTUP;
+
 static void set_reason(why_t w) {
+    g_reason_why = w;
     g_reason_code = WHY[w].code;
     g_reason_text = WHY[w].text;
 }
@@ -409,6 +412,9 @@ static int engine_start(int preset, int dns) {
     PROCESS_INFORMATION pi;
     DWORD r;
 
+    EnterCriticalSection(&g_lock);
+    g_ui.driver_err = 0;   /* an old driver error must not label a new failure */
+    LeaveCriticalSection(&g_lock);
     build_args(preset, dns, args, sizeof(args));
     /* Already running with exactly these arguments: keep it. Restarting
      * would only drop the user's connections for nothing (a watchdog or
@@ -480,21 +486,23 @@ static int engine_start(int preset, int dns) {
 
 static const wchar_t *windivert_error_text(long e) {
     switch (e) {
-    case 2:    return L"WinDivert64.sys bulunamadı. Zip'teki tüm dosyaları TurkishDPI.exe ile aynı "
-                      L"klasöre çıkarın; dosya oradaysa antivirüs karantinasına bakın.";
-    case 126:  return L"WinDivert.dll bulunamadı. Zip'teki tüm dosyaları TurkishDPI.exe ile aynı "
-                      L"klasöre çıkarın; dosya oradaysa antivirüs karantinasına bakın.";
+    /* each text fits g_ui.detail (159 chars) and four lines of the window */
+    case 2:    return L"WinDivert64.sys bulunamadı. Zip'teki tüm dosyaları exe ile aynı klasöre "
+                      L"çıkarın; dosya varsa antivirüs karantinasına bakın.";
+    case 126:  return L"WinDivert.dll bulunamadı. Zip'teki tüm dosyaları exe ile aynı klasöre "
+                      L"çıkarın; dosya varsa antivirüs karantinasına bakın.";
+    case 1920: return L"WinDivert dosyalarına erişilemiyor: antivirüs engellemiş ya da başka bir "
+                      L"program kullanıyor olabilir.";
     case 5:    return L"Yönetici izni gerekiyor. Programı yönetici olarak çalıştırın.";
     case 577:  return L"Sürücü imzası doğrulanamadı. Windows güncellemelerini yükleyin.";
-    case 654:  return L"Farklı sürümde bir WinDivert sürücüsü yüklü (eski GoodbyeDPI/zapret?). "
+    case 654:  return L"Başka sürümde bir WinDivert sürücüsü yüklü (eski GoodbyeDPI/zapret?). "
                       L"Onları kapatıp bilgisayarı yeniden başlatın.";
     case 1275: return L"Sürücü bir güvenlik yazılımı tarafından engellendi (ör. Kaspersky).";
     case 1753: return L"Base Filtering Engine (BFE) hizmeti kapalı. Hizmetler'den açın.";
-    case 193:  return L"WinDivert.dll bu sistemin mimarisine uymuyor (x64/x86 zip'leri karışmış olabilir). "
-                      L"Doğru zip'i yeniden çıkarın.";
-    case 1006: return L"WinDivert dosyaları (WinDivert.dll ya da sürücü) beklenen dosyalar değil: "
-                      L"değiştirilmiş ya da başka bir sürüm. Güvenlik için yüklenmedi. "
-                      L"TurkishDPI'ı resmi zip'ten yeniden çıkarın.";
+    case 193:  return L"WinDivert.dll bu Windows'a uymuyor (x64/x86 zip'i karışmış olabilir). "
+                      L"Doğru zip'i indirin.";
+    case 1006: return L"WinDivert dosyaları beklenenler değil (değiştirilmiş ya da başka sürüm), "
+                      L"güvenlik için yüklenmedi. Resmi zip'i yeniden indirin.";
     default:   return NULL;
     }
 }
@@ -688,6 +696,10 @@ static void announce(int p, int score) {
     config_save();
     _snwprintf(d, 159, L"%ls · %ls", PRESETS[p].name, g_reason_text);
     d[159] = 0;
+    EnterCriticalSection(&g_lock);
+    wcsncpy(g_ui.reason, g_reason_text, 63);
+    g_ui.reason[63] = 0;
+    LeaveCriticalSection(&g_lock);
     log_line("decision: preset %d (%d/%d) reason=%s", p, score, g_ntargets, g_reason_code);
     if (score >= g_ntargets) {
         set_state(ST_ACTIVE, L"Koruma aktif", d);
@@ -866,6 +878,11 @@ static void auto_scan(void) {
 
     InterlockedExchange(&g_scan_aborted, 0);
     log_line("scan: reason=%s", g_reason_code);
+    /* A confirmed watchdog failure or the user's "rescan" must not end with
+     * the same, possibly wedged engine process kept alive: restart it even
+     * if the same preset wins again. */
+    if (g_reason_why == WHY_WATCHDOG || g_reason_why == WHY_USER_RESCAN)
+        g_running_args[0] = 0;
     set_state(ST_SCANNING, L"Bağlantı kontrol ediliyor…", L"");
     /* The running engine (if any) stays on while the connection and the DNS
      * servers are measured: protection is only interrupted when a different
@@ -1401,10 +1418,18 @@ static int autostart_register(int on, int quiet) {
          * at a folder ordinary programs can write to (see sys_install_copy). */
         if (!sys_install_copy(g_self_exe, g_exe, installed, MAX_PATH)) {
             log_line("autostart: could not install into Program Files (%lu)", GetLastError());
-            if (!quiet)
-                notify(L"Windows ile başlat açılamadı",
-                       L"TurkishDPI, Program Files\\TurkishDPI klasörüne kopyalanamadı. "
-                       L"Güvenlik nedeniyle başlangıç görevi başka bir klasörden çalıştırılmaz.");
+            /* Never keep a task that may still point at an unprotected copy
+             * (e.g. one made by v1.1.0 in the extraction folder): no
+             * autostart is safer than an elevated start from a writable folder. */
+            if (g_autostart_cache == 1) {
+                run_hidden(L"schtasks.exe", L"/Delete /F /TN \"TurkishDPI\"");
+                log_line("autostart: existing logon task removed (could not be made safe)");
+            }
+            notify(L"Windows ile başlat kapatıldı",
+                   L"TurkishDPI, Program Files\\TurkishDPI klasörüne kopyalanamadı. Güvenlik nedeniyle "
+                   L"başlangıç görevi başka bir klasörden çalıştırılmaz. Ayarlar'dan tekrar açabilirsiniz.");
+            (void)quiet;
+            autostart_query();
             return 0;
         }
         xml_escape(installed, exe, MAX_PATH * 2);

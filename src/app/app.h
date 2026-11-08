@@ -34,6 +34,7 @@ typedef struct {
     int hybrid;                 /* hybrid DNS on                      */
     int n_block_ips;            /* learned block-page addresses       */
     long driver_err;            /* last WinDivert error code, 0 = none */
+    wchar_t reason[64];         /* why the running preset was chosen   */
     int autostart;              /* Windows logon task present (-1 unknown) */
     int learned;                /* presets with history on this net */
     wchar_t site_result[160];   /* result of the last site test   */
