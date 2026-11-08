@@ -319,6 +319,10 @@ SHA-256 in the workflow.
   target those heuristics. v1.2.0 (2026-11-08): x64 zip 3/68 (the same three
   WinDivert labels), `TurkishDPI.exe` alone 1/71 (Elastic ML "Malicious (high
   Confidence)"; Microsoft, Kaspersky, ESET, BitDefender etc. clean), local
-  Defender scan clean. Remaining options are code signing and false-positive
+  Defender scan clean. v1.2.1: x64 zip 3/68 (same WinDivert labels), exe
+  alone 2/71: Elastic ML plus Microsoft cloud ML `Trojan:Win32/Wacatac.B!ml`
+  (a generic label for new unsigned binaries; local Defender without cloud
+  protection is clean) - needs a false-positive submission to Microsoft
+  (owner, signed in). Remaining options are code signing and false-positive
   reports to the vendors (both need the owner); do not try to dodge ML
   detectors with packing/obfuscation.
