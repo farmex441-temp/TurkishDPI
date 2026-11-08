@@ -15,6 +15,7 @@
 #include <windows.h>
 #include <time.h>
 #include <stdio.h>
+#include "syslib.h"
 #include "goodbyedpi.h"
 #include "dnsredir.h"
 #include "utils/uthash.h"
@@ -167,7 +168,7 @@ void flush_dns_cache() {
     /* TurkishDPI: System32 only. dnsapi.dll is not a KnownDLL, so a plain
      * LoadLibrary would search the (possibly user-writable) exe folder first
      * from this elevated process. */
-    HMODULE dnsapi = LoadLibraryExW(L"dnsapi.dll", NULL, LOAD_LIBRARY_SEARCH_SYSTEM32);
+    HMODULE dnsapi = load_system_dll(L"dnsapi.dll");
     if (dnsapi == NULL)
     {
         printf("Can't load dnsapi.dll to flush DNS cache!\n");

@@ -31,6 +31,15 @@
 
 > **Not:** DPI atlatma; SNI/Host incelemesi ve DNS ile yapılan engelleri aşar. Bir sitenin **IP adresi** engellenmişse veya site Türkiye'ye kendisi hizmet vermiyorsa hiçbir DPI aracı (VPN olmadan) bunu aşamaz – TurkishDPI bu durumu site testinde size söyler.
 
+### Uyumluluk
+
+- **Windows 7 SP1, 8.1, 10, 11** – 64 bit (`x64` zip) ve 32 bit (`x86` zip). Windows 7'de WinDivert sürücüsünün imzası için KB4474419 (SHA-2), bağlantı testleri için KB3140245 (TLS 1.2) güncellemeleri gerekir; KB2533623 olmadan da çalışır.
+- **ARM işlemcili Windows desteklenmez:** WinDivert'in ARM64 sürücüsü yoktur. Program bu durumda belirsiz bir sürücü hatası yerine bunu açıkça söyler.
+- **Ekran okuyucu:** Tüm düğmeler, durum bilgisi, Ayrıntılar satırları, test siteleri ve site kutusu Ekran Okuyucusu/NVDA tarafından okunur (UI Automation ile doğrulandı); her şey Tab, Boşluk ve Enter ile kullanılabilir.
+- **Discord:** Web sitesi, uygulama, ağ geçidi, CDN ve **güncelleyici** (`updates.discord.com`) engelli; TurkishDPI açıkken hepsi açılıyor (ölçüldü). Sesli görüşme sunucuları (`*.discord.media`) Türkiye'de şu an engelli değil, ses de çalışıyor.
+- **Windows hizmeti:** TurkishDPI hizmet olarak değil, oturum açılınca Görev Zamanlayıcı ile başlar (tepside simgesiyle). Eski GoodbyeDPI tarzı `sc create` hizmetleri ve `.cmd` betikleri motorla aynen çalışır.
+- **Linux/macOS:** Desteklenmez (WinDivert yalnızca Windows'ta vardır). Linux için [zapret](https://github.com/bol-van/zapret) kullanılabilir.
+
 ### Ölçüm sonuçları (v1.1.0, Türk Telekom altyapılı bir ağ, `--selftest`)
 
 | | Sonuç |

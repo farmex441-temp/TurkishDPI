@@ -19,6 +19,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <wchar.h>
+#include "syslib.h"
 #include "sysdll.h"
 #include "app.h"
 #include "system.h"
@@ -115,7 +116,7 @@ int sys_proxy_repair(void) {
     RegSetValueExW(k, L"ProxyEnable", 0, REG_DWORD, (const BYTE *)&zero, sizeof(zero));
     RegCloseKey(k);
     /* Tell running programs the settings changed (address is kept for the user). */
-    wi = LoadLibraryExW(L"wininet.dll", NULL, LOAD_LIBRARY_SEARCH_SYSTEM32);
+    wi = load_system_dll(L"wininet.dll");
     if (wi) {
         set_opt_fn f = (set_opt_fn)(void *)GetProcAddress(wi, "InternetSetOptionW");
         if (f) {
@@ -144,6 +145,7 @@ int sys_check_update(wchar_t *tag_out, size_t cap) {
     s = WinHttpOpen(L"TurkishDPI/" TURKISHDPI_VERSION_W, WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
                     WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
     if (!s) return 0;
+    sysdll_winhttp_tls(s);
     WinHttpSetTimeouts(s, 8000, 8000, 8000, 8000);
     c = WinHttpConnect(s, L"api.github.com", INTERNET_DEFAULT_HTTPS_PORT, 0);
     if (c) r = WinHttpOpenRequest(c, L"GET", TURKISHDPI_RELEASE_API, NULL, WINHTTP_NO_REFERER,

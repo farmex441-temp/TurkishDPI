@@ -14,6 +14,7 @@
 #include <winhttp.h>
 #include <stdio.h>
 #include <string.h>
+#include "syslib.h"
 #include "sysdll.h"
 #include "probe.h"
 
@@ -66,6 +67,7 @@ static int https_once(const wchar_t *host, DWORD timeout_ms) {
                     WINHTTP_ACCESS_TYPE_NO_PROXY, WINHTTP_NO_PROXY_NAME,
                     WINHTTP_NO_PROXY_BYPASS, 0);
     if (!s) goto out;
+    sysdll_winhttp_tls(s);
     WinHttpSetTimeouts(s, (int)timeout_ms, (int)timeout_ms, (int)timeout_ms, (int)timeout_ms);
     WinHttpSetStatusCallback(s, status_cb,
                              WINHTTP_CALLBACK_FLAG_CONNECT_TO_SERVER | WINHTTP_CALLBACK_FLAG_SEND_REQUEST,
@@ -348,7 +350,7 @@ static int system_dns_a(const char *name, DWORD flags, unsigned long *ips, int m
     typedef LONG (WINAPI *dnsq_fn)(PCSTR, WORD, DWORD, PVOID, PVOID *, PVOID *);
     typedef VOID (WINAPI *dnsfree_fn)(PVOID, int);
     struct rec { struct rec *next; char *name; WORD type, len; DWORD flags, ttl, res; DWORD ip; };
-    HMODULE h = LoadLibraryExW(L"dnsapi.dll", NULL, LOAD_LIBRARY_SEARCH_SYSTEM32);
+    HMODULE h = load_system_dll(L"dnsapi.dll");
     dnsq_fn q;
     dnsfree_fn fr;
     PVOID list = NULL;
@@ -409,7 +411,7 @@ int probe_learn_block_ips(const char *clean_v4, unsigned short clean_port,
 
 void probe_flush_dns_cache(void) {
     typedef BOOL (WINAPI *flush_fn)(void);
-    HMODULE h = LoadLibraryExW(L"dnsapi.dll", NULL, LOAD_LIBRARY_SEARCH_SYSTEM32);
+    HMODULE h = load_system_dll(L"dnsapi.dll");
     if (h) {
         flush_fn f = (flush_fn)(void *)GetProcAddress(h, "DnsFlushResolverCache");
         if (f) f();

@@ -16,6 +16,7 @@
  */
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
+#include "syslib.h"
 #include "windivert.h"
 
 #ifndef LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR
@@ -61,7 +62,7 @@ typedef LONG (WINAPI *bc_destroy_t)(void *);
 typedef LONG (WINAPI *bc_close_t)(void *, ULONG);
 
 static BOOL sha256_of_handle(HANDLE f, unsigned char out[32]) {
-    HMODULE bc = LoadLibraryExW(L"bcrypt.dll", NULL, LOAD_LIBRARY_SEARCH_SYSTEM32);
+    HMODULE bc = load_system_dll(L"bcrypt.dll");
     bc_open_t bopen; bc_create_t bcreate; bc_data_t bdata; bc_finish_t bfinish;
     bc_destroy_t bdestroy; bc_close_t bclose;
     void *alg = NULL, *hash = NULL;
@@ -186,6 +187,15 @@ int windivert_handle_ok(HANDLE f, const wchar_t *name) {
 #endif
 }
 
+/* 1 on Windows on ARM: x64/x86 programs run there emulated, but WinDivert
+ * has no ARM64 driver, so the filter can never open. */
+int windivert_arm64_host(void) {
+    typedef BOOL (WINAPI *wow2_fn)(HANDLE, USHORT *, USHORT *);
+    USHORT proc = 0, native = 0;
+    wow2_fn f = (wow2_fn)(void *)GetProcAddress(GetModuleHandleW(L"kernel32.dll"), "IsWow64Process2");
+    return f && f(GetCurrentProcess(), &proc, &native) && native == 0xAA64;   /* IMAGE_FILE_MACHINE_ARM64 */
+}
+
 /* The driver WinDivert itself will load on this system. */
 static const wchar_t *driver_in_use(void) {
 #ifdef _WIN64
@@ -205,6 +215,7 @@ static BOOL CALLBACK wd_load(PINIT_ONCE o, PVOID p, PVOID *c) {
     HMODULE h;
     HANDLE pin = INVALID_HANDLE_VALUE;
     (void)o; (void)p; (void)c;
+    if (windivert_arm64_host()) { wd.err = ERROR_NOT_SUPPORTED; return TRUE; }
     /* a truncated path could name a different (plantable) file */
     if (n == 0 || n >= MAX_PATH) return TRUE;
     while (n > 0 && path[n - 1] != L'\\') n--;
@@ -246,7 +257,7 @@ static BOOL CALLBACK wd_load(PINIT_ONCE o, PVOID p, PVOID *c) {
     lstrcpyW(path + n, L"WinDivert.dll");
 #endif
     /* Absolute path; its own imports (kernel32, advapi32) from System32 only. */
-    h = LoadLibraryExW(path, NULL, LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_SYSTEM32);
+    h = load_dll_path(path);
     if (!h) wd.err = GetLastError();   /* e.g. 193: DLL of the wrong architecture */
     if (pin != INVALID_HANDLE_VALUE) CloseHandle(pin);   /* mapped now: cannot change */
     if (!h) return TRUE;

@@ -504,6 +504,8 @@ static const wchar_t *windivert_error_text(long e) {
                       L"Doğru zip'i indirin.";
     case 1006: return L"WinDivert dosyaları beklenenler değil (değiştirilmiş ya da başka sürüm), "
                       L"güvenlik için yüklenmedi. Resmi zip'i yeniden indirin.";
+    case 50:   return L"ARM işlemcili Windows desteklenmiyor: WinDivert sürücüsünün ARM64 sürümü yok. "
+                      L"x64 veya x86 işlemcili bir bilgisayar gerekir.";
     default:   return NULL;
     }
 }
@@ -916,7 +918,11 @@ static void auto_scan(void) {
     for (int k = 0; k < PRESET_COUNT; k++) {
         int p = order[k], score, ms;
         wchar_t st[64];
-        if (cmd_pending()) { InterlockedExchange(&g_scan_aborted, 1); return; }
+        if (cmd_pending()) {
+            log_line("scan: interrupted by a command");
+            InterlockedExchange(&g_scan_aborted, 1);
+            return;
+        }
         if (winner >= 0 && (known_before[p] || extra >= 2)) break;
         EnterCriticalSection(&g_lock);
         g_ui.scan_pos = k + 1;
@@ -1202,6 +1208,10 @@ static DWORD WINAPI controller(LPVOID unused) {
         if (r == WAIT_OBJECT_0 + 2) netchg = 1;   /* resumed from sleep */
 
         if ((cmd = cmd_pop(&arg)) != CMD_NONE) {
+            /* auto_scan gives way to any queued command; a command that does
+             * not replace the scan must finish it afterwards, otherwise the
+             * engine stays on whatever preset was being tried. */
+            int interrupted = g_scan_aborted != 0;
             if (cmd == CMD_TOGGLE_PAUSE) cmd = g_paused ? CMD_RESUME : CMD_PAUSE;
             if (cmd != CMD_TESTSITE) InterlockedExchange(&g_scan_aborted, 0);
             switch (cmd) {
@@ -1218,7 +1228,8 @@ static DWORD WINAPI controller(LPVOID unused) {
                               set_state(ST_PAUSED, L"Duraklatıldı", L"Açmak için düğmeye basın"); break;
             case CMD_RESTART: /* settings changed: restart what runs, no full rescan */
                               set_reason(WHY_SETTINGS);
-                              if (!g_paused && g_running_preset >= 0) {
+                              /* mid-scan the running preset is only a candidate */
+                              if (!g_paused && g_running_preset >= 0 && !interrupted) {
                                   int p = g_running_preset;
                                   if (engine_start(p, g_dns)) announce(p, targets_score(NULL));
                                   else if (!engine_fatal()) { if (g_auto) auto_scan(); else manual_start(g_preset); }
@@ -1229,7 +1240,9 @@ static DWORD WINAPI controller(LPVOID unused) {
                               if (cmd == CMD_RESUME) set_reason(WHY_RESUME_PAUSE);
                               if (g_auto) auto_scan(); else manual_start(g_preset);
                               break;
-            case CMD_AUTOSTART: autostart_set((int)arg); break;
+            case CMD_AUTOSTART: autostart_set((int)arg);
+                              if (interrupted && g_auto && !g_paused) auto_scan();
+                              break;
             case CMD_TESTSITE: {
                 wchar_t h[256];
                 EnterCriticalSection(&g_lock);
@@ -1488,25 +1501,30 @@ static int autostart_register(int on, int quiet) {
         }
         /* written to the admin-only data folder, removed right after use */
         swprintf(xml_path, MAX_PATH, L"%ls\\autostart.xml", g_dir);
-        /* Kept open (others may read, nobody may write or delete) until
-         * schtasks has read it. The handle has no DELETE access on purpose:
-         * with it, schtasks (which does not share delete) could not open
-         * the file. The folder is admin-only, so deleting by name afterwards
-         * is safe. */
-        f = CreateFileW(xml_path, GENERIC_WRITE, FILE_SHARE_READ, NULL, CREATE_ALWAYS,
+        /* Written and closed before schtasks runs: schtasks opens the file
+         * without FILE_SHARE_WRITE, so any handle of ours with write access
+         * makes it fail with a sharing violation (exit code 1). Nobody else
+         * can touch the file in between: g_dir is admin-only (protected DACL,
+         * Administrators owner, verified by sys_secure_dir at start). */
+        f = CreateFileW(xml_path, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS,
                         FILE_ATTRIBUTE_NORMAL, NULL);
-        if (f != INVALID_HANDLE_VALUE) {
+        if (f == INVALID_HANDLE_VALUE) {
+            log_line("autostart: could not write the task XML (%lu)", GetLastError());
+        } else {
             static const WCHAR bom = 0xFEFF;
             DWORD code;
-            WriteFile(f, &bom, sizeof(bom), &w, NULL);
-            WriteFile(f, xml, (DWORD)(wcslen(xml) * sizeof(wchar_t)), &w, NULL);
-            FlushFileBuffers(f);
-            _snwprintf(args, MAX_PATH + 63, L"/Create /F /TN \"TurkishDPI\" /XML \"%ls\"", xml_path);
-            args[MAX_PATH + 63] = 0;
-            code = run_hidden(L"schtasks.exe", args);
-            ok = code == 0;
-            if (!ok) log_line("autostart: schtasks /Create exit code %lu", code);
+            BOOL wr = WriteFile(f, &bom, sizeof(bom), &w, NULL) &&
+                      WriteFile(f, xml, (DWORD)(wcslen(xml) * sizeof(wchar_t)), &w, NULL);
             CloseHandle(f);
+            if (wr) {
+                _snwprintf(args, MAX_PATH + 63, L"/Create /F /TN \"TurkishDPI\" /XML \"%ls\"", xml_path);
+                args[MAX_PATH + 63] = 0;
+                code = run_hidden(L"schtasks.exe", args);
+                ok = code == 0;
+                if (!ok) log_line("autostart: schtasks /Create exit code %lu", code);
+            } else {
+                log_line("autostart: could not write the task XML (%lu)", GetLastError());
+            }
             DeleteFileW(xml_path);
         }
     } else {

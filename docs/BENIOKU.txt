@@ -3,29 +3,44 @@ TurkishDPI - Otomatik DPI atlatma aracı
 
 KULLANIM
 1) TurkishDPI.exe dosyasına çift tıklayın ve yönetici iznini onaylayın.
-2) TurkishDPI penceresi açılır ve sizin için en uygun ayarı (profili)
+2) TurkishDPI penceresi açılır ve sizin için en uygun yöntemi (profili)
    kendisi bulur. Hiçbir şey yapmanıza gerek yoktur. Her ağı ayrı
-   öğrenir; bir dahaki sefere doğru profili ilk denemede seçer.
+   öğrenir; bir dahaki sefere doğru yöntemi ilk denemede seçer.
    Pencereyi kapatınca saatin yanındaki simgede çalışmaya devam eder.
-3) Açılmayan bir site olursa pencereye yazıp "Test et" deyin; uygulama
-   o siteyi açan profili kendisi arar.
+3) Açılmayan bir site olursa "Bir site açılmıyor mu?" düğmesine basın,
+   adresini yazıp "Kontrol et" deyin. Uygulama engelin türünü söyler ve
+   DPI ile aşılabiliyorsa o siteyi açan yöntemi kendisi arar.
 4) Banka ve ödeme sitelerinin (3D Secure dahil) trafiğine dokunulmaz
-   ("Ödeme ve banka koruması", varsayılan olarak açık).
-5) Pencerede ve simge menüsünde:
-   - Otomatik mod   : Çalışan profili otomatik bulur (önerilir)
-   - Profil seç     : Profili elle seçmek için
-   - Yeniden tara   : Profilleri baştan dener
-   - Duraklat       : DPI atlatmayı geçici olarak kapatır
-   - Windows ile başlat : Bilgisayar açıldığında otomatik çalıştırır
-   - Günlüğü aç     : Sorun giderme kayıtları
+   ("Ödeme koruması", varsayılan olarak açık).
+5) Pencerenin sayfaları:
+   - Durum      : Koruma durumu, ağ ve hız; Duraklat / Devam et
+   - Ayrıntılar : Kullanılan yöntem ve DNS, test siteleri, site kontrolü,
+                  "Değiştir" (yöntemi elle seçmek) ve "Yeniden tara"
+   - Ayarlar    : Otomatik yöntem seçimi, Windows açılışında başlat,
+                  Ödeme koruması, Günlüğü aç, Kaldır ve temizle
+   Klavye (Tab, Boşluk, Enter) ve ekran okuyucularla (Ekran Okuyucusu,
+   NVDA) kullanılabilir.
 
 ÖNEMLİ
 - WinDivert.dll ve WinDivert64.sys dosyaları TurkishDPI.exe ile aynı
   klasörde durmalıdır (zip'in tamamını aynı klasöre çıkarın).
-- Bazı antivirüsler WinDivert'i "HackTool/RiskWare" olarak işaretler; bu
-  bir yanlış alarmdır. Klasörü istisnalara ekleyin. Kaspersky kullanıyorsanız
-  tamamen kaldırmanız gerekebilir.
+- "Windows açılışında başlat" programı C:\Program Files\TurkishDPI
+  klasörüne kopyalar ve oradan çalıştırır.
+- Bazı antivirüsler WinDivert sürücüsünü "RiskTool/WinDivert" olarak
+  işaretler; bu bir yanlış alarmdır (GoodbyeDPI ve zapret için de aynı).
+  Gerekirse yalnızca C:\Program Files\TurkishDPI klasörünü istisnalara
+  ekleyin. Kaspersky kullanıyorsanız sürücüyü engelleyebilir.
 - Eski GoodbyeDPI hizmeti kuruluysa TurkishDPI bunu fark eder ve
   kaldırmayı önerir.
+
+UYUMLULUK
+- Windows 7 SP1, 8.1, 10 ve 11 (64 ve 32 bit). Windows 7'de sürücü imzası
+  için KB4474419 (SHA-2), TLS 1.2 için KB3140245 güncellemesi gerekir.
+- ARM işlemcili Windows desteklenmez (WinDivert'in ARM64 sürücüsü yoktur);
+  program bunu açıkça söyler.
+
+SINIRLAR
+- IP adresinden engellenen siteler VPN olmadan açılamaz; site kontrolü
+  bunu söyler.
 
 Ayarlar ve günlük: C:\ProgramData\TurkishDPI\
