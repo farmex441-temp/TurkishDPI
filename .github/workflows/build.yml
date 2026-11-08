@@ -37,9 +37,11 @@ jobs:
           gcc -O2 -Wall -Isrc/engine tests/exclude_test.c src/engine/exclude.c -lws2_32 -o build/exclude_test.exe
           gcc -O2 -Wall -Isrc/engine tests/dns_test.c src/engine/dns.c -lws2_32 -o build/dns_test.exe
           gcc -O2 -Wall -Isrc/app tests/diag_test.c src/app/diag.c -o build/diag_test.exe
+          gcc -O2 -Wall -Isrc/app -Itests tests/updpkg_test.c src/app/updpkg.c -o build/updpkg_test.exe
           ./build/exclude_test.exe
           ./build/dns_test.exe
           ./build/diag_test.exe
+          ./build/updpkg_test.exe
           # the packet engine's helpers (from Shroudly's core, with its tests)
           CORE="src/engine/core/proto.c src/engine/core/tcpdpi.c src/engine/core/udpdpi.c src/engine/core/rawscope.c"
           for t in proto tcpdpi udpdpi rawscope; do
@@ -103,6 +105,10 @@ jobs:
           gcc -g -O1 -fsanitize=address,undefined -fno-sanitize-recover=all -Wall -Wextra \
               -Isrc/app tests/diag_test.c src/app/diag.c -o build/diag_test
           ./build/diag_test
+      - name: update package reader (ASan/UBSan)
+        run: |
+          gcc -g -O1 -fsanitize=address,undefined -fno-sanitize-recover=all -Wall -Wextra               -Isrc/app -Itests tests/updpkg_test.c src/app/updpkg.c -o build/updpkg_test
+          ./build/updpkg_test
       - name: engine core (ASan/UBSan)
         run: |
           CORE="src/engine/core/proto.c src/engine/core/tcpdpi.c src/engine/core/udpdpi.c src/engine/core/rawscope.c"
@@ -177,6 +183,15 @@ jobs:
           done
           (cd dist && sha256sum * > SHA256SUMS.txt)
           ls -la dist
+          # The one-click update (src/app/system.c) reads exactly these files:
+          # SHA256SUMS.txt lines "<sha256>  TurkishDPI-<tag>-<x64|x86>.zip" and
+          # TurkishDPI.exe in the zip's folder. Check it can, with its own reader.
+          gcc -O2 -Wall -Isrc/app -Itests tests/updpkg_test.c src/app/updpkg.c -o build/updpkg_check
+          for a in x86_64 i686; do
+            w=x64; [ $a = i686 ] && w=x86
+            grep -qE "^[0-9a-f]{64}  TurkishDPI-$V-$w.zip$" dist/SHA256SUMS.txt
+            ./build/updpkg_check dist/TurkishDPI-$V-$w.zip TurkishDPI.exe build/$a/TurkishDPI.exe
+          done
 
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:

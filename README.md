@@ -24,7 +24,7 @@ Sürüm 2.0'dan itibaren **kendi paket motorunu** kullanır: motorun IPv4 paket 
 - **Sahte DNS filtresi:** Engel sayfasına, sinkhole'a veya özel ağ adreslerine yönlendiren sahte DNS cevapları veren sunucular otomatik elenir; yalnızca gerçek cevap veren DNS kullanılır.
 - **Canlı istatistik:** İşlenen paket, HTTPS/HTTP/DNS işlemleri ve atlanan ödeme bağlantıları pencerede anlık görünür.
 - **Otopilot kontrolleri (Shroudly'den):** Aynı anda çalışan başka bir DPI/VPN aracı (GoodbyeDPI, zapret, ByeDPI, Shroudly, WARP, v2rayN…) varsa uyarır; Windows proxy ayarı kapanmış bir programı gösteriyorsa (eski ByeDPI/proxy araçlarından kalan) tek tıkla onarır.
-- **Güncelleme bildirimi:** Yeni sürüm çıktığında pencerede bildirir.
+- **Tek tıkla güncelleme (2.0.1+):** Yeni sürüm çıktığında pencerede "Yeni sürüm hazır" yazar. **Güncelle →** düğmesine basınca TurkishDPI yeni sürümü GitHub'dan indirir, sürümle birlikte yayımlanan `SHA256SUMS.txt` ile karşılaştırır, kendini bulunduğu klasörde değiştirir ve yeni sürümle yeniden açılır. Ayarlar ve öğrenilen bilgiler korunur.
 - **Temiz kaldırma:** *Ayarlar → Kaldır ve temizle* başlangıç görevini, Program Files kopyasını, ayarları, günlüğü ve WinDivert sürücü hizmetini siler.
 - **Açıklanabilir kararlar:** Pencerede profil adının yanında neden seçildiği yazar (açılış, ağ değişimi, bekçi, uykudan dönüş…). Tek seferlik bir aksaklık yeniden tarama başlatmaz; aynı profil devam ediyorsa bağlantılar kesilmez. Bildirim yalnızca durum gerçekten değişince gelir.
 - **Kendi kendini test:** `TurkishDPI.exe --selftest` tarar, ödeme sitelerinin dokunulmadan geçtiğini doğrular, sonucu günlüğe yazıp kapanır.
@@ -162,7 +162,8 @@ TurkishDPI.exe --engine --desync fakeddisorder --autottl 1 --dns-addr 208.67.222
 **Bilgisayarınızdan neler çıkar:**
 - **DNS:** Hibrit DNS açıkken (varsayılan) her DNS sorgusu hem ağınızın DNS'ine hem de seçilen temiz DNS'e (Yandex, AdGuard veya OpenDNS; en hızlısı) gider. Bu sorgular şifresizdir. İsterseniz `DnsHybrid=0` ile yalnızca temiz DNS kullanılır.
 - **Bağlantı testleri:** Profil seçimi ve bekçi için test sitelerine (varsayılan discord.com, roblox.com, wattpad.com) ve kontrol sitelerine (google.com, microsoft.com) yaklaşık 10 dakikada bir HTTPS bağlantısı kurulur; içerik indirilmez.
-- **Güncelleme kontrolü:** Günde bir kez GitHub API'sine sürüm sorusu gider (`CheckUpdates=0` ile kapatılır).
+- **Güncelleme kontrolü:** Günde bir kez GitHub API'sine sürüm sorusu gider (`CheckUpdates=0` ile kapatılır). Güncellemeyi yalnızca siz **Güncelle →** düğmesine bastığınızda indirir; kendiliğinden hiçbir şey kurmaz.
+- **Güncellemenin güvenliği:** Dosyalar yalnızca HTTPS üzerinden `github.com`'dan (ve GitHub'ın indirmeleri yönlendirdiği `*.githubusercontent.com`'dan) alınır; zip, aynı sürümdeki `SHA256SUMS.txt` ile tutmazsa kurulmaz. Dosyalar kod imzalı olmadığı için bu kontrol bozuk ya da yolda değiştirilmiş bir indirmeyi yakalar, GitHub hesabının kendisini ele geçiren birine karşı koruma sağlamaz. Yeni sürüm WinDivert dosyalarını değiştiriyorsa otomatik güncelleme yapılmaz, indirme sayfası açılır.
 - Bunların dışında hiçbir veri gönderilmez: telemetri, hesap veya analiz yoktur.
 
 **Yerelde ne saklanır:** `C:\ProgramData\TurkishDPI` yalnızca Yöneticiler ve SYSTEM tarafından okunabilir. Ayarlar, öğrenilen ağ bilgisi (ağ geçidi kimliği ve bağdaştırıcı adı) ve günlük burada durur. Günlük, ziyaret ettiğiniz siteleri kaydetmez.

@@ -8,6 +8,7 @@
 
 #define WM_TRAY    (WM_APP + 1)
 #define WM_STATUS  (WM_APP + 2)
+#define WM_UPDATE_DONE (WM_APP + 3)   /* controller -> UI: wParam 1 restart, 2 broken */
 
 typedef enum {
     ST_STARTING, ST_SCANNING, ST_ACTIVE, ST_PARTIAL, ST_STANDBY,
@@ -15,7 +16,7 @@ typedef enum {
 } state_kind_t;
 
 enum { CMD_NONE, CMD_RESCAN, CMD_SELECT, CMD_AUTO, CMD_PAUSE, CMD_RESUME,
-       CMD_TESTSITE, CMD_RESTART, CMD_TOGGLE_PAUSE, CMD_AUTOSTART };
+       CMD_TESTSITE, CMD_RESTART, CMD_TOGGLE_PAUSE, CMD_AUTOSTART, CMD_UPDATE };
 
 typedef struct {
     state_kind_t kind;
@@ -45,6 +46,7 @@ typedef struct {
     wchar_t rival[48];          /* another bypass/VPN tool running     */
     int proxy_broken;           /* system proxy points at nothing      */
     wchar_t update_tag[32];     /* newer release available             */
+    int update_state;           /* 0 offered, 1 installing, 2 failed   */
 } ui_state_t;
 
 /* app.c */
@@ -63,6 +65,7 @@ void app_open_url(const wchar_t *url);   /* in the user's (non-elevated) shell *
 void app_open_file(const wchar_t *path); /* Notepad from System32 */
 void app_repair_proxy(void);
 void app_uninstall(void);
+void app_update_done(int how);           /* UI thread: WM_UPDATE_DONE */
 
 /* ui.c */
 int  ui_init(HINSTANCE inst);
