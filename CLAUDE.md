@@ -43,9 +43,14 @@ src/app/            the app (controller, UI, probes, learning)
                     preset (trials, ok, avg ms) in [net_<id>] of the ini
   probe.c/.h        WinHTTP HTTPS probes (TCP+TLS set-up time via status
                     callback), DNS RTT probes, forged-answer check, block-page
-                    IP learning via DnsQuery_A
+                    IP learning via DnsQuery_A, facts for site diagnosis
+  diag.c/.h         site diagnosis verdict (ok / no_dns / dns_poison /
+                    tls_block / ip_block); pure C, no Win32, unit tested
+  sysdll.c/.h       winhttp.dll + iphlpapi.dll resolved at run time from
+                    System32 (not linked), SetDefaultDllDirectories
   system.c/.h       rival tools, broken system proxy repair, GitHub update check,
-                    admin-only data folder (sys_secure_dir), uninstall
+                    admin-only data folder (sys_secure_dir), protected
+                    Program Files copy for autostart (sys_install_copy), uninstall
   presets.h         strategy presets ({DNS} placeholder) and clean DNS servers
   version.h         version + GitHub URLs
   TurkishDPI.rc, .exe.manifest, res/*.ico   resources (icons from tools/make_icons.py)
@@ -55,8 +60,10 @@ src/engine/         GoodbyeDPI engine (upstream code + TurkishDPI changes)
   exclude.c/.h      payment/bank "never touch" list (SNI + IPs learned from DNS)
   windivert_dyn.c   loads WinDivert.dll at runtime from the exe's folder only
   fakepackets.c, ttltrack.c, blackwhitelist.c, service.c, utils/   upstream
-tests/              unit tests (no admin): exclude_test.c, dns_test.c;
-                    probe_test.c is a manual network/latency check
+tests/              unit tests (no admin): exclude_test.c, dns_test.c,
+                    diag_test.c, windivert_hash_test.c (DLL pinning, uses a
+                    stand-in DLL, never the driver); probe_test.c is a manual
+                    network/latency/diagnosis check
 third_party/WinDivert/include/windivert.h   header only; DLL/SYS are not in git
 tools/make_icons.py generates src/app/res/*.ico and assets/logo.png (Pillow)
 .github/workflows/build.yml   CI: tests on windows-latest, build x64/x86 on
@@ -70,9 +77,27 @@ Runtime data: `%ProgramData%\TurkishDPI\` (admin-owned, protected DACL):
 
 - **Auto scan** (`auto_scan`): no internet -> wait; measure all clean DNS servers
   in parallel and keep the fastest; learn the ISP's block-page IPs (engine must
-  be stopped); try presets in learned order; on a new network measure up to two
-  extra working presets and keep the fastest. Watchdog every `WatchdogMinutes`,
-  re-check on network change / resume. Partial mode only rescans if it gets worse.
+  be stopped, so at most once per 24 h per network: `bt=` in `[net_<id>]`); try
+  presets in learned order; on a new network measure up to two extra working
+  presets and keep the fastest. The running engine stays on during the
+  measurements and `engine_start` keeps it when the arguments are identical,
+  so a re-check that ends on the same preset drops no connection.
+  Watchdog every `WatchdogMinutes` (1-240) with a second strike: a failed
+  check is repeated after 20 s, only a repeated failure rescans. Network
+  changes are debounced (4 s quiet, 20 s max). Partial mode only rescans if
+  it gets worse. Watchdog successes count in the learning stats once an hour.
+- **Explained decisions**: every scan/start has a reason (`set_reason`,
+  `WHY_*`): logged as `scan: reason=…` / `decision: preset N … reason=…` and
+  shown after the profile name in the window.
+- **Balloons** (`notify_state`): only when the kind of state last told to the
+  user changes (error/partial/active); restarts and re-checks are silent.
+- **Site test diagnosis**: before trying presets for a site that does not
+  open, `probe_collect_facts` + `diag_classify` tell DNS poisoning and TLS/SNI
+  blocks (worth a preset search) from IP blocks / dead servers and unknown
+  names (reported at once; no preset can fix them).
+- **STANDBY** only happens when no preset opens any target but the targets
+  open without the engine (the engine itself is the problem). If the test
+  sites are simply unblocked, every preset scores full and one stays active.
 - **Hybrid DNS** (`--dns-hybrid`, `--dns-block-ip`): each query goes to the
   system resolver *and* the clean one; first trustworthy answer wins; forged
   answers (block pages, bogons, NXDOMAIN/SERVFAIL/REFUSED from the ISP) dropped.
@@ -108,6 +133,11 @@ x86_64-w64-mingw32-gcc -g -O1 -fsanitize=undefined,address -Isrc/engine tests/dn
 x86_64-w64-mingw32-gcc -g -O1 -fsanitize=undefined,address -Isrc/engine tests/exclude_test.c src/engine/exclude.c src/engine/utils/getline.c -o build/exclude_test.exe
 ```
 
+Without MinGW, MSVC (`cl /fsanitize=address`, add `/Dssize_t=intptr_t`) builds
+and runs the unit tests and compile-checks `src/app` + the TurkishDPI engine
+files; the upstream engine (`goodbyedpi.c`, `service.c`, `fakepackets.c`)
+needs GCC (unistd.h, getopt, `__attribute__`), so the full exe needs MinGW/CI.
+
 Quick checks without admin:
 - `__COMPAT_LAYER=RunAsInvoker TurkishDPI.exe --engine <args>`: "Error opening
   filter: 5" means the filter compiled (only the driver needs admin); 87 means
@@ -139,7 +169,19 @@ SHA-256 in the workflow.
     `FILE_FLAG_OPEN_REPARSE_POINT`, owner + protected DACL set on that handle,
     entries owned by other users removed); the app refuses to start if it fails;
   - uninstall never follows reparse points;
-  - WinDivert.dll only from the exe's own folder; `schtasks.exe`/`notepad.exe`
+  - the exe's own folder is NOT trusted (zips get extracted to Downloads):
+    the logon task always runs the protected copy in
+    `%ProgramFiles%\TurkishDPI` (`sys_install_copy`, refreshed when started
+    from elsewhere, `autostart_migrate`); a failed copy means no task, never a
+    task pointing at the extraction folder;
+  - WinDivert.dll only from the exe's own folder, and only if its SHA-256
+    matches the one pinned at build time (`WINDIVERT_DLL_SHA256`, Makefile,
+    from the checksum-pinned archive; CI sets `REQUIRE_WINDIVERT_HASH=1`);
+    checked on a handle that denies writes until the DLL is mapped; error
+    1006 otherwise;
+  - no static imports of non-KnownDLLs (winhttp, iphlpapi, dnsapi, bcrypt):
+    `sysdll.c` / `LoadLibraryExW(..., LOAD_LIBRARY_SEARCH_SYSTEM32)`; CI's
+    "Check imports" step fails the build otherwise; `schtasks.exe`/`notepad.exe`
     by absolute System32 path (`run_hidden`, `app_open_file`), system DLLs with
     `LOAD_LIBRARY_SEARCH_SYSTEM32`;
   - URLs open through `explorer.exe` (`app_open_url`) so the browser is not elevated.
@@ -148,7 +190,8 @@ SHA-256 in the workflow.
   the controller thread; the UI only reads the cache and posts `CMD_AUTOSTART`.
 - The UI window allows `TaskbarCreated`/`WM_TRAY` through UIPI
   (`ChangeWindowMessageFilterEx`), otherwise an elevated tray icon disappears
-  for good when Explorer restarts.
+  for good when Explorer restarts. Never `WM_COMMAND`: any unprivileged
+  process could then post menu commands (exit, autostart, profile).
 - Exit/uninstall call `stop_controller()` (sets `g_quitting`, joins the
   controller) before touching the engine or files.
 - The clean resolver on a custom port is diverted with an exact
@@ -156,8 +199,12 @@ SHA-256 in the workflow.
   plain port rule would catch mDNS (5353) or QUIC (443).
 - Known limits (be honest in docs/UI): IP-level blocks cannot be bypassed by
   DPI tricks; Discord voice (UDP) and Discord's desktop updater are not handled;
-  WinDivert's signed driver itself gets ~2 generic "WinDivert" detections on
-  VirusTotal (Elastic, Arctic Wolf), same as GoodbyeDPI/zapret.
+  WinDivert's signed driver itself gets generic "WinDivert" detections on
+  VirusTotal (see Status), same as GoodbyeDPI/zapret. Payment protection
+  relies on the SNI in the first TLS segment or addresses seen in plain DNS
+  answers; with browser DoH and a ClientHello split over two segments it may
+  not apply (not measured yet, docs/SECURITY-REVIEW.md S6).
+- The log is rotated at 1 MB on write (`log_write`), not only at start.
 
 ## Status / history
 
@@ -165,6 +212,9 @@ SHA-256 in the workflow.
 - v1.1.0 (rc2 published as pre-release): hybrid DNS, fastest DNS, narrow
   filter, honest latency metric, payment IP learning, no embedded driver,
   first bug-hunting round (21 findings).
+- Branch `feature/hardening-autopilot` (not merged): security hardening and
+  autopilot work from docs/DEVELOPMENT-ROADMAP.md items 1, 2, 3 (partly), 5,
+  16; see docs/ for the analysis.
 - After rc2 (on main, not yet tagged): second bug-hunting round - app layer
   (17 findings: folder-security race, laptop autostart, tray icon after
   Explorer restart, manual mode overridden by site test, watchdog balloon

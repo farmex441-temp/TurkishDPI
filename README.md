@@ -18,14 +18,15 @@
 
 - **Kendi arayüzü:** Koyu temalı, tek pencerelik sade uygulama – büyük aç/kapa düğmesi, canlı durum, gecikme, test siteleri ve tepsi simgesi (yeşil: aktif, sarı: taranıyor, gri: duraklatıldı).
 - **Akıllı motor:** Her ağı (modem/Wi-Fi) ayrı tanır ve o ağda hangi profilin ne kadar başarılı ve hızlı olduğunu **öğrenir**. Bilinen bir ağa bağlandığınızda doğru profili ilk denemede seçer; yeni bir ağda en hızlı çalışanı ölçerek bulur. ISS engeli değiştirirse eski bilgiyi yavaşça unutup yeniden öğrenir.
-- **Site testi ve onarımı:** Açılmayan bir siteyi yazın; TurkishDPI önce test eder, engelliyse o siteyi açan profili kendisi bulur ve siteyi izleme listesine ekler.
+- **Site testi ve onarımı:** Açılmayan bir siteyi yazın; TurkishDPI önce engelin türünü ayırır (DNS engeli, SNI/TLS engeli, IP engeli ya da sunucu kapalı, alan adı yok). DPI ile aşılabilen bir engelse o siteyi açan profili kendisi bulur ve siteyi izleme listesine ekler; aşılamıyorsa bunu açıkça söyler.
 - **Ödeme koruması:** 100'den fazla banka, kart, 3D Secure ve ödeme sistemi alan adının (Garanti, İş Bankası, Akbank, Ziraat, Papara, iyzico, PayTR, PayPal, Stripe, Visa, Mastercard…) trafiğine **hiç dokunulmaz**. Böylece ödeme ve 3D Secure adımları etkilenmez. İsterseniz `--exclude dosya.txt` ile kendi listenizi ekleyebilirsiniz.
 - **Tüm siteler:** Motor, yalnızca belirli siteleri değil 80/443 portundaki tüm HTTP/HTTPS bağlantılarını işler. Tüm profillerde QUIC/HTTP3 engellenir, böylece YouTube/Google gibi QUIC kullanan siteler de TCP'ye düşüp atlatmadan geçer.
 - **Sahte DNS filtresi:** Engel sayfasına, sinkhole'a veya özel ağ adreslerine yönlendiren sahte DNS cevapları veren sunucular otomatik elenir; yalnızca gerçek cevap veren DNS kullanılır.
 - **Canlı istatistik:** İşlenen paket, HTTPS/HTTP/DNS işlemleri ve atlanan ödeme bağlantıları pencerede anlık görünür.
 - **Otopilot kontrolleri (Shroudly'den):** Aynı anda çalışan başka bir DPI/VPN aracı (GoodbyeDPI, zapret, ByeDPI, Shroudly, WARP, v2rayN…) varsa uyarır; Windows proxy ayarı kapanmış bir programı gösteriyorsa (eski ByeDPI/proxy araçlarından kalan) tek tıkla onarır.
 - **Güncelleme bildirimi:** Yeni sürüm çıktığında pencerede bildirir.
-- **Temiz kaldırma:** *Ayarlar → Kaldır ve temizle* başlangıç görevini, ayarları, günlüğü ve WinDivert sürücüsünü siler.
+- **Temiz kaldırma:** *Ayarlar → Kaldır ve temizle* başlangıç görevini, Program Files kopyasını, ayarları, günlüğü ve WinDivert sürücü hizmetini siler.
+- **Açıklanabilir kararlar:** Pencerede profil adının yanında neden seçildiği yazar (açılış, ağ değişimi, bekçi, uykudan dönüş…). Tek seferlik bir aksaklık yeniden tarama başlatmaz; aynı profil devam ediyorsa bağlantılar kesilmez. Bildirim yalnızca durum gerçekten değişince gelir.
 - **Kendi kendini test:** `TurkishDPI.exe --selftest` tarar, ödeme sitelerinin dokunulmadan geçtiğini doğrular, sonucu günlüğe yazıp kapanır.
 
 > **Not:** DPI atlatma; SNI/Host incelemesi ve DNS ile yapılan engelleri aşar. Bir sitenin **IP adresi** engellenmişse veya site Türkiye'ye kendisi hizmet vermiyorsa hiçbir DPI aracı (VPN olmadan) bunu aşamaz – TurkishDPI bu durumu site testinde size söyler.
@@ -46,12 +47,12 @@
 |---|---|---|---|
 | Kurulum | Doğru `.cmd` dosyasını deneme-yanılma ile bulmak | Electron uygulaması | **Tek `.exe`, çift tıkla** |
 | Ayar seçimi | Elle (7 farklı betik) | Otomatik | **Otomatik** – 10 profili gerçek bağlantı testiyle dener |
-| DNS | Sabit (Yandex:1253) | DoH | **Otomatik** – erişilebilir DNS'i bulur (Yandex / AdGuard) |
+| DNS | Sabit (Yandex:1253) | DoH | **Otomatik** – en hızlı temiz DNS'i ölçer (Yandex / AdGuard / OpenDNS), hibrit mod |
 | Bozulunca | Elle yeniden deneme | Otomatik | **Otomatik** – ağ değişince, uyandıktan sonra ve her 10 dk'da kontrol |
 | Öğrenme | Yok | Yok | **Ağ başına başarı/gecikme istatistiği** |
 | Ödeme sistemleri | Etkilenebilir | Etkilenebilir | **Banka/ödeme alan adlarına dokunulmaz** |
 | Bellek | ~2 MB | ~150–300 MB | **~4–5 MB** (pencere kapalıyken), saf C |
-| Dosya boyutu | ~100 KB + betikler | ~100 MB | **~250 KB** (+ WinDivert) |
+| Dosya boyutu | ~100 KB + betikler | ~100 MB | **< 1 MB** (+ WinDivert) |
 
 ## İndirme
 
@@ -69,26 +70,28 @@
 3. Pencereyi kapatınca uygulama saatin yanındaki simgede çalışmaya devam eder. Simgeye tıklayınca pencere açılır, sağ tıklayınca hızlı menü gelir.
 4. **Ayarlar** menüsü: Otomatik mod, Windows ile başlat, Ödeme ve banka koruması, Günlük, Gelişmiş ayarlar.
 
-"Windows ile başlat" seçeneği, Görev Zamanlayıcı'ya yönetici yetkili bir oturum açma görevi ekler; her açılışta UAC sorusu çıkmaz.
+"Windows ile başlat" seçeneği, TurkishDPI'ı (exe, WinDivert dosyaları ve lisanslar) korumalı `C:\Program Files\TurkishDPI` klasörüne kopyalar ve Görev Zamanlayıcı'ya **o kopyayı** çalıştıran yönetici yetkili bir oturum açma görevi ekler; her açılışta UAC sorusu çıkmaz. Görev hiçbir zaman zip'i çıkardığınız klasörü (ör. İndirilenler) çalıştırmaz: o klasöre başka programlar da yazabildiği için bu, onlara UAC'sız yönetici yetkisi verirdi. Yeni bir sürümü çalıştırdığınızda korumalı kopya kendiliğinden güncellenir.
 
 ### Nasıl çalışır?
 
 1. **İnternet kontrolü** – Engelsiz sitelere (Google, Microsoft) erişim yoksa bekler, profil denemesi yapmaz.
-2. **DNS seçimi** – Standart dışı portlardaki DNS sunucularına (Yandex 77.88.8.8:1253, 77.88.8.1:1253, AdGuard 94.140.14.140:5353) sorgu atar ve yanıt veren ilkini kullanır.
+2. **DNS seçimi** – Standart dışı portlardaki temiz DNS sunucularının (Yandex :1253, AdGuard :5353, OpenDNS :5353/:443) hepsini paralel ölçer ve sahte cevap vermeyen en hızlısını seçer. Hibrit modda her sorgu hem ağınızın DNS'ine hem bu temiz sunucuya gider; ilk güvenilir cevap kullanılır. (Gizlilik notu: bu modda DNS sorgularınız seçilen temiz DNS sağlayıcısına da gider; istemezseniz ini'de `DnsHybrid=0`.)
 3. **Profil taraması** – Profilleri bu ağda öğrenilmiş başarı oranına ve hıza göre sıralar, motoru başlatır ve engelli test sitelerine (varsayılan: `discord.com`, `www.roblox.com`, `www.wattpad.com`) **gerçek TLS bağlantısı** kurar. Yeni bir ağda ilk çalışan profilden sonra iki aday daha ölçülür ve en hızlısı seçilir.
-4. **Bekçi** – Ağ değiştiğinde, uykudan uyanınca ve belirli aralıklarla test eder; çalışmıyorsa yeniden tarar. Motor çökerse yeniden başlatır.
+4. **Bekçi** – Ağ değiştiğinde, uykudan uyanınca ve belirli aralıklarla test eder. Bir test başarısız olursa 20 saniye sonra tekrar dener; ancak ikinci kez de başarısız olursa yeniden tarar. Motor çökerse yeniden başlatır.
 
 ### Profiller
 
 | Profil | Motor argümanları |
 |---|---|
-| Türkiye Standart | `-5 --set-ttl 5` + DNS |
-| Modern | `-9` + DNS |
-| Auto-TTL | `-5` + DNS |
-| Sabit TTL 3 | `--set-ttl 3` + DNS |
+| Türkiye Standart | `-5 -q --set-ttl 5` + DNS |
+| Modern | `-9` + DNS (`-9` QUIC engelini içerir) |
+| Auto-TTL | `-5 -q` + DNS |
+| Sabit TTL 3 | `-q --set-ttl 3` + DNS |
 | SNI Parçalama + Sahte SNI | `-9 --frag-by-sni --fake-with-sni www.google.com` + DNS |
 | Agresif SNI | `-9 --frag-by-sni --fake-with-sni www.google.com --fake-resend 2 --auto-ttl` + DNS |
 | Superonline (-5 / -9 / TTL 3 / SNI) | DNS yönlendirmesiz varyantlar |
+
+Profillerin tamamı QUIC/HTTP3'ü (`-q`) engeller.
 
 ### Ayarlar
 
@@ -100,7 +103,9 @@ Auto=1                 ; 1 = otomatik mod
 Preset=0               ; son çalışan profil
 Dns=0                  ; son çalışan DNS
 PaymentProtection=1    ; banka/ödeme sitelerine dokunma
-WatchdogMinutes=10     ; bekçi aralığı
+DnsHybrid=1            ; DNS sorgularını hem ağın DNS'ine hem temiz DNS'e gönder
+WatchdogMinutes=10     ; bekçi aralığı (1-240 dk)
+CheckUpdates=1         ; günde bir kez GitHub'da yeni sürüm kontrolü
 Targets=discord.com,www.roblox.com,www.wattpad.com   ; engelli test siteleri
 Control=www.google.com,www.microsoft.com             ; engelsiz kontrol siteleri
 
@@ -121,7 +126,7 @@ Eski GoodbyeDPI `.cmd` betiklerinde `goodbyedpi.exe` yerine `TurkishDPI.exe` yaz
 
 ## Sorun giderme
 
-- **Antivirüs:** TurkishDPI.exe sürücü taşımaz ve diske dosya bırakmaz. Paketteki `WinDivert64.sys`, WinDivert'in resmi imzalı sürücüsüdür; bazı üreticiler (ör. Elastic, Arctic Wolf) **her** WinDivert sürücüsünü genel bir kuralla "WinDivert" olarak etiketler. Bu, GoodbyeDPI ve zapret'te de aynıdır ve imzalı sürücü değiştirilemez. Windows Defender'ın işaretlediği şey ise WinDivert'in resmi zip arşivindeki örnek araçlardır; TurkishDPI bunları dağıtmaz. Başka bir antivirüs engellerse uygulamadaki *Ayarlar → Antivirüs sorunu yardımı* adım adım yol gösterir; TurkishDPI hiçbir zaman antivirüs ayarlarınızı kendisi değiştirmez.
+- **Antivirüs:** TurkishDPI.exe sürücü taşımaz; yalnızca "Windows ile başlat" açıkken kendisini ve WinDivert dosyalarını Program Files'a kopyalar. Exe, yanındaki `WinDivert.dll`'in resmi sürümle aynı olduğunu (SHA-256) doğrulamadan onu yüklemez. Paketteki `WinDivert64.sys`, WinDivert'in resmi imzalı sürücüsüdür; bazı üreticiler (ör. Elastic, Kaspersky "not-a-virus", Lionic) **her** WinDivert sürücüsünü genel bir kuralla "WinDivert"/"RiskTool" olarak etiketler. Bu, GoodbyeDPI ve zapret'te de aynıdır ve imzalı sürücü değiştirilemez. Windows Defender'ın işaretlediği şey ise WinDivert'in resmi zip arşivindeki örnek araçlardır; TurkishDPI bunları dağıtmaz. Başka bir antivirüs engellerse uygulamadaki *Ayarlar → Antivirüs sorunu yardımı* adım adım yol gösterir; TurkishDPI hiçbir zaman antivirüs ayarlarınızı kendisi değiştirmez.
 - **Kaspersky:** GoodbyeDPI'ı engeller; tamamen kaldırılması gerekir.
 - **Eski GoodbyeDPI / zapret hizmeti:** TurkishDPI açılışta tespit eder ve kaldırmayı önerir.
 - Ayrıntılı kayıt: menüden **Günlüğü aç**.
