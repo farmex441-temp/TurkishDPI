@@ -18,6 +18,12 @@ param(
     [string[]]$FullScaleScenarios = @("active", "active-long")
 )
 $ErrorActionPreference = "Stop"
+# "powershell -File" passes "a,b" as one string: split lists ourselves
+$Scenarios = @($Scenarios | ForEach-Object { $_ -split "," } | Where-Object { $_ })
+$Pages = @($Pages | ForEach-Object { $_ -split "," } | Where-Object { $_ })
+$FullScaleScenarios = @($FullScaleScenarios | ForEach-Object { $_ -split "," } | Where-Object { $_ })
+$Scales = @($Scales | ForEach-Object { "$_" -split "," } | Where-Object { $_ } |
+            ForEach-Object { [double]::Parse($_, [Globalization.CultureInfo]::InvariantCulture) })
 $root = Split-Path -Parent $PSScriptRoot
 Set-Location $root
 New-Item -ItemType Directory -Force $Out | Out-Null
