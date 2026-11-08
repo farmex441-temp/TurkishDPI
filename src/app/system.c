@@ -17,6 +17,7 @@
 #include <sddl.h>
 #include <shlobj.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <wchar.h>
 #include "syslib.h"
@@ -24,6 +25,7 @@
 #include "app.h"
 #include "system.h"
 #include "probe.h"
+#include "updpkg.h"
 #include "version.h"
 
 /* ---------- other bypass / VPN tools ---------- */
@@ -164,7 +166,7 @@ int sys_check_update(wchar_t *tag_out, size_t cap) {
                 t++;
                 while (*t && *t != '"' && i < 31) tag[i++] = *t++;
                 tag[i] = 0;
-                if (version_newer(tag)) {
+                if (upd_tag_ok(tag) && version_newer(tag)) {
                     MultiByteToWideChar(CP_UTF8, 0, tag, -1, tag_out, (int)cap);
                     found = 1;
                 }
@@ -536,6 +538,38 @@ static int install_one(HANDLE src, const wchar_t *dst) {
     return same || copy_from_handle(src, dst);   /* a loaded driver file cannot be replaced */
 }
 
+/* File version from the VERSIONINFO resource (major<<48 | minor<<32 |
+ * patch<<16 | build), 0 when it cannot be read. version.dll from System32. */
+typedef DWORD (WINAPI *gfvis_t)(LPCWSTR, LPDWORD);
+typedef BOOL (WINAPI *gfvi_t)(LPCWSTR, DWORD, DWORD, LPVOID);
+typedef BOOL (WINAPI *vqv_t)(LPCVOID, LPCWSTR, LPVOID *, PUINT);
+
+static unsigned long long file_version(const wchar_t *path) {
+    HMODULE v = load_system_dll(L"version.dll");
+    unsigned long long ver = 0;
+    if (v) {
+        gfvis_t size_fn = (gfvis_t)(void *)GetProcAddress(v, "GetFileVersionInfoSizeW");
+        gfvi_t info_fn = (gfvi_t)(void *)GetProcAddress(v, "GetFileVersionInfoW");
+        vqv_t query_fn = (vqv_t)(void *)GetProcAddress(v, "VerQueryValueW");
+        DWORD dummy = 0, n = size_fn ? size_fn(path, &dummy) : 0;
+        void *buf = n ? malloc(n) : NULL;
+        VS_FIXEDFILEINFO *ffi = NULL;
+        UINT len = 0;
+        if (buf && info_fn && query_fn && info_fn(path, 0, n, buf) &&
+            query_fn(buf, L"\\", (LPVOID *)&ffi, &len) && ffi && len >= sizeof(*ffi) &&
+            ffi->dwSignature == 0xFEEF04BDu)
+            ver = (unsigned long long)ffi->dwFileVersionMS << 32 | ffi->dwFileVersionLS;
+        free(buf);
+        FreeLibrary(v);
+    }
+    return ver;
+}
+
+static unsigned long long own_version(void) {
+    return (unsigned long long)TURKISHDPI_VER_MAJOR << 48 | (unsigned long long)TURKISHDPI_VER_MINOR << 32 |
+           (unsigned long long)TURKISHDPI_VER_PATCH << 16;
+}
+
 /* src/engine/windivert_dyn.c */
 int windivert_file_pinned(const wchar_t *name);
 int windivert_handle_ok(HANDLE f, const wchar_t *name);
@@ -558,7 +592,8 @@ int windivert_handle_ok(HANDLE f, const wchar_t *name);
 int sys_install_copy(HANDLE self_exe, const wchar_t *running_exe, wchar_t *installed_exe, size_t cap) {
     static const struct { const wchar_t *name; int required; } FILES[] = {
         { L"WinDivert.dll", 1 }, { L"WinDivert64.sys", 0 }, { L"WinDivert32.sys", 0 },
-        { L"LICENSE", 0 }, { L"NOTICE", 0 }, { L"WinDivert-LICENSE.txt", 0 }, { L"BENIOKU.txt", 0 },
+        { L"LICENSE", 0 }, { L"NOTICE", 0 }, { L"THIRD_PARTY_LICENSES.txt", 0 },
+        { L"WinDivert-LICENSE.txt", 0 }, { L"BENIOKU.txt", 0 },
     };
     wchar_t dst_dir[MAX_PATH], src_dir[MAX_PATH], src[MAX_PATH], dst[MAX_PATH];
     wchar_t *slash;
@@ -582,6 +617,10 @@ int sys_install_copy(HANDLE self_exe, const wchar_t *running_exe, wchar_t *insta
     installed_exe[cap - 1] = 0;
     if (!_wcsicmp(src_dir, dst_dir)) return 1;        /* already running from there */
     if (!sys_secure_dir(dst_dir, 1)) return 0;         /* admin-owned, runnable by users */
+    /* That copy may have been updated in place (one-click update while the
+     * logon task ran it): an older exe started from elsewhere never
+     * replaces it. The task keeps pointing at the newer copy. */
+    if (file_version(installed_exe) > own_version()) return 1;
 
     for (size_t i = 0; i < sizeof(FILES) / sizeof(FILES[0]); i++) {
         HANDLE h;
@@ -663,4 +702,425 @@ void sys_uninstall(const wchar_t *data_dir) {
     if (attr != INVALID_FILE_ATTRIBUTES && (attr & FILE_ATTRIBUTE_DIRECTORY) &&
         !(attr & FILE_ATTRIBUTE_REPARSE_POINT))
         sys_delete_dir(data_dir);
+}
+
+/* ---------- one-click update ---------- */
+/*
+ * Installs a newer release over the running copy, in the folder it runs
+ * from (the extracted zip, or the Program Files copy the logon task uses).
+ *
+ * What is trusted: the release files come over HTTPS from github.com (and
+ * the *.githubusercontent.com host GitHub redirects downloads to); the zip
+ * must match its line in the same release's SHA256SUMS.txt. The files are not
+ * code-signed, so this guards against a broken or altered download on the
+ * way, not against someone who controls the GitHub repository itself.
+ *
+ * The folder may be writable by ordinary programs of the user (Downloads),
+ * while this process is elevated. So every file is written under a new name
+ * created without following links, checked to be inside the folder, moved
+ * into place by a handle-relative rename, and the new exe is re-opened
+ * denying writes and deletes and compared byte by byte before it is started.
+ * WinDivert files are never replaced: if the release ships different ones,
+ * the update is refused and the release page is opened instead.
+ */
+int sha256_mem(const void *data, size_t len, unsigned char out[32]);   /* windivert_dyn.c */
+
+#ifdef _WIN64
+#define UPD_ARCH "x64"
+#define UPD_MACHINE 0x8664u
+#else
+#define UPD_ARCH "x86"
+#define UPD_MACHINE 0x14cu
+#endif
+
+/* https on github.com or *.githubusercontent.com (release downloads redirect there). */
+static int url_allowed(const wchar_t *url) {
+    static const wchar_t sfx[] = L".githubusercontent.com";
+    const size_t sl = sizeof(sfx) / sizeof(sfx[0]) - 1;
+    const wchar_t *h, *end;
+    size_t n;
+    if (_wcsnicmp(url, L"https://", 8)) return 0;
+    h = url + 8;
+    end = h + wcscspn(h, L"/:?#@\\");
+    if (*end != L'/') return 0;               /* no port, user info or odd separators */
+    n = (size_t)(end - h);
+    if (n == 10 && !_wcsnicmp(h, L"github.com", 10)) return 1;
+    return n > sl && !_wcsnicmp(end - sl, sfx, sl);
+}
+
+/* GET https://github.com<path> (redirects followed, final host checked);
+ * at most cap bytes into a malloc'ed buffer. */
+static int http_get(const char *path_a, size_t cap, unsigned char **out, size_t *len) {
+    wchar_t path[512], url[4096];
+    DWORD status = 0, sz = sizeof(status), usz = sizeof(url);
+    HINTERNET s, c = NULL, r = NULL;
+    unsigned char *buf = NULL;
+    size_t n = 0, have = 0;
+    int ok = 0;
+    *out = NULL;
+    *len = 0;
+    if (!MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, path_a, -1, path, 512)) return 0;
+    s = WinHttpOpen(L"TurkishDPI/" TURKISHDPI_VERSION_W, WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
+                    WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
+    if (!s) return 0;
+    sysdll_winhttp_tls(s);
+    WinHttpSetTimeouts(s, 10000, 15000, 30000, 30000);
+    c = WinHttpConnect(s, L"github.com", INTERNET_DEFAULT_HTTPS_PORT, 0);
+    if (c) r = WinHttpOpenRequest(c, L"GET", path, NULL, WINHTTP_NO_REFERER,
+                                  WINHTTP_DEFAULT_ACCEPT_TYPES, WINHTTP_FLAG_SECURE);
+    if (r && WinHttpSendRequest(r, WINHTTP_NO_ADDITIONAL_HEADERS, 0, WINHTTP_NO_REQUEST_DATA, 0, 0, 0) &&
+        WinHttpReceiveResponse(r, NULL) &&
+        WinHttpQueryHeaders(r, WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
+                            WINHTTP_HEADER_NAME_BY_INDEX, &status, &sz, WINHTTP_NO_HEADER_INDEX) &&
+        status == 200 && WinHttpQueryOption(r, WINHTTP_OPTION_URL, url, &usz) && url_allowed(url)) {
+        ok = 1;
+        for (;;) {
+            DWORD got = 0;
+            if (n == have) {
+                size_t nc = have ? have * 2 : 256 * 1024;
+                unsigned char *nb;
+                if (have >= cap) { ok = 0; break; }   /* larger than any real package */
+                if (nc > cap) nc = cap;
+                nb = (unsigned char *)realloc(buf, nc);
+                if (!nb) { ok = 0; break; }
+                buf = nb;
+                have = nc;
+            }
+            if (!WinHttpReadData(r, buf + n, (DWORD)(have - n), &got)) { ok = 0; break; }
+            if (!got) break;
+            n += got;
+        }
+    }
+    if (r) WinHttpCloseHandle(r);
+    if (c) WinHttpCloseHandle(c);
+    WinHttpCloseHandle(s);
+    if (!ok) { free(buf); return 0; }
+    *out = buf;
+    *len = n;
+    return 1;
+}
+
+/* The folder the exe runs from, opened without following a link; its real
+ * path in real. Files are renamed relative to this handle. */
+static HANDLE open_update_dir(const wchar_t *running_exe, wchar_t *real, DWORD cap) {
+    wchar_t dir[MAX_PATH], *slash;
+    BY_HANDLE_FILE_INFORMATION fi;
+    HANDLE h;
+    if (!GetFullPathNameW(running_exe, MAX_PATH, dir, NULL) || !(slash = wcsrchr(dir, L'\\')))
+        return INVALID_HANDLE_VALUE;
+    *slash = 0;
+    h = CreateFileW(dir, FILE_LIST_DIRECTORY | FILE_TRAVERSE | FILE_READ_ATTRIBUTES | SYNCHRONIZE,
+                    FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, NULL, OPEN_EXISTING,
+                    FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT, NULL);
+    if (h == INVALID_HANDLE_VALUE) return h;
+    if (!GetFileInformationByHandle(h, &fi) || !(fi.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) ||
+        (fi.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) || !final_path(h, real, cap)) {
+        CloseHandle(h);
+        return INVALID_HANDLE_VALUE;
+    }
+    return h;
+}
+
+/*
+ * Renames the open file f to dir\name: name only, resolved relative to the
+ * dir handle, so the target is the folder we opened whatever its path is
+ * now. NtSetInformationFile, because SetFileInformationByHandle treats the
+ * name as a full Win32 path and rejects a bare name with ERROR_INVALID_NAME
+ * (123) even when RootDirectory is set. ntdll is in every process already.
+ */
+typedef struct { union { LONG Status; PVOID Pointer; } u; ULONG_PTR Information; } upd_iosb_t;
+typedef LONG (NTAPI *nt_set_info_t)(HANDLE, upd_iosb_t *, PVOID, ULONG, int);
+#define UPD_FILE_RENAME_INFORMATION 10
+
+static int rename_in(HANDLE f, HANDLE dirh, const wchar_t *name, int replace) {
+    union { FILE_RENAME_INFO ri; BYTE b[sizeof(FILE_RENAME_INFO) + MAX_PATH * sizeof(wchar_t)]; } u;
+    static nt_set_info_t set_info;
+    upd_iosb_t io;
+    size_t n = wcslen(name);
+    if (n == 0 || n >= MAX_PATH || wcschr(name, L'\\') || wcschr(name, L'/') || wcschr(name, L':')) return 0;
+    if (!set_info) {
+        HMODULE nt = GetModuleHandleW(L"ntdll.dll");
+        set_info = nt ? (nt_set_info_t)(void *)GetProcAddress(nt, "NtSetInformationFile") : NULL;
+        if (!set_info) return 0;
+    }
+    ZeroMemory(&u, sizeof(u));
+    u.ri.ReplaceIfExists = replace ? TRUE : FALSE;
+    u.ri.RootDirectory = dirh;
+    u.ri.FileNameLength = (DWORD)(n * sizeof(wchar_t));
+    memcpy(u.ri.FileName, name, n * sizeof(wchar_t));
+    return set_info(f, &io, &u.ri, (ULONG)(sizeof(FILE_RENAME_INFO) + n * sizeof(wchar_t)),
+                    UPD_FILE_RENAME_INFORMATION) >= 0;
+}
+
+/* 1 if the open file holds exactly data[0..len) (read from the start). */
+static int handle_equals(HANDLE h, const unsigned char *data, size_t len) {
+    static unsigned char buf[65536];   /* controller thread only */
+    LARGE_INTEGER size, zero;
+    size_t pos = 0;
+    zero.QuadPart = 0;
+    if (!GetFileSizeEx(h, &size) || (unsigned long long)size.QuadPart != len ||
+        !SetFilePointerEx(h, zero, NULL, FILE_BEGIN))
+        return 0;
+    while (pos < len) {
+        DWORD want = (DWORD)(len - pos > sizeof(buf) ? sizeof(buf) : len - pos), got = 0;
+        if (!ReadFile(h, buf, want, &got, NULL) || got != want || memcmp(buf, data + pos, got)) return 0;
+        pos += got;
+    }
+    return 1;
+}
+
+/* 1 if dir\name is a plain file (no link) with exactly these bytes. */
+static int file_equals(const wchar_t *real, const wchar_t *name, const unsigned char *data, size_t len) {
+    wchar_t path[MAX_PATH];
+    BY_HANDLE_FILE_INFORMATION fi;
+    HANDLE h;
+    int same;
+    if (_snwprintf(path, MAX_PATH - 1, L"%ls\\%ls", real, name) < 0) return 0;
+    path[MAX_PATH - 1] = 0;
+    h = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, FILE_FLAG_OPEN_REPARSE_POINT, NULL);
+    if (h == INVALID_HANDLE_VALUE) return 0;
+    same = GetFileInformationByHandle(h, &fi) && !(fi.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) &&
+           handle_equals(h, data, len);
+    CloseHandle(h);
+    return same;
+}
+
+static void discard(HANDLE h) {
+    FILE_DISPOSITION_INFO di;
+    di.DeleteFile = TRUE;
+    SetFileInformationByHandle(h, FileDispositionInfo, &di, sizeof(di));
+    CloseHandle(h);
+}
+
+/* Writes data to a new file dir\name (a leftover of that name, or a link,
+ * is removed first) and returns its handle (write + delete access, no
+ * sharing), or INVALID_HANDLE_VALUE. */
+static HANDLE write_new(const wchar_t *real, const wchar_t *name, const unsigned char *data, size_t len) {
+    wchar_t path[MAX_PATH], fp[MAX_PATH * 2];
+    size_t pos = 0;
+    HANDLE h;
+    if (_snwprintf(path, MAX_PATH - 1, L"%ls\\%ls", real, name) < 0) return INVALID_HANDLE_VALUE;
+    path[MAX_PATH - 1] = 0;
+    if (!delete_object(path, real, 0)) return INVALID_HANDLE_VALUE;
+    h = CreateFileW(path, GENERIC_READ | GENERIC_WRITE | DELETE, 0, NULL, CREATE_NEW,
+                    FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OPEN_REPARSE_POINT, NULL);
+    if (h == INVALID_HANDLE_VALUE) return h;
+    if (!final_path(h, fp, MAX_PATH * 2) || !path_within(fp, real, 0)) { discard(h); return INVALID_HANDLE_VALUE; }
+    while (pos < len) {
+        DWORD chunk = (DWORD)(len - pos > (1u << 20) ? (1u << 20) : len - pos), w = 0;
+        if (!WriteFile(h, data + pos, chunk, &w, NULL) || w != chunk) { discard(h); return INVALID_HANDLE_VALUE; }
+        pos += w;
+    }
+    if (!FlushFileBuffers(h)) { discard(h); return INVALID_HANDLE_VALUE; }
+    return h;
+}
+
+/* Replaces dir\name with data unless it already holds those bytes. */
+static int replace_file(HANDLE dirh, const wchar_t *real, const wchar_t *name,
+                        const unsigned char *data, size_t len) {
+    wchar_t tmp[MAX_PATH];
+    HANDLE h;
+    if (file_equals(real, name, data, len)) return 1;
+    if (_snwprintf(tmp, MAX_PATH - 1, L"%ls.upd-new", name) < 0) return 0;
+    tmp[MAX_PATH - 1] = 0;
+    if ((h = write_new(real, tmp, data, len)) == INVALID_HANDLE_VALUE) return 0;
+    if (!rename_in(h, dirh, name, 1)) { discard(h); return 0; }
+    CloseHandle(h);
+    return 1;
+}
+
+typedef struct { const char *name; int kind; } upd_item_t;   /* kind: 0 exe, 1 WinDivert, 2 text */
+static const upd_item_t UPD_ITEMS[] = {
+    { "TurkishDPI.exe", 0 }, { "WinDivert.dll", 1 }, { "WinDivert64.sys", 1 }, { "WinDivert32.sys", 1 },
+    { "LICENSE", 2 }, { "NOTICE", 2 }, { "THIRD_PARTY_LICENSES.txt", 2 }, { "WinDivert-LICENSE.txt", 2 },
+    { "BENIOKU.txt", 2 },
+};
+#define UPD_NITEMS (sizeof(UPD_ITEMS) / sizeof(UPD_ITEMS[0]))
+
+static int same_file(const BY_HANDLE_FILE_INFORMATION *a, const BY_HANDLE_FILE_INFORMATION *b) {
+    return a->dwVolumeSerialNumber == b->dwVolumeSerialNumber && a->nFileIndexHigh == b->nFileIndexHigh &&
+           a->nFileIndexLow == b->nFileIndexLow;
+}
+
+/* Re-opens the running exe like lock_self_exe (read, no write/delete
+ * sharing) and checks it is the same file as before. */
+static HANDLE relock_self(const wchar_t *running_exe, const BY_HANDLE_FILE_INFORMATION *was) {
+    BY_HANDLE_FILE_INFORMATION fi;
+    HANDLE h = CreateFileW(running_exe, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, 0, NULL);
+    if (h == INVALID_HANDLE_VALUE) return h;
+    if (!GetFileInformationByHandle(h, &fi) || !same_file(&fi, was)) {
+        CloseHandle(h);
+        return INVALID_HANDLE_VALUE;
+    }
+    return h;
+}
+
+int sys_update_install(const wchar_t *tag_w, void **self_exe_p, const wchar_t *running_exe,
+                       void **lock_out, const char **why) {
+    HANDLE *self_exe = (HANDLE *)self_exe_p;
+    char tag[32], path[256], asset[96];
+    unsigned char *sums = NULL, *zip = NULL, *data[UPD_NITEMS];
+    size_t sums_len = 0, zip_len = 0, dlen[UPD_NITEMS];
+    unsigned char want[32], got[32];
+    wchar_t real[MAX_PATH * 2], base[MAX_PATH], tmp[MAX_PATH], old[MAX_PATH], cur[MAX_PATH];
+    wchar_t wname[64], fp[MAX_PATH * 2];
+    const wchar_t *slash;
+    BY_HANDLE_FILE_INFORMATION self_fi, fi;
+    HANDLE dirh = INVALID_HANDLE_VALUE, hn = INVALID_HANDLE_VALUE, ho = INVALID_HANDLE_VALUE, lock;
+    int rc = 0;
+
+    *lock_out = INVALID_HANDLE_VALUE;
+    *why = "";
+    memset(data, 0, sizeof(data));
+    memset(dlen, 0, sizeof(dlen));
+    if (!WideCharToMultiByte(CP_UTF8, 0, tag_w, -1, tag, sizeof(tag), NULL, NULL) || !upd_tag_ok(tag)) {
+        *why = "bad tag";
+        return 0;
+    }
+    snprintf(asset, sizeof(asset), "TurkishDPI-%s-" UPD_ARCH ".zip", tag);
+
+    /* 1. checksums, then the package, checked against them */
+    snprintf(path, sizeof(path), TURKISHDPI_REPO_PATH_A "/releases/download/%s/SHA256SUMS.txt", tag);
+    if (!http_get(path, 64 * 1024, &sums, &sums_len)) { *why = "download SHA256SUMS.txt"; goto out; }
+    if (!upd_sums_find((const char *)sums, sums_len, asset, want)) { *why = "zip not in SHA256SUMS.txt"; goto out; }
+    snprintf(path, sizeof(path), TURKISHDPI_REPO_PATH_A "/releases/download/%s/%s", tag, asset);
+    if (!http_get(path, 64u * 1024 * 1024, &zip, &zip_len)) { *why = "download zip"; goto out; }
+    if (!sha256_mem(zip, zip_len, got) || memcmp(want, got, 32) != 0) { *why = "zip SHA-256 mismatch"; goto out; }
+
+    /* 2. the files we take from it */
+    for (size_t i = 0; i < UPD_NITEMS; i++) {
+        int r = upd_zip_extract(zip, zip_len, UPD_ITEMS[i].name, &data[i], &dlen[i]);
+        if (r < 0) { *why = "broken zip"; goto out; }
+        if (r == 0 && UPD_ITEMS[i].kind == 0) { *why = "no exe in zip"; goto out; }
+    }
+    if (upd_pe_machine(data[0], dlen[0]) != UPD_MACHINE) { *why = "exe for another CPU"; goto out; }
+
+    /* 3. where we run from: the folder, and the exe's real (long) name in it
+     * taken from its locked handle - the start path may use 8.3 names */
+    if ((dirh = open_update_dir(running_exe, real, MAX_PATH * 2)) == INVALID_HANDLE_VALUE) {
+        *why = "open folder";
+        goto out;
+    }
+    if (!final_path(*self_exe, fp, MAX_PATH * 2) || !path_within(fp, real, 0) ||
+        !(slash = wcsrchr(fp, L'\\')) || slash != fp + wcslen(real) || wcslen(slash + 1) + 24 >= MAX_PATH) {
+        *why = "exe path";
+        goto out;
+    }
+    wcscpy(base, slash + 1);
+    if (_snwprintf(cur, MAX_PATH - 1, L"%ls\\%ls", real, base) < 0) { *why = "exe path"; goto out; }
+    cur[MAX_PATH - 1] = 0;
+
+    /* 4. WinDivert must stay as it is: the running build pins these files */
+    for (size_t i = 0; i < UPD_NITEMS; i++) {
+        wchar_t p[MAX_PATH];
+        if (UPD_ITEMS[i].kind != 1 || !data[i]) continue;
+        MultiByteToWideChar(CP_UTF8, 0, UPD_ITEMS[i].name, -1, wname, 64);
+        _snwprintf(p, MAX_PATH - 1, L"%ls\\%ls", real, wname);
+        p[MAX_PATH - 1] = 0;
+        if (GetFileAttributesW(p) != INVALID_FILE_ATTRIBUTES && !file_equals(real, wname, data[i], dlen[i])) {
+            *why = "new WinDivert files (manual update needed)";
+            rc = -1;
+            goto out;
+        }
+    }
+
+    /* 5. texts (licences, read-me): best effort */
+    for (size_t i = 0; i < UPD_NITEMS; i++) {
+        if (UPD_ITEMS[i].kind != 2 || !data[i]) continue;
+        MultiByteToWideChar(CP_UTF8, 0, UPD_ITEMS[i].name, -1, wname, 64);
+        replace_file(dirh, real, wname, data[i], dlen[i]);
+    }
+
+    /* 6. the exe: new file ready, running one moved aside, new one in place */
+    _snwprintf(tmp, MAX_PATH - 1, L"%ls.upd-new", base);
+    tmp[MAX_PATH - 1] = 0;
+    _snwprintf(old, MAX_PATH - 1, L"%ls.%lu.old", base, GetTickCount());
+    old[MAX_PATH - 1] = 0;
+    if ((hn = write_new(real, tmp, data[0], dlen[0])) == INVALID_HANDLE_VALUE) { *why = "write exe"; goto out; }
+    if (!GetFileInformationByHandle(*self_exe, &self_fi)) { *why = "self info"; goto out; }
+    CloseHandle(*self_exe);       /* it denies delete sharing, which the rename needs */
+    *self_exe = INVALID_HANDLE_VALUE;
+    ho = CreateFileW(cur, DELETE | SYNCHRONIZE | FILE_READ_ATTRIBUTES,
+                     FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, NULL, OPEN_EXISTING,
+                     FILE_FLAG_OPEN_REPARSE_POINT, NULL);
+    if (ho == INVALID_HANDLE_VALUE || !GetFileInformationByHandle(ho, &fi) || !same_file(&fi, &self_fi)) {
+        *why = "running exe not found in its folder";
+        goto relock;
+    }
+    if (!rename_in(ho, dirh, old, 0)) { *why = "move running exe aside"; goto relock; }
+    if (!rename_in(hn, dirh, base, 0)) {
+        rename_in(ho, dirh, base, 0);   /* put the running one back */
+        *why = "move new exe in place";
+        goto relock;
+    }
+    CloseHandle(hn);
+    hn = INVALID_HANDLE_VALUE;
+    CloseHandle(ho);
+    ho = INVALID_HANDLE_VALUE;
+
+    /* 7. the file that will be started: locked against changes, verified */
+    lock = CreateFileW(cur, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, FILE_FLAG_OPEN_REPARSE_POINT, NULL);
+    if (lock == INVALID_HANDLE_VALUE || !GetFileInformationByHandle(lock, &fi) || fi.nNumberOfLinks != 1 ||
+        (fi.dwFileAttributes & (FILE_ATTRIBUTE_REPARSE_POINT | FILE_ATTRIBUTE_DIRECTORY)) ||
+        !final_path(lock, fp, MAX_PATH * 2) || _wcsicmp(fp, cur) != 0 || !handle_equals(lock, data[0], dlen[0])) {
+        if (lock != INVALID_HANDLE_VALUE) CloseHandle(lock);
+        *why = "new exe changed after writing";
+        rc = -2;    /* the running exe is already moved aside */
+        goto out;
+    }
+    *lock_out = lock;
+    rc = 1;
+    goto out;
+
+relock:
+    /* our own DELETE handle on the running exe would make the re-lock
+     * (which denies delete sharing) fail */
+    if (ho != INVALID_HANDLE_VALUE) { CloseHandle(ho); ho = INVALID_HANDLE_VALUE; }
+    *self_exe = relock_self(running_exe, &self_fi);
+    if (*self_exe == INVALID_HANDLE_VALUE) rc = -2;
+out:
+    if (hn != INVALID_HANDLE_VALUE) discard(hn);
+    if (ho != INVALID_HANDLE_VALUE) CloseHandle(ho);
+    if (dirh != INVALID_HANDLE_VALUE) CloseHandle(dirh);
+    for (size_t i = 0; i < UPD_NITEMS; i++) free(data[i]);
+    free(zip);
+    free(sums);
+    return rc;
+}
+
+/* Removes what an update left in the exe's folder: the previous exe (moved
+ * aside while it ran) and unfinished writes. Only our own name patterns. */
+void sys_update_cleanup(const wchar_t *running_exe) {
+    static const wchar_t *pats[] = { L"*.old", L"*.upd-new" };
+    wchar_t real[MAX_PATH * 2], pat[MAX_PATH], path[MAX_PATH], longp[MAX_PATH];
+    const wchar_t *slash;
+    WIN32_FIND_DATAW fd;
+    HANDLE dirh, f;
+    size_t bl;
+    /* the long file name: the start path may use 8.3 names */
+    if (!GetLongPathNameW(running_exe, longp, MAX_PATH) || !(slash = wcsrchr(longp, L'\\'))) return;
+    bl = wcslen(slash + 1);
+    if ((dirh = open_update_dir(running_exe, real, MAX_PATH * 2)) == INVALID_HANDLE_VALUE) return;
+    for (int k = 0; k < 2; k++) {
+        if (_snwprintf(pat, MAX_PATH - 1, L"%ls\\%ls", real, pats[k]) < 0) continue;
+        pat[MAX_PATH - 1] = 0;
+        f = FindFirstFileW(pat, &fd);
+        if (f == INVALID_HANDLE_VALUE) continue;
+        do {
+            size_t n = wcslen(fd.cFileName);
+            int ours;
+            if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
+            if (k == 0)   /* "<exe name>.<number>.old" */
+                ours = n > bl + 5 && !_wcsnicmp(fd.cFileName, slash + 1, bl) && fd.cFileName[bl] == L'.' &&
+                       !_wcsicmp(fd.cFileName + n - 4, L".old");
+            else          /* "<name>.upd-new" */
+                ours = n > 8 && !_wcsicmp(fd.cFileName + n - 8, L".upd-new");
+            if (!ours) continue;
+            if (_snwprintf(path, MAX_PATH - 1, L"%ls\\%ls", real, fd.cFileName) < 0) continue;
+            path[MAX_PATH - 1] = 0;
+            delete_object(path, real, 0);
+        } while (FindNextFileW(f, &fd));
+        FindClose(f);
+    }
+    CloseHandle(dirh);
 }

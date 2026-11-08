@@ -23,7 +23,7 @@ BEGIN
       VALUE "FileDescription",  "TurkishDPI - otomatik DPI atlatma"
       VALUE "FileVersion",      TURKISHDPI_VERSION_A
       VALUE "InternalName",     "TurkishDPI"
-      VALUE "LegalCopyright",   "Apache-2.0. GoodbyeDPI (ValdikSS), GoodbyeDPI-Turkey (cagritaskn)"
+      VALUE "LegalCopyright",   "Apache-2.0. Packet engine core: Shroudly (umutxyp, MIT)"
       VALUE "OriginalFilename", "TurkishDPI.exe"
       VALUE "ProductName",      "TurkishDPI"
       VALUE "ProductVersion",   TURKISHDPI_VERSION_A

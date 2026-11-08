@@ -398,7 +398,11 @@ static int banner_kind(const ui_state_t *st, int *others) {
 }
 
 static void banner_text(const ui_state_t *st, int kind, wchar_t *buf, int n) {
-    if (kind == 1)
+    if (kind == 1 && st->update_state == 1)
+        _snwprintf(buf, n - 1, L"Güncelleniyor: %ls…", st->update_tag);
+    else if (kind == 1 && st->update_state == 2)
+        _snwprintf(buf, n - 1, L"Güncelleme yapılamadı: %ls", st->update_tag);
+    else if (kind == 1)
         _snwprintf(buf, n - 1, L"Yeni sürüm hazır: %ls", st->update_tag);
     else if (kind == 2)
         _snwprintf(buf, n - 1, L"%ls", L"Bozuk bir proxy ayarı bulundu");
@@ -407,6 +411,11 @@ static void banner_text(const ui_state_t *st, int kind, wchar_t *buf, int n) {
     else
         buf[0] = 0;
     buf[n - 1] = 0;
+}
+
+/* what the update banner's button does in each step */
+static const wchar_t *update_action(const ui_state_t *st) {
+    return st->update_state == 1 ? L"" : st->update_state == 2 ? L"Sayfa →" : L"Güncelle →";
 }
 
 static int ok_count(const ui_state_t *st) {
@@ -1234,8 +1243,8 @@ static void draw_item(const DRAWITEMSTRUCT *d) {
             RECT ar = r;
             ar.right -= S(12);
             if (bk == 3) _snwprintf(act, 23, L"+%d", others);
-            else if (others) _snwprintf(act, 23, L"+%d  %ls", others, bk == 1 ? L"İndir →" : L"Onar →");
-            else _snwprintf(act, 23, L"%ls", bk == 1 ? L"İndir →" : L"Onar →");
+            else if (others) _snwprintf(act, 23, L"+%d  %ls", others, bk == 1 ? update_action(&st) : L"Onar →");
+            else _snwprintf(act, 23, L"%ls", bk == 1 ? update_action(&st) : L"Onar →");
             act[23] = 0;
             text(mem, f_label, bk == 3 ? P->text2 : P->focus, ar, act, DT_RIGHT | DT_VCENTER | DT_SINGLELINE);
         }
@@ -1454,7 +1463,8 @@ static void do_click(int id) {
         break;
     case ID_BANNER: {
         int others, bk = banner_kind(&st, &others);
-        if (bk == 1) command(IDM_UPDATE);
+        if (bk == 1 && st.update_state == 0) post_cmd(CMD_UPDATE, 0);   /* one-click update */
+        else if (bk == 1 && st.update_state == 2) command(IDM_UPDATE);  /* failed: release page */
         else if (bk == 2) command(IDM_PROXY);
         break;
     }
@@ -1737,6 +1747,9 @@ static LRESULT CALLBACK wndproc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
         if (IsWindowVisible(h)) update_controls();
         spinner_update();
         return 0;
+    case WM_UPDATE_DONE:   /* posted by our own controller thread only */
+        if (!g_ui_preview) app_update_done((int)wp);
+        return 0;
     case WM_CLOSE:
         if (g_ui_preview) { DestroyWindow(h); PostQuitMessage(0); return 0; }
         ShowWindow(h, SW_HIDE);
@@ -1965,13 +1978,19 @@ static int preview_fill(const char *name) {
         g_ui.st_packets = 0;
         pv_state(ST_ERROR, L"Çalışan profil bulunamadı", L"Günlük dosyasına bakın");
     } else if (!strcmp(name, "banner-update")) {
-        wcscpy(g_ui.update_tag, L"v1.2.0");
+        wcscpy(g_ui.update_tag, L"v2.0.2");
+    } else if (!strcmp(name, "banner-updating")) {
+        wcscpy(g_ui.update_tag, L"v2.0.2");
+        g_ui.update_state = 1;
+    } else if (!strcmp(name, "banner-update-failed")) {
+        wcscpy(g_ui.update_tag, L"v2.0.2");
+        g_ui.update_state = 2;
     } else if (!strcmp(name, "banner-proxy")) {
         g_ui.proxy_broken = 1;
     } else if (!strcmp(name, "banner-rival")) {
         wcscpy(g_ui.rival, L"GoodbyeDPI");
     } else if (!strcmp(name, "banner-multi")) {
-        wcscpy(g_ui.update_tag, L"v1.2.0");
+        wcscpy(g_ui.update_tag, L"v2.0.2");
         g_ui.proxy_broken = 1;
         wcscpy(g_ui.rival, L"GoodbyeDPI");
     } else if (!strcmp(name, "manual")) {

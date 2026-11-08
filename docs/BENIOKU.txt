@@ -20,6 +20,10 @@ KULLANIM
                   Ödeme koruması, Günlüğü aç, Kaldır ve temizle
    Klavye (Tab, Boşluk, Enter) ve ekran okuyucularla (Ekran Okuyucusu,
    NVDA) kullanılabilir.
+6) Yeni sürüm çıkınca pencerenin üstünde "Yeni sürüm hazır" yazar.
+   "Güncelle" düğmesine basın: TurkishDPI yeni sürümü GitHub'dan indirir,
+   doğrular, kendini aynı klasörde değiştirir ve yeniden açılır. Ayarlarınız
+   korunur. Güncelleme olmazsa düğme indirme sayfasını açar.
 
 ÖNEMLİ
 - WinDivert.dll ve WinDivert64.sys dosyaları TurkishDPI.exe ile aynı

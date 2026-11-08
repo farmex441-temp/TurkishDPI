@@ -17,5 +17,17 @@ int  sys_install_dir(wchar_t *out, size_t cap);
 /* self_exe: handle to the running exe file (see g_self_exe in app.c) */
 int  sys_install_copy(void *self_exe, const wchar_t *running_exe, wchar_t *installed_exe, size_t cap);
 void sys_uninstall_install_dir(const wchar_t *running_exe);
+/*
+ * One-click update to release tag (e.g. L"v2.0.2") in the exe's own folder.
+ * self_exe: the running exe's lock handle (closed, and re-opened on failure).
+ * Returns 1 with *lock_out = the new exe opened read-only without write/delete
+ * sharing (start it, keep the handle until exit); 0 failed, nothing changed;
+ * -1 refused (the release changes WinDivert: update by hand); -2 failed after
+ * the running exe was moved: the app must not go on (restart it by hand).
+ * why: short English reason for the log.
+ */
+int  sys_update_install(const wchar_t *tag, void **self_exe, const wchar_t *running_exe,
+                        void **lock_out, const char **why);
+void sys_update_cleanup(const wchar_t *running_exe);
 
 #endif

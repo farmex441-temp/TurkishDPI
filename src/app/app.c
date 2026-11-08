@@ -47,6 +47,10 @@ static wchar_t g_dir[MAX_PATH], g_exe[MAX_PATH];
  * be renamed and swapped for another file while we run, and it is what gets
  * copied into Program Files for the logon task (sys_install_copy). */
 static HANDLE g_self_exe = INVALID_HANDLE_VALUE;
+static HANDLE g_mutex;                /* single-instance mutex (owned by the UI thread) */
+/* One-click update: the new exe, opened without write/delete sharing until
+ * it has been started (sys_update_install). */
+static HANDLE g_update_lock = INVALID_HANDLE_VALUE;
 static HANDLE g_job, g_cmd_event, g_net_event, g_resume_event, g_quit_event;
 static CRITICAL_SECTION g_log_lock;   /* file I/O never blocks the UI's g_lock */
 /* Small command queue: clicks are never lost or merged (UI -> controller). */
@@ -783,6 +787,9 @@ static DWORD WINAPI update_thread(LPVOID u) {
     /* Waits on an event instead of sleeping: the thread ends at once on exit,
      * and nothing here looks like a long "sleep to outwait a sandbox". */
     if (WaitForSingleObject(g_quit_event, 20000) == WAIT_OBJECT_0) return 0;
+    /* the previous exe of a one-click update (gone from memory by now) */
+    sys_update_cleanup(g_exe);
+    if (!ini_int(L"CheckUpdates", 1)) return 0;
     for (;;) {
         wchar_t tag[32];
         if (sys_check_update(tag, 32)) {
@@ -1158,6 +1165,42 @@ static void site_test(const wchar_t *raw) {
         auto_scan();
 }
 
+/* CMD_UPDATE (controller thread): download, verify and put the new release
+ * in place; the UI thread then restarts into it (app_update_done). */
+static void update_install(void) {
+    wchar_t tag[32];
+    void *lock = INVALID_HANDLE_VALUE;
+    const char *why = "";
+    int r;
+    EnterCriticalSection(&g_lock);
+    wcscpy(tag, g_ui.update_tag);
+    if (tag[0]) g_ui.update_state = 1;
+    LeaveCriticalSection(&g_lock);
+    if (!tag[0]) return;
+    ui_refresh();
+    log_line("update: installing %ls", tag);
+    r = sys_update_install(tag, (void **)&g_self_exe, g_exe, &lock, &why);
+    if (r == 1) {
+        log_line("update: %ls is in place, restarting", tag);
+        g_update_lock = (HANDLE)lock;
+        InterlockedExchange(&g_quitting, 1);   /* start nothing more: the UI restarts us */
+        PostMessageW(ui_hwnd(), WM_UPDATE_DONE, 1, 0);
+        return;
+    }
+    log_line("update: failed (%s)", why);
+    if (r == -2) {
+        InterlockedExchange(&g_quitting, 1);
+        PostMessageW(ui_hwnd(), WM_UPDATE_DONE, 2, 0);
+        return;
+    }
+    EnterCriticalSection(&g_lock);
+    g_ui.update_state = 2;
+    LeaveCriticalSection(&g_lock);
+    ui_refresh();
+    /* the release changes WinDivert: that takes the zip from the page */
+    if (r == -1) app_open_url(TURKISHDPI_RELEASES_URL);
+}
+
 /* ---------- controller thread ---------- */
 static DWORD WINAPI controller(LPVOID unused) {
     OVERLAPPED ov;
@@ -1239,6 +1282,10 @@ static DWORD WINAPI controller(LPVOID unused) {
                               if (g_auto) auto_scan(); else manual_start(g_preset);
                               break;
             case CMD_AUTOSTART: autostart_set((int)arg);
+                              if (interrupted && g_auto && !g_paused) auto_scan();
+                              break;
+            case CMD_UPDATE:  update_install();
+                              if (g_quitting) return 0;
                               if (interrupted && g_auto && !g_paused) auto_scan();
                               break;
             case CMD_TESTSITE: {
@@ -1594,6 +1641,67 @@ static void check_conflicts(void) {
     CloseServiceHandle(scm);
 }
 
+/*
+ * UI thread, after update_install: how 1 = the new exe is in place, start it;
+ * 2 = the update broke off after the running exe was moved aside.
+ * Everything is stopped first and the single-instance mutex released, so the
+ * new version (whatever it does at start) finds no running instance.
+ */
+void app_update_done(int how) {
+    NOTIFYICONDATAW n;
+    STARTUPINFOW si;
+    PROCESS_INFORMATION pi;
+    wchar_t cmd[MAX_PATH + 32], image[MAX_PATH * 2];
+    DWORD il = MAX_PATH * 2;
+    int hidden = !IsWindowVisible(ui_hwnd()), started = 0;
+    ZeroMemory(&n, sizeof(n));
+    n.cbSize = sizeof(n);
+    n.hWnd = ui_hwnd();
+    n.uID = 1;
+    Shell_NotifyIconW(NIM_DELETE, &n);
+    stop_controller(5000);
+    engine_stop();
+    if (how != 1 || g_update_lock == INVALID_HANDLE_VALUE) {
+        log_line("update: stopped, the program must be started again by hand");
+        MessageBoxW(NULL, L"Güncelleme yarıda kaldı. TurkishDPI kapatılıyor.\n\n"
+                          L"TurkishDPI.exe'yi yeniden açın; açılmazsa son sürümü GitHub'dan indirin.",
+                    L"TurkishDPI", MB_ICONERROR);
+        ExitProcess(1);
+    }
+    if (g_mutex) { ReleaseMutex(g_mutex); CloseHandle(g_mutex); g_mutex = NULL; }
+    _snwprintf(cmd, MAX_PATH + 31, L"\"%ls\"%ls", g_exe, hidden ? L" --tray" : L"");
+    cmd[MAX_PATH + 31] = 0;
+    ZeroMemory(&si, sizeof(si));
+    si.cb = sizeof(si);
+    /* started suspended and resumed only if the process runs exactly the
+     * file we wrote and still hold locked */
+    if (CreateProcessW(g_exe, cmd, NULL, NULL, FALSE, CREATE_SUSPENDED, NULL, NULL, &si, &pi)) {
+        /* same file? compared by volume and file ID, not by name (the start
+         * path may use 8.3 names) */
+        BY_HANDLE_FILE_INFORMATION a, b;
+        HANDLE img = INVALID_HANDLE_VALUE;
+        if (QueryFullProcessImageNameW(pi.hProcess, 0, image, &il))
+            img = CreateFileW(image, FILE_READ_ATTRIBUTES, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                              NULL, OPEN_EXISTING, 0, NULL);
+        if (img != INVALID_HANDLE_VALUE && GetFileInformationByHandle(img, &a) &&
+            GetFileInformationByHandle(g_update_lock, &b) && a.dwVolumeSerialNumber == b.dwVolumeSerialNumber &&
+            a.nFileIndexHigh == b.nFileIndexHigh && a.nFileIndexLow == b.nFileIndexLow &&
+            ResumeThread(pi.hThread) != (DWORD)-1) {
+            started = 1;
+        } else {
+            TerminateProcess(pi.hProcess, 1);
+        }
+        if (img != INVALID_HANDLE_VALUE) CloseHandle(img);
+        CloseHandle(pi.hThread);
+        CloseHandle(pi.hProcess);
+    }
+    log_line(started ? "update: new version started" : "update: new version could not be started");
+    if (!started)
+        MessageBoxW(NULL, L"Yeni sürüm kuruldu ama başlatılamadı. TurkishDPI.exe'yi yeniden açın.",
+                    L"TurkishDPI", MB_ICONWARNING);
+    ExitProcess(0);
+}
+
 void app_exit(void) {
     NOTIFYICONDATAW n;
     ZeroMemory(&n, sizeof(n));
@@ -1673,7 +1781,7 @@ static int app_main(int quiet) {
     JOBOBJECT_EXTENDED_LIMIT_INFORMATION jl;
     wchar_t *pd = NULL;
 
-    mtx = instance_mutex();
+    mtx = g_mutex = instance_mutex();
     if (!mtx) {
         if (!quiet)
             MessageBoxW(NULL, L"TurkishDPI başlatılamadı: tek örnek kilidi oluşturulamadı.",
@@ -1746,7 +1854,7 @@ static int app_main(int quiet) {
 
     g_controller = CreateThread(NULL, 256 * 1024, controller, NULL, STACK_SIZE_PARAM_IS_A_RESERVATION,
                                 &g_controller_id);
-    if (!g_selftest && ini_int(L"CheckUpdates", 1)) {
+    if (!g_selftest) {   /* clean-up after an update, then the update check */
         t = CreateThread(NULL, 64 * 1024, update_thread, NULL, STACK_SIZE_PARAM_IS_A_RESERVATION, NULL);
         if (t) CloseHandle(t);
     }

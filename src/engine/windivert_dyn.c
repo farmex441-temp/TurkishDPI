@@ -1,8 +1,8 @@
 /*
  * TurkishDPI - runtime loader for WinDivert.dll.
  *
- * GoodbyeDPI links WinDivert.dll at load time, so a missing DLL (typically
- * quarantined by an antivirus, or an exe copied without its folder) makes
+ * Linking WinDivert.dll at load time would make a missing DLL (typically
+ * quarantined by an antivirus, or an exe copied without its folder) make
  * Windows refuse to start the program with a cryptic system dialog.
  * TurkishDPI loads it on first use instead, so the app always starts and can
  * explain the problem in plain words.
@@ -45,15 +45,8 @@ static struct {
     pParse parse; pCalc calc;
 } wd = { INIT_ONCE_STATIC_INIT, FALSE, ERROR_MOD_NOT_FOUND, 0, 0, 0, 0, 0, 0, 0 };
 
-#if defined(WINDIVERT_DLL_SHA256) || defined(WINDIVERT_SYS64_SHA256) || defined(WINDIVERT_SYS32_SHA256)
-#define WD_PINNED 1
-/*
- * The DLL next to the exe is loaded into an elevated process, and that folder
- * may be writable by ordinary users (a zip extracted to Downloads). Its
- * SHA-256 is fixed at build time (Makefile: taken from the checksum-pinned
- * WinDivert archive) and checked here on an open handle that denies writes
- * and deletes, so the file cannot be swapped between the check and the load.
- */
+/* SHA-256 through bcrypt.dll (System32 only). Used for the WinDivert pins
+ * below and for update packages (src/app/system.c). */
 typedef LONG (WINAPI *bc_open_t)(void **, LPCWSTR, LPCWSTR, ULONG);
 typedef LONG (WINAPI *bc_create_t)(void *, void **, PUCHAR, ULONG, PUCHAR, ULONG, ULONG);
 typedef LONG (WINAPI *bc_data_t)(void *, PUCHAR, ULONG, ULONG);
@@ -61,13 +54,14 @@ typedef LONG (WINAPI *bc_finish_t)(void *, PUCHAR, ULONG, ULONG);
 typedef LONG (WINAPI *bc_destroy_t)(void *);
 typedef LONG (WINAPI *bc_close_t)(void *, ULONG);
 
-static BOOL sha256_of_handle(HANDLE f, unsigned char out[32]) {
+/* next() hands out the data piece by piece: 1 and a piece, 0 at the end, -1 on error. */
+typedef int (*sha_next_t)(void *ctx, const unsigned char **p, ULONG *n);
+
+static BOOL sha256_run(sha_next_t next, void *ctx, unsigned char out[32]) {
     HMODULE bc = load_system_dll(L"bcrypt.dll");
     bc_open_t bopen; bc_create_t bcreate; bc_data_t bdata; bc_finish_t bfinish;
     bc_destroy_t bdestroy; bc_close_t bclose;
     void *alg = NULL, *hash = NULL;
-    unsigned char buf[16384];
-    DWORD got;
     BOOL ok = FALSE;
     if (!bc) return FALSE;
     bopen = (bc_open_t)(void *)GetProcAddress(bc, "BCryptOpenAlgorithmProvider");
@@ -79,9 +73,12 @@ static BOOL sha256_of_handle(HANDLE f, unsigned char out[32]) {
     if (bopen && bcreate && bdata && bfinish && bdestroy && bclose &&
         bopen(&alg, L"SHA256", NULL, 0) == 0) {
         if (bcreate(alg, &hash, NULL, 0, NULL, 0, 0) == 0) {
+            const unsigned char *p;
+            ULONG n;
+            int r;
             ok = TRUE;
-            while (ok && ReadFile(f, buf, sizeof(buf), &got, NULL) && got)
-                ok = bdata(hash, buf, got, 0) == 0;
+            while (ok && (r = next(ctx, &p, &n)) != 0)
+                ok = r > 0 && bdata(hash, (PUCHAR)p, n, 0) == 0;
             ok = ok && bfinish(hash, out, 32, 0) == 0;
             bdestroy(hash);
         }
@@ -89,6 +86,57 @@ static BOOL sha256_of_handle(HANDLE f, unsigned char out[32]) {
     }
     FreeLibrary(bc);
     return ok;
+}
+
+typedef struct { const unsigned char *p; size_t left; } mem_src_t;
+
+static int mem_next(void *ctx, const unsigned char **p, ULONG *n) {
+    mem_src_t *m = (mem_src_t *)ctx;
+    size_t take = m->left > (1u << 20) ? (1u << 20) : m->left;
+    if (!take) return 0;
+    *p = m->p;
+    *n = (ULONG)take;
+    m->p += take;
+    m->left -= take;
+    return 1;
+}
+
+int sha256_mem(const void *data, size_t len, unsigned char out[32]) {
+    mem_src_t m;
+    m.p = (const unsigned char *)data;
+    m.left = len;
+    if (!len) {   /* bcrypt needs no data call for an empty input */
+        static const unsigned char z = 0;
+        m.p = &z;
+    }
+    return sha256_run(mem_next, &m, out) ? 1 : 0;
+}
+
+#if defined(WINDIVERT_DLL_SHA256) || defined(WINDIVERT_SYS64_SHA256) || defined(WINDIVERT_SYS32_SHA256)
+#define WD_PINNED 1
+/*
+ * The DLL next to the exe is loaded into an elevated process, and that folder
+ * may be writable by ordinary users (a zip extracted to Downloads). Its
+ * SHA-256 is fixed at build time (Makefile: taken from the checksum-pinned
+ * WinDivert archive) and checked here on an open handle that denies writes
+ * and deletes, so the file cannot be swapped between the check and the load.
+ */
+typedef struct { HANDLE f; unsigned char buf[16384]; } file_src_t;
+
+static int file_next(void *ctx, const unsigned char **p, ULONG *n) {
+    file_src_t *s = (file_src_t *)ctx;
+    DWORD got;
+    if (!ReadFile(s->f, s->buf, sizeof(s->buf), &got, NULL)) return -1;
+    if (!got) return 0;
+    *p = s->buf;
+    *n = got;
+    return 1;
+}
+
+static BOOL sha256_of_handle(HANDLE f, unsigned char out[32]) {
+    file_src_t s;          /* 16 KB on the caller's stack, as before */
+    s.f = f;
+    return sha256_run(file_next, &s, out);
 }
 
 static BOOL hash_matches(const unsigned char h[32], const char *hex) {

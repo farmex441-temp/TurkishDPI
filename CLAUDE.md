@@ -67,7 +67,11 @@ src/app/            the app (controller, UI, probes, learning)
                     `sysdll_winhttp_tls` turns on TLS 1.2 on Windows 7/8.0
   system.c/.h       rival tools, broken system proxy repair, GitHub update check,
                     admin-only data folder (sys_secure_dir), protected
-                    Program Files copy for autostart (sys_install_copy), uninstall
+                    Program Files copy for autostart (sys_install_copy, never
+                    replaces a newer copy), uninstall, one-click update
+                    (sys_update_install / sys_update_cleanup)
+  updpkg.c/.h       update package reader: SHA256SUMS.txt lookup, zip (stored
+                    + own inflate, CRC-32), tag and PE checks; pure C, unit tested
   presets.h         strategy presets ({DNS} placeholder) and clean DNS servers
   version.h         version + GitHub URLs
   TurkishDPI.rc, .exe.manifest, res/*.ico   resources (icons from tools/make_icons.py)
@@ -91,7 +95,9 @@ src/engine/         the packet engine
                     that also works on Windows 7 without KB2533623
 tests/              unit tests (no admin): core/test_{proto,tcpdpi,udpdpi,rawscope}.c
                     (Shroudly's, strategy parts removed), exclude_test.c, dns_test.c,
-                    diag_test.c, windivert_hash_test.c (DLL + driver pinning, uses a
+                    diag_test.c, updpkg_test.c (+ updpkg_vectors.h from Python's
+                    zlib; `updpkg_test pkg.zip name file` checks a real zip),
+                    xlate_test.c, windivert_hash_test.c (DLL + driver pinning, uses a
                     stand-in DLL, never the driver); manual tools:
                     probe_test.c (network/latency/diagnosis), hosts_test.c
                     (DNS answer + TCP+TLS per host, e.g. Discord endpoints),
@@ -127,6 +133,28 @@ Runtime data: `%ProgramData%\TurkishDPI\` (admin-owned, protected DACL):
   check is repeated after 20 s, only a repeated failure rescans. Network
   changes are debounced (4 s quiet, 20 s max). Partial mode only rescans if
   it gets worse. Watchdog successes count in the learning stats once an hour.
+- **One-click update** (2.0.1): the update thread finds a newer
+  `releases/latest` tag (digits and dots only); the banner's "Güncelle →"
+  posts `CMD_UPDATE`; the controller (`update_install` -> `sys_update_install`)
+  downloads `SHA256SUMS.txt` and `TurkishDPI-<tag>-<x64|x86>.zip` from
+  github.com (final URL must be github.com or *.githubusercontent.com, https),
+  checks the zip's SHA-256, extracts TurkishDPI.exe (+ licence/read-me texts)
+  and refuses (-1, opens the release page) if the zip's WinDivert files differ
+  from the ones next to the exe. In the exe's own folder (often user-writable):
+  new files are created CREATE_NEW without following links, checked inside the
+  folder, and renamed relative to the folder handle with
+  `NtSetInformationFile` (SetFileInformationByHandle rejects a bare name with
+  error 123); the running exe (lock handle closed first) is renamed to
+  `<name>.<tick>.old`, the new one put in place, re-opened read-only without
+  delete sharing and compared byte by byte. On failure the running exe is
+  renamed back and re-locked (our DELETE handle must be closed first) and the
+  banner says "Güncelleme yapılamadı". On success the UI thread
+  (`app_update_done`) stops controller + engine, releases the instance mutex,
+  starts the new exe suspended, resumes it only if its image is the locked
+  file (volume + file ID), and exits. The next start (>= 2.0.1) deletes
+  `<name>.*.old` / `*.upd-new` after 20 s (`sys_update_cleanup`).
+  Not code-signed: protects against broken/altered downloads, not against a
+  compromised GitHub account (say so in docs).
 - **Explained decisions**: every scan/start has a reason (`set_reason`,
   `WHY_*`): logged as `scan: reason=…` / `decision: preset N … reason=…` and
   shown after the profile name in the window.
@@ -185,6 +213,7 @@ Unit tests (run them under sanitizers when touching engine parsing code):
 ```bash
 x86_64-w64-mingw32-gcc -g -O1 -fsanitize=undefined,address -Isrc/engine tests/dns_test.c src/engine/dns.c -lws2_32 -o build/dns_test.exe
 x86_64-w64-mingw32-gcc -g -O1 -fsanitize=undefined,address -Isrc/engine tests/exclude_test.c src/engine/exclude.c -lws2_32 -o build/exclude_test.exe
+x86_64-w64-mingw32-gcc -g -O1 -fsanitize=undefined,address -Isrc/app -Itests tests/updpkg_test.c src/app/updpkg.c -o build/updpkg_test.exe
 for t in proto tcpdpi udpdpi rawscope; do x86_64-w64-mingw32-gcc -g -O1 -fsanitize=undefined,address -Isrc/engine/core tests/core/test_$t.c src/engine/core/{proto,tcpdpi,udpdpi,rawscope}.c -lws2_32 -o build/test_$t.exe && ./build/test_$t.exe; done
 ```
 
@@ -331,6 +360,16 @@ SHA-256 in the workflow.
   20/20 at ~150 ms on Türk Telekom and made preset 0. Verified elevated:
   selftest x64/x86 PASS (latency +6/-1 ms), 3 consecutive scans on preset 0,
   Discord endpoints, NXDOMAIN fast, tlsrec downloads close cleanly, UI e2e.
+- v2.0.1: one-click update (see Key behaviours), exe version info no longer
+  names GoodbyeDPI. Verified elevated with a build labelled 1.9.9 against the
+  real v2.0.0 release: x64 and x86 replaced themselves and restarted as the
+  release exe (byte-identical), Program Files copy not downgraded, a forced
+  failure (exe held open without delete sharing) leaves the app running with
+  the "failed" banner and the exe unchanged, 2.0.1 removes the `.old` file.
+  The parser extracts every file of the real v2.0.0 zips (Info-ZIP deflate),
+  120 Python-made zips and a .NET-made zip identically. (Windows PowerShell
+  5.1's Compress-Archive writes backslashes in names; those zips are refused
+  by design - releases are made by Info-ZIP in CI.)
 - After rc2 (on main, not yet tagged): second bug-hunting round - app layer
   (17 findings: folder-security race, laptop autostart, tray icon after
   Explorer restart, manual mode overridden by site test, watchdog balloon

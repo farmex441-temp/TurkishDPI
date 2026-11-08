@@ -16,6 +16,7 @@ sd_WinHttpCloseHandle_t       sd_WinHttpCloseHandle;
 sd_WinHttpConnect_t           sd_WinHttpConnect;
 sd_WinHttpOpenRequest_t       sd_WinHttpOpenRequest;
 sd_WinHttpQueryHeaders_t      sd_WinHttpQueryHeaders;
+sd_WinHttpQueryOption_t       sd_WinHttpQueryOption;
 sd_WinHttpReadData_t          sd_WinHttpReadData;
 sd_WinHttpReceiveResponse_t   sd_WinHttpReceiveResponse;
 sd_WinHttpSendRequest_t       sd_WinHttpSendRequest;
@@ -54,6 +55,7 @@ static BOOL CALLBACK load_all(PINIT_ONCE o, PVOID p, PVOID *c) {
     SD(http, WinHttpConnect);
     SD(http, WinHttpOpenRequest);
     SD(http, WinHttpQueryHeaders);
+    SD(http, WinHttpQueryOption);
     SD(http, WinHttpReadData);
     SD(http, WinHttpReceiveResponse);
     SD(http, WinHttpSendRequest);
@@ -66,7 +68,7 @@ static BOOL CALLBACK load_all(PINIT_ONCE o, PVOID p, PVOID *c) {
     SD(iph, GetIfEntry2);
 #undef SD
     g_ok = sd_WinHttpOpen && sd_WinHttpCloseHandle && sd_WinHttpConnect && sd_WinHttpOpenRequest &&
-           sd_WinHttpQueryHeaders && sd_WinHttpReadData && sd_WinHttpReceiveResponse &&
+           sd_WinHttpQueryHeaders && sd_WinHttpQueryOption && sd_WinHttpReadData && sd_WinHttpReceiveResponse &&
            sd_WinHttpSendRequest && sd_WinHttpSetOption && sd_WinHttpSetStatusCallback &&
            sd_WinHttpSetTimeouts && sd_NotifyAddrChange && sd_GetBestRoute2 &&
            sd_ResolveIpNetEntry2 && sd_GetIfEntry2;
