@@ -324,6 +324,13 @@ SHA-256 in the workflow.
   Windows 7 without KB2533623 (syslib.h) and TLS 1.2 for WinHTTP on 7/8.0;
   clear ARM64 message. Verified elevated with tools/uia_e2e.ps1: selftest
   PASS, task created/removed, tray icon on the taskbar, clean exit.
+- v2.0.0: own packet engine - GoodbyeDPI code removed; Shroudly core (MIT)
+  for the IPv4 path, own DNS/IPv6/payment/CLI; an independent review found
+  8 issues (clean NXDOMAIN dropped in the hybrid race, tlsrec close/reuse,
+  option-parse crash, ...), all fixed; `--split-pos 2` reverse cut measured
+  20/20 at ~150 ms on Türk Telekom and made preset 0. Verified elevated:
+  selftest x64/x86 PASS (latency +6/-1 ms), 3 consecutive scans on preset 0,
+  Discord endpoints, NXDOMAIN fast, tlsrec downloads close cleanly, UI e2e.
 - After rc2 (on main, not yet tagged): second bug-hunting round - app layer
   (17 findings: folder-security race, laptop autostart, tray icon after
   Explorer restart, manual mode overridden by site test, watchdog balloon
@@ -352,6 +359,8 @@ SHA-256 in the workflow.
   hands downloads to Defender; Google Safe Browsing itself reports the URL
   clean). False-positive report sent 2026-11-08, submission ID
   89a9c5f0-2095-46ea-b5b0-f9f4a55ae401 (status at https://www.microsoft.com/en-us/wdsi/submission/89a9c5f0-2095-46ea-b5b0-f9f4a55ae401;
-  cloud label then `Program:Win32/Wacapew.A!ml`, determination pending). Remaining options are code signing and false-positive
+  cloud label then `Program:Win32/Wacapew.A!ml`, determination pending).
+  v2.0.0 (own engine): x64 zip 3/68 (the WinDivert labels), exe alone 1/71
+  (Elastic ML only; Microsoft clean), local Defender clean. Remaining options are code signing and false-positive
   reports to the vendors (both need the owner); do not try to dodge ML
   detectors with packing/obfuscation.
