@@ -13,18 +13,20 @@
 #include <stdio.h>
 #include <string.h>
 #include <ctype.h>
-#include "goodbyedpi.h"
+#include <stdlib.h>
 #include "exclude.h"
-#include "utils/uthash.h"
-#include "utils/getline.h"
 
-typedef struct exclude_record {
-    char *host;
-    UT_hash_handle hh;
-} exclude_record_t;
-
-static exclude_record_t *excluded = NULL;
+#define HOST_MAXLEN 253
+/* The names, in an open-addressing set (a few hundred at most). */
+#define EXCL_SLOTS 1024                  /* power of two, > 2x the names */
+static char *excluded[EXCL_SLOTS];
 static int excluded_count = 0;
+
+static unsigned name_hash(const char *s) {
+    unsigned h = 2166136261u;
+    while (*s) h = (h ^ (unsigned char)*s++) * 16777619u;
+    return h;
+}
 
 static const char *BUILTIN_EXCLUDES[] = {
     /* Turkish banks */
@@ -64,24 +66,24 @@ static void normalize(char *s) {
 }
 
 static int lookup(const char *host) {
-    exclude_record_t *r = NULL;
-    HASH_FIND_STR(excluded, host, r);
-    return r != NULL;
+    for (unsigned i = name_hash(host) & (EXCL_SLOTS - 1);; i = (i + 1) & (EXCL_SLOTS - 1)) {
+        if (!excluded[i]) return 0;
+        if (!strcmp(excluded[i], host)) return 1;
+    }
 }
 
 int exclude_add(const char *host) {
     char buf[HOST_MAXLEN + 1];
     const char *s = host;
-    exclude_record_t *r;
+    unsigned i;
     while (*s == ' ' || *s == '\t' || *s == '.') s++;
     if (strlen(s) < 2 || strlen(s) > HOST_MAXLEN || *s == '#') return 0;
     strcpy(buf, s);
     normalize(buf);
-    if (!buf[0] || lookup(buf)) return 0;
-    r = malloc(sizeof(*r));
-    if (!r) return 0;
-    r->host = strdup(buf);
-    HASH_ADD_KEYPTR(hh, excluded, r->host, strlen(r->host), r);
+    if (!buf[0] || lookup(buf) || excluded_count >= EXCL_SLOTS / 2) return 0;
+    for (i = name_hash(buf) & (EXCL_SLOTS - 1); excluded[i]; i = (i + 1) & (EXCL_SLOTS - 1)) {}
+    excluded[i] = strdup(buf);
+    if (!excluded[i]) return 0;
     excluded_count++;
     return 1;
 }
@@ -94,16 +96,14 @@ int exclude_load_builtin(void) {
 }
 
 int exclude_load_list(const char *filename) {
-    char *line = malloc(HOST_MAXLEN + 2);
-    size_t linelen = HOST_MAXLEN + 2;
+    char line[1024];
     int cnt = 0;
     FILE *fp = fopen(filename, "r");
-    if (!fp) { free(line); return -1; }
-    while (getline(&line, &linelen, fp) != -1) {
+    if (!fp) return -1;
+    while (fgets(line, sizeof(line), fp)) {
         line[strcspn(line, "\r\n#")] = '\0';
         cnt += exclude_add(line);
     }
-    free(line);
     fclose(fp);
     return cnt;
 }
@@ -205,7 +205,7 @@ void exclude_learn_dns(const char *data, unsigned int len) {
 int exclude_check_hostname(const char *host_addr, size_t host_len) {
     char host[HOST_MAXLEN + 1];
     char *dot;
-    if (!excluded || !host_addr || !host_len || host_len > HOST_MAXLEN) return 0;
+    if (!excluded_count || !host_addr || !host_len || host_len > HOST_MAXLEN) return 0;
     memcpy(host, host_addr, host_len);
     host[host_len] = 0;
     /* strip :port from HTTP Host headers */

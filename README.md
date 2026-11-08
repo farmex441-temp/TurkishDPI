@@ -12,7 +12,7 @@
 
 **TurkishDPI**, Türkiye'deki internet servis sağlayıcılarının Derin Paket İnceleme (DPI) ve DNS engellerini **VPN'siz**, **hız kaybı olmadan** ve **tamamen otomatik** olarak aşmanızı sağlayan küçük bir Windows uygulamasıdır.
 
-[GoodbyeDPI](https://github.com/ValdikSS/GoodbyeDPI) ve [GoodbyeDPI-Turkey](https://github.com/cagritaskn/GoodbyeDPI-Turkey) motorunu temel alır; [Shroudly](https://github.com/umutxyp/Shroudly)'nin otomatik strateji bulma, bağlantı bekçisi ve SNI parçalama fikirlerini ekler.
+Sürüm 2.0'dan itibaren **kendi paket motorunu** kullanır: motorun IPv4 paket yolu ve yardımcıları açık kaynak [Shroudly](https://github.com/umutxyp/Shroudly) çekirdeğinden (MIT) alınmıştır; DNS yönlendirmesi, IPv6, ödeme koruması, otomatik profil seçimi ve arayüz TurkishDPI'ındır. (1.x sürümleri GoodbyeDPI tabanlı bir motor kullanıyordu; 2.0'da o koddan hiçbir şey kalmadı.)
 
 ## Öne çıkanlar
 
@@ -37,10 +37,10 @@
 - **ARM işlemcili Windows desteklenmez:** WinDivert'in ARM64 sürücüsü yoktur. Program bu durumda belirsiz bir sürücü hatası yerine bunu açıkça söyler.
 - **Ekran okuyucu:** Tüm düğmeler, durum bilgisi, Ayrıntılar satırları, test siteleri ve site kutusu Ekran Okuyucusu/NVDA tarafından okunur (UI Automation ile doğrulandı); her şey Tab, Boşluk ve Enter ile kullanılabilir.
 - **Discord:** Web sitesi, uygulama, ağ geçidi, CDN ve **güncelleyici** (`updates.discord.com`) engelli; TurkishDPI açıkken hepsi açılıyor (ölçüldü). Sesli görüşme sunucuları (`*.discord.media`) Türkiye'de şu an engelli değil, ses de çalışıyor.
-- **Windows hizmeti:** TurkishDPI hizmet olarak değil, oturum açılınca Görev Zamanlayıcı ile başlar (tepside simgesiyle). Eski GoodbyeDPI tarzı `sc create` hizmetleri ve `.cmd` betikleri motorla aynen çalışır.
+- **Windows hizmeti:** TurkishDPI hizmet olarak değil, oturum açılınca Görev Zamanlayıcı ile başlar (tepside simgesiyle).
 - **Linux/macOS:** Desteklenmez (WinDivert yalnızca Windows'ta vardır). Linux için [zapret](https://github.com/bol-van/zapret) kullanılabilir.
 
-### Ölçüm sonuçları (v1.1.0, Türk Telekom altyapılı bir ağ, `--selftest`)
+### Ölçüm sonuçları (v1.x motoru, Türk Telekom altyapılı bir ağ, `--selftest`)
 
 | | Sonuç |
 |---|---|
@@ -88,19 +88,32 @@
 3. **Profil taraması** – Profilleri bu ağda öğrenilmiş başarı oranına ve hıza göre sıralar, motoru başlatır ve engelli test sitelerine (varsayılan: `discord.com`, `www.roblox.com`, `www.wattpad.com`) **gerçek TLS bağlantısı** kurar. Yeni bir ağda ilk çalışan profilden sonra iki aday daha ölçülür ve en hızlısı seçilir.
 4. **Bekçi** – Ağ değiştiğinde, uykudan uyanınca ve belirli aralıklarla test eder. Bir test başarısız olursa 20 saniye sonra tekrar dener; ancak ikinci kez de başarısız olursa yeniden tarar. Motor çökerse yeniden başlatır.
 
+### Motor nasıl atlatır?
+
+Bir web bağlantısının ilk paketinde (TLS ClientHello ya da HTTP isteği) sitenin adı açıkça yazar; ISS'nin filtresi bu adı okuyup bağlantıyı keser. Motor bu paketi yakalar ve:
+
+- önce **sahte bir kopyasını** gönderir: filtreye ulaşır ama sunucuya varmadan ölür (ağdaki uzaklık ölçülerek ayarlanan düşük TTL, bozuk TCP sağlama toplamı, adı değiştirilmiş);
+- gerçek paketi, hiçbir parçada sitenin adı tam görünmeyecek şekilde **böler** (gerekirse ters sırada gönderir);
+- filtrenin bağlantıyı kesmek için uydurduğu **RST paketlerini** düşürür;
+- QUIC/HTTP3'ü engeller ki tarayıcı bu tekniklerin işlediği TCP'ye geçsin;
+- DNS sorgularını temiz bir DNS'e de gönderir (hibrit yarış).
+
+Banka ve ödeme bağlantılarına hiç dokunulmaz.
+
 ### Profiller
 
 | Profil | Motor argümanları |
 |---|---|
-| Türkiye Standart | `-5 -q --set-ttl 5` + DNS |
-| Modern | `-9` + DNS (`-9` QUIC engelini içerir) |
-| Auto-TTL | `-5 -q` + DNS |
-| Sabit TTL 3 | `-q --set-ttl 3` + DNS |
-| SNI Parçalama + Sahte SNI | `-9 --frag-by-sni --fake-with-sni www.google.com` + DNS |
-| Agresif SNI | `-9 --frag-by-sni --fake-with-sni www.google.com --fake-resend 2 --auto-ttl` + DNS |
-| Superonline (-5 / -9 / TTL 3 / SNI) | DNS yönlendirmesiz varyantlar |
+| Sahte + ters bölme (önerilen) | `--desync fakeddisorder --autottl 1` + DNS |
+| Sahte paket + bölme | `--desync fake --split on --autottl 1` + DNS |
+| TLS kaydı bölme (Superonline) | `--desync fake --split on --tlsrec 1 --autottl 1` + DNS |
+| Sahte paket + ters sıralı bölme | `--desync fake --split disorder --autottl 1` + DNS |
+| Sahte + bölünmüş | `--desync fakedsplit --autottl 1` + DNS |
+| Sahte + ters bölme, sabit TTL 4 | `--desync fakeddisorder --autottl 0 --fake-ttl 4` + DNS |
+| Yalnız bölme | `--desync none --split on` + DNS |
+| … DNS yönlendirmesiz | aynı tekniklerin DNS'e dokunmayan varyantları |
 
-Profillerin tamamı QUIC/HTTP3'ü (`-q`) engeller.
+Hepsi `--drop-rst 1` ile sahte RST'leri düşürür ve QUIC'i engeller. Türk Telekom hattında ölçüldü: sahte paket filtreyi geçecek kadar uzağa gitmeli (ölçülen TTL; sabit 3-5 yetmiyor) ve gerçek veri sahtenin ardından sırayla gitmemeli; aksi hâlde filtre gerçek ilk parçayı düşürür ve Windows onu 300 ms sonra yeniden gönderir. Bu yüzden ters sıralı profil ilk sıradadır.
 
 ### Ayarlar
 
@@ -119,19 +132,18 @@ Targets=discord.com,www.roblox.com,www.wattpad.com   ; engelli test siteleri
 Control=www.google.com,www.microsoft.com             ; engelsiz kontrol siteleri
 
 [net_<ağ-kimliği>]     ; akıllı motorun her ağ için öğrendikleri
-p0=12,11,84            ; deneme, başarı, ortalama gecikme (ms)
+e0=12,11,84            ; profil 0: deneme, başarı, ortalama gecikme (ms)
 ```
 
-### Komut satırı (GoodbyeDPI uyumlu)
+### Komut satırı
 
 ```bat
 TurkishDPI.exe                       :: tepsi uygulaması (otomatik)
 TurkishDPI.exe --tray                :: sessiz başlat
-TurkishDPI.exe --engine -9 --dns-addr 77.88.8.8 --dns-port 1253
-TurkishDPI.exe -5 --set-ttl 5 ...    :: goodbyedpi.exe ile birebir aynı argümanlar
+TurkishDPI.exe --selftest            :: tara, ödeme korumasını doğrula, günlüğe yaz, çık
+TurkishDPI.exe --engine --help       :: yalnızca motor ve seçenekleri
+TurkishDPI.exe --engine --desync fakeddisorder --autottl 1 --dns-addr 208.67.222.222 --dns-port 5353 --dns-hybrid
 ```
-
-Eski GoodbyeDPI `.cmd` betiklerinde `goodbyedpi.exe` yerine `TurkishDPI.exe` yazmanız yeterlidir; Windows hizmeti (`sc create`) olarak da çalışır.
 
 ## Gizlilik ve güvenlik
 
@@ -152,8 +164,8 @@ Eski GoodbyeDPI `.cmd` betiklerinde `goodbyedpi.exe` yerine `TurkishDPI.exe` yaz
 
 ## Sorun giderme
 
-- **Antivirüs:** TurkishDPI.exe sürücü taşımaz; yalnızca "Windows ile başlat" açıkken kendisini ve WinDivert dosyalarını Program Files'a kopyalar. Exe, yanındaki `WinDivert.dll` ve sürücü dosyalarının resmi sürümle aynı olduğunu (SHA-256) doğrulamadan onları yüklemez. Paketteki `WinDivert64.sys`, WinDivert'in resmi imzalı sürücüsüdür; bazı üreticiler (ör. Elastic, Kaspersky "not-a-virus", Lionic) **her** WinDivert sürücüsünü genel bir kuralla "WinDivert"/"RiskTool" olarak etiketler. Bu, GoodbyeDPI ve zapret'te de aynıdır ve imzalı sürücü değiştirilemez. Windows Defender'ın işaretlediği şey ise WinDivert'in resmi zip arşivindeki örnek araçlardır; TurkishDPI bunları dağıtmaz. Başka bir antivirüs engellerse uygulamadaki *Ayarlar → Antivirüs sorunu yardımı* adım adım yol gösterir; TurkishDPI hiçbir zaman antivirüs ayarlarınızı kendisi değiştirmez.
-- **Kaspersky:** GoodbyeDPI'ı engeller; tamamen kaldırılması gerekir.
+- **Antivirüs:** TurkishDPI.exe sürücü taşımaz; yalnızca "Windows ile başlat" açıkken kendisini ve WinDivert dosyalarını Program Files'a kopyalar. Exe, yanındaki `WinDivert.dll` ve sürücü dosyalarının resmi sürümle aynı olduğunu (SHA-256) doğrulamadan onları yüklemez. Paketteki `WinDivert64.sys`, WinDivert'in resmi imzalı sürücüsüdür; bazı üreticiler (ör. Elastic, Kaspersky "not-a-virus", Lionic) **her** WinDivert sürücüsünü genel bir kuralla "WinDivert"/"RiskTool" olarak etiketler. Bu, WinDivert kullanan her araçta (zapret, Shroudly'nin gelişmiş modu…) aynıdır ve imzalı sürücü değiştirilemez. Windows Defender'ın işaretlediği şey ise WinDivert'in resmi zip arşivindeki örnek araçlardır; TurkishDPI bunları dağıtmaz. Başka bir antivirüs engellerse uygulamadaki *Ayarlar → Antivirüs sorunu yardımı* adım adım yol gösterir; TurkishDPI hiçbir zaman antivirüs ayarlarınızı kendisi değiştirmez.
+- **Kaspersky:** WinDivert sürücüsünü engelleyebilir (hata 1275); gerekirse kaldırılması gerekir.
 - **Eski GoodbyeDPI / zapret hizmeti:** TurkishDPI açılışta tespit eder ve kaldırmayı önerir.
 - Ayrıntılı kayıt: menüden **Günlüğü aç**.
 
@@ -172,9 +184,8 @@ GitHub Actions her `v*` etiketi için x64/x86 sürümlerini derleyip Release'e y
 
 Apache License 2.0 — ayrıntılar için [LICENSE](LICENSE) ve [NOTICE](NOTICE).
 
-- [ValdikSS/GoodbyeDPI](https://github.com/ValdikSS/GoodbyeDPI) — paket motoru (Apache 2.0)
-- [cagritaskn/GoodbyeDPI-Turkey](https://github.com/cagritaskn/GoodbyeDPI-Turkey) — Türkiye profilleri (Apache 2.0)
-- [umutxyp/Shroudly](https://github.com/umutxyp/Shroudly) — otomatik tarama / bekçi / SNI fikirleri (MIT)
+- [umutxyp/Shroudly](https://github.com/umutxyp/Shroudly) — motor çekirdeği: `src/engine/core/` ve `engine.c`'nin IPv4 paket yolu (MIT, metni [THIRD_PARTY_LICENSES.txt](THIRD_PARTY_LICENSES.txt))
+- 1.x sürümleri [ValdikSS/GoodbyeDPI](https://github.com/ValdikSS/GoodbyeDPI) tabanlı bir motor kullanıyordu (Apache 2.0); 2.0'da o kod kaldırıldı.
 - [WinDivert](https://reqrypt.org/windivert.html) — Basil Hussain (LGPL v3)
 
 Logo ve simgeler bu projeye özeldir (`tools/make_icons.py` ile üretilir).

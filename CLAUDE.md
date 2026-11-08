@@ -1,10 +1,13 @@
 # TurkishDPI – project guide
 
 TurkishDPI is a small native Windows program (C, Win32, no frameworks) that gets
-around DPI/DNS-based website blocking in Turkey without a VPN. It is a fork of
-**GoodbyeDPI** (ValdikSS) / **GoodbyeDPI-Turkey** (cagritaskn), extended with an
-automatic, self-learning controller, its own UI and ideas taken from
-**Shroudly** (umutxyp, MIT). License: Apache-2.0 (see `LICENSE`, `NOTICE`).
+around DPI/DNS-based website blocking in Turkey without a VPN: an automatic,
+self-learning controller with its own UI, and (since 2.0) its own packet engine
+whose IPv4 path and helpers come from **Shroudly**'s core (umutxyp, MIT; kept
+attributed in file headers, `NOTICE`, `THIRD_PARTY_LICENSES.txt`). License:
+Apache-2.0. 1.x used a GoodbyeDPI-derived engine; the owner asked for it to be
+removed entirely (trust), so no GoodbyeDPI code or GoodbyeDPI-style command
+line remains - do not reintroduce it.
 
 - Repo: https://github.com/farmex441-temp/TurkishDPI (public, account `farmex441-temp`)
 - User-facing docs are Turkish (`README.md`, `docs/BENIOKU.txt`, UI strings).
@@ -17,10 +20,10 @@ automatic, self-learning controller, its own UI and ideas taken from
 1. **App** (no args or `--tray`): tray icon + main window. A controller thread
    picks a strategy preset, starts the engine as a child process, probes test
    sites, learns per network, watches the connection and re-tunes.
-2. **Engine** (`--engine ARGS`, or any GoodbyeDPI-style first argument like `-9`):
-   the GoodbyeDPI packet loop on WinDivert. The app starts it hidden, reads its
-   stdout through a pipe and kills it via a job object if the app dies.
-   Old GoodbyeDPI `.cmd` scripts and `sc create` services work with it unchanged.
+2. **Engine** (`--engine ARGS`, options in `engine_main`, `--engine --help`):
+   the packet loop on WinDivert (src/engine/engine.c). The app starts it
+   hidden, reads its stdout through a pipe and kills it via a job object if
+   the app dies.
 
 Other modes: `--selftest` (scan, verify payment pass-through, write `SELFTEST …`
 lines to the log, exit; exits 3 if another instance runs), `--help`,
@@ -30,9 +33,10 @@ mock `g_ui` data, no data folder/engine/network/tray, every action gated in
 `do_click`/`command`; own window class so the real app never finds it; runs
 without admin via `__COMPAT_LAYER=RunAsInvoker`; scenarios in `preview_fill`).
 
-Engine -> app protocol (stdout lines): `Filter activated…`,
-`Error opening filter: <code>`, `STATS packets=… https=… http=… excluded=… dns=…`
-(STATS only when `gdpi_report_stats` is set, i.e. in `--engine` mode).
+Engine -> app protocol (stdout lines): `TurkishDPI engine <ver>` and one
+settings line, `Filter activated`, `Error opening filter: <code>`,
+`STATS packets=… https=… http=… excluded=… dns=…` (STATS only when
+`engine_report_stats` is set, i.e. in `--engine` mode; every 2 s if changed).
 
 ## Layout
 
@@ -67,16 +71,26 @@ src/app/            the app (controller, UI, probes, learning)
   presets.h         strategy presets ({DNS} placeholder) and clean DNS servers
   version.h         version + GitHub URLs
   TurkishDPI.rc, .exe.manifest, res/*.ico   resources (icons from tools/make_icons.py)
-src/engine/         GoodbyeDPI engine (upstream code + TurkishDPI changes)
-  goodbyedpi.c      option parsing (gdpi_main), WinDivert filters, packet loop
-  dnsredir.c/.h     DNS redirection conntrack + TurkishDPI hybrid DNS race
+src/engine/         the packet engine
+  engine.c/.h       command line (engine_main), WinDivert filter (build_filter),
+                    packet loop: IPv4 decoy/split/seqovl/tlsrec/RST-drop/autottl/
+                    QUIC/Discord-voice adapted from Shroudly raw_windows.c; own
+                    IPv6 split+decoy (build6/desync6, no extension headers),
+                    DNS redirection, payment exclusion, STATS reporter
+  core/             from Shroudly core/src (MIT, unchanged except a header
+                    line): proto (TLS/HTTP parse, decoy names), tcpdpi (segment
+                    builders, hop table, tlsrec seq translation), udpdpi (QUIC
+                    Initial, Discord voice), rawscope (local addresses, touched
+                    servers for RST drop, no-decoy table), raw_desync.h (config)
+  dns.c/.h          own DNS question table + hybrid race verdicts + forged-answer
+                    check (block IPs, bogons, error rcodes, malformed = forged)
   exclude.c/.h      payment/bank "never touch" list (SNI + IPs learned from DNS)
   windivert_dyn.c   loads WinDivert.dll at runtime from the exe's folder only;
                     ARM64 Windows is refused with error 50 (no WinDivert driver)
   syslib.h          load_system_dll / load_dll_path: System32-only loading
                     that also works on Windows 7 without KB2533623
-  fakepackets.c, ttltrack.c, blackwhitelist.c, service.c, utils/   upstream
-tests/              unit tests (no admin): exclude_test.c, dns_test.c,
+tests/              unit tests (no admin): core/test_{proto,tcpdpi,udpdpi,rawscope}.c
+                    (Shroudly's, strategy parts removed), exclude_test.c, dns_test.c,
                     diag_test.c, windivert_hash_test.c (DLL + driver pinning, uses a
                     stand-in DLL, never the driver); manual tools:
                     probe_test.c (network/latency/diagnosis), hosts_test.c
@@ -128,14 +142,24 @@ Runtime data: `%ProgramData%\TurkishDPI\` (admin-owned, protected DACL):
 - **Hybrid DNS** (`--dns-hybrid`, `--dns-block-ip`): each query goes to the
   system resolver *and* the clean one; first trustworthy answer wins; forged
   answers (block pages, bogons, NXDOMAIN/SERVFAIL/REFUSED from the ISP) dropped.
-- **Narrow filter**: outbound only HTTP requests (port 80 with payload) and TLS
-  handshake records (443, payload starts `16 03`); clean-resolver answers only
-  from that server's IP:port. Do not widen this without a reason: every
-  diverted packet costs two context switches.
+- **Narrow filter** (`build_filter`): outbound only HTTP requests (port 80 with
+  payload) and TLS records 22/21 on 443 (ClientHello, client alerts); with
+  tlsrec every IPv4 443 segment (its sequence numbers move); QUIC Initials;
+  DNS port 53 out, answers from 53 (hybrid/learning) and from the clean
+  resolver's exact IP:port; inbound RST / SYN-ACK / TLS alerts from 80/443.
+  Do not widen this without a reason: every diverted packet costs two
+  context switches.
+- **Presets** (presets.h, measured on Türk Telekom 2026-11-08): the decoy must
+  pass the filter (hop-distance TTL, `--autottl 1`; fixed 3-5 dies before it)
+  and real data must not follow the decoy in order (`fake`+in-order split adds
+  ~300 ms: the filter drops the real first segment, Windows resends after its
+  300 ms minimum RTO). `fakeddisorder` costs nothing, so it is preset 0.
+  Learned stats use keys `e<N>` in `[net_<id>]` (the 1.x `p<N>` keys belong to
+  the old presets and are ignored); reordering presets invalidates them.
 - **Payment protection** (default on, `--no-payment-exclude` / ini
   `PaymentProtection=0` to disable): ~100 bank/payment/3-D Secure domains are
   never modified, matched by SNI/Host and by addresses learned from DNS answers.
-- **QUIC** is blocked (`-q`) in every preset so browsers fall back to TCP.
+- **QUIC** Initials are dropped (engine default, both families) so browsers fall back to TCP.
 - **No bundled/embedded driver in the exe**: releases are zips with
   `TurkishDPI.exe` + WinDivert's signed `WinDivert.dll`/`WinDivert64.sys`
   (+ `WinDivert32.sys` on x86). The v1.0 single-file build that embedded and
@@ -156,14 +180,13 @@ make ARCH=i686            # build/i686/TurkishDPI.exe
 Unit tests (run them under sanitizers when touching engine parsing code):
 
 ```bash
-x86_64-w64-mingw32-gcc -g -O1 -fsanitize=undefined,address -Isrc/engine tests/dns_test.c src/engine/dnsredir.c -lws2_32 -o build/dns_test.exe
-x86_64-w64-mingw32-gcc -g -O1 -fsanitize=undefined,address -Isrc/engine tests/exclude_test.c src/engine/exclude.c src/engine/utils/getline.c -o build/exclude_test.exe
+x86_64-w64-mingw32-gcc -g -O1 -fsanitize=undefined,address -Isrc/engine tests/dns_test.c src/engine/dns.c -lws2_32 -o build/dns_test.exe
+x86_64-w64-mingw32-gcc -g -O1 -fsanitize=undefined,address -Isrc/engine tests/exclude_test.c src/engine/exclude.c -lws2_32 -o build/exclude_test.exe
+for t in proto tcpdpi udpdpi rawscope; do x86_64-w64-mingw32-gcc -g -O1 -fsanitize=undefined,address -Isrc/engine/core tests/core/test_$t.c src/engine/core/{proto,tcpdpi,udpdpi,rawscope}.c -lws2_32 -o build/test_$t.exe && ./build/test_$t.exe; done
 ```
 
 Without MinGW, MSVC (`cl /fsanitize=address`, add `/Dssize_t=intptr_t`) builds
-and runs the unit tests and compile-checks `src/app` + the TurkishDPI engine
-files; the upstream engine (`goodbyedpi.c`, `service.c`, `fakepackets.c`)
-needs GCC (unistd.h, getopt, `__attribute__`), so the full exe needs MinGW/CI.
+and runs the unit tests; the release exe is built with MinGW (CI).
 
 Quick checks without admin:
 - `__COMPAT_LAYER=RunAsInvoker TurkishDPI.exe --engine <args>`: "Error opening

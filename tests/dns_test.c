@@ -3,7 +3,7 @@
 #include <ws2tcpip.h>
 #include <stdio.h>
 #include <string.h>
-#include "dnsredir.h"
+#include "dns.h"
 
 static int fails;
 #define EXPECT(cond, what) do { if (!(cond)) { printf("FAIL: %s\n", what); fails++; } } while (0)
