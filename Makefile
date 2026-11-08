@@ -33,11 +33,13 @@ LIBS    := -lws2_32 -lshell32 -lole32 -luser32 -ladvapi32 -luuid -lgdiplus -lcom
 # used for the build (CI: the checksum-pinned official archive).
 # REQUIRE_WINDIVERT_HASH=1 (CI) turns a missing DLL into a build error.
 WDARCH := $(if $(filter x86_64,$(ARCH)),x64,x86)
-WINDIVERT_DLL_SHA256 ?= $(shell sha256sum $(WINDIVERT)/$(WDARCH)/WinDivert.dll 2>/dev/null | cut -c1-64)
+WINDIVERT_DLL := $(WINDIVERT)/$(WDARCH)/WinDivert.dll
+# read from stdin: sha256sum escapes its output line when the path holds a backslash
+WINDIVERT_DLL_SHA256 ?= $(shell sha256sum < $(WINDIVERT_DLL) 2>/dev/null | cut -c1-64)
 ifneq ($(WINDIVERT_DLL_SHA256),)
 CFLAGS += -DWINDIVERT_DLL_SHA256=\"$(WINDIVERT_DLL_SHA256)\"
 else ifeq ($(REQUIRE_WINDIVERT_HASH),1)
-$(error $(WINDIVERT)/$(WDARCH)/WinDivert.dll not found: cannot pin its SHA-256)
+$(error $(WINDIVERT_DLL) not found: cannot pin its SHA-256)
 endif
 
 ENGINE_SRC := $(wildcard src/engine/*.c src/engine/utils/*.c)
@@ -50,6 +52,9 @@ all: $(OUT)/TurkishDPI.exe
 $(OUT)/obj/%.o: src/%.c $(wildcard src/*/*.h)
 	@mkdir -p $(dir $@)
 	$(CC) $(CFLAGS) -c $< -o $@
+
+# the pinned hash is compiled in: rebuild when the DLL changes
+$(OUT)/obj/engine/windivert_dyn.o: $(wildcard $(WINDIVERT_DLL))
 
 $(OUT)/obj/res.o: src/app/TurkishDPI.rc src/app/TurkishDPI.exe.manifest $(wildcard src/app/res/*.ico) src/app/version.h
 	@mkdir -p $(dir $@)

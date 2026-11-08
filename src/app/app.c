@@ -44,6 +44,10 @@ int g_auto = 1, g_preset = 0, g_paused = 0, g_payment_protect = 1;
 wchar_t g_log[MAX_PATH], g_ini[MAX_PATH];
 
 static wchar_t g_dir[MAX_PATH], g_exe[MAX_PATH];
+/* The running exe's file, opened at start without delete sharing: it cannot
+ * be renamed and swapped for another file while we run, and it is what gets
+ * copied into Program Files for the logon task (sys_install_copy). */
+static HANDLE g_self_exe = INVALID_HANDLE_VALUE;
 static HANDLE g_job, g_cmd_event, g_net_event, g_resume_event, g_quit_event;
 static CRITICAL_SECTION g_log_lock;   /* file I/O never blocks the UI's g_lock */
 /* Small command queue: clicks are never lost or merged (UI -> controller). */
@@ -486,6 +490,8 @@ static const wchar_t *windivert_error_text(long e) {
                       L"Onları kapatıp bilgisayarı yeniden başlatın.";
     case 1275: return L"Sürücü bir güvenlik yazılımı tarafından engellendi (ör. Kaspersky).";
     case 1753: return L"Base Filtering Engine (BFE) hizmeti kapalı. Hizmetler'den açın.";
+    case 193:  return L"WinDivert.dll bu sistemin mimarisine uymuyor (x64/x86 zip'leri karışmış olabilir). "
+                      L"Doğru zip'i yeniden çıkarın.";
     case 1006: return L"WinDivert.dll beklenen dosya değil (değiştirilmiş ya da başka bir sürüm). "
                       L"Güvenlik için yüklenmedi. TurkishDPI'ı resmi zip'ten yeniden çıkarın.";
     default:   return NULL;
@@ -563,7 +569,7 @@ static void pick_dns(void) {
  * (needs the engine stopped, so the real answers are seen). Kept per network. */
 static void load_block_ips(void);
 
-static void learn_block_ips(void) {
+static int learn_block_ips(void) {
     char found[8][16];
     wchar_t sec[80], key[8], val[32];
     int n = probe_learn_block_ips(DNS_SERVERS[g_dns].v4, DNS_SERVERS[g_dns].port, found, 8);
@@ -579,6 +585,7 @@ static void learn_block_ips(void) {
         log_line("learned %d block-page address(es), first %s", n, found[0]);
     }
     load_block_ips();
+    return n;
 }
 
 static unsigned long long now_seconds(void) {
@@ -608,9 +615,10 @@ static void learn_block_ips_if_stale(void) {
     wchar_t sec[80], val[32];
     if (!block_ips_stale()) { load_block_ips(); return; }
     engine_stop();   /* the network's real answers must be seen */
-    learn_block_ips();
     swprintf(sec, 80, L"net_%ls", smart_network_id());
-    _ui64tow(now_seconds(), val, 10);   /* no %llu: msvcrt and ucrt differ */
+    /* Nothing found (no DNS blocking here, or a bad moment): try again in an
+     * hour instead of a day, so a passing DNS problem is not remembered. */
+    _ui64tow(now_seconds() - (learn_block_ips() > 0 ? 0 : BLOCK_IP_RELEARN_S - 3600ull), val, 10);
     WritePrivateProfileStringW(sec, L"bt", val, g_ini);
 }
 
@@ -946,7 +954,7 @@ static void auto_scan(void) {
             g_last_score = 0;
             set_state(ST_ERROR, L"Çalışan profil bulunamadı", L"Günlük dosyasına bakın");
         }
-        if (!was) notify_state(ST_PARTIAL, L"TurkishDPI", L"Hiçbir profil tüm test sitelerini açamadı.");
+        if (!was) notify_state(g_ui.kind, L"TurkishDPI", L"Hiçbir profil tüm test sitelerini açamadı.");
     }
 }
 
@@ -959,6 +967,11 @@ static void auto_scan(void) {
  */
 static int g_health_passes = 0;
 
+static void health_record(int s) {
+    if (g_running_preset >= 0 && g_ui.kind != ST_PARTIAL && (!s || ++g_health_passes % 6 == 0))
+        smart_record(g_running_preset, s, 0);
+}
+
 static int health_ok(int record) {
     int score, need, s;
     if (g_running_preset >= 0 && !engine_alive()) return 0;
@@ -967,9 +980,7 @@ static int health_ok(int record) {
      * IP block). Only getting worse than that is a reason to rescan. */
     need = (g_ui.kind == ST_PARTIAL && g_last_score >= 0) ? g_last_score : g_ntargets;
     s = score >= need;
-    if (record && g_running_preset >= 0 && g_ui.kind != ST_PARTIAL &&
-        (!s || ++g_health_passes % 6 == 0))
-        smart_record(g_running_preset, s, 0);
+    if (record) health_record(s);
     return s;
 }
 
@@ -985,7 +996,7 @@ static int health_ok(int record) {
 static int watchdog_check(void) {
     HANDLE w[2];
     DWORD r;
-    if (health_ok(1)) return 1;
+    if (health_ok(0)) { health_record(1); return 1; }
     if (g_running_preset >= 0 && !engine_alive()) return 0;   /* no point waiting */
     log_line("watchdog: first check failed, re-checking in %d s", WATCHDOG_RECHECK_MS / 1000);
     w[0] = g_quit_event;
@@ -993,10 +1004,12 @@ static int watchdog_check(void) {
     r = WaitForMultipleObjects(2, w, FALSE, WATCHDOG_RECHECK_MS);
     if (r == WAIT_OBJECT_0 + 1) SetEvent(g_cmd_event);   /* auto-reset: give it back */
     if (r != WAIT_TIMEOUT || g_quitting) return -1;
-    if (health_ok(1)) {
+    if (health_ok(0)) {
         log_line("watchdog: transient failure, second check passed");
+        health_record(1);
         return 1;
     }
+    health_record(0);   /* only a confirmed failure counts against the preset */
     return 0;
 }
 
@@ -1380,7 +1393,7 @@ static int autostart_register(int on, int quiet) {
         DWORD w;
         /* The task runs elevated without a UAC prompt, so it must never point
          * at a folder ordinary programs can write to (see sys_install_copy). */
-        if (!sys_install_copy(g_exe, installed, MAX_PATH)) {
+        if (!sys_install_copy(g_self_exe, g_exe, installed, MAX_PATH)) {
             log_line("autostart: could not install into Program Files (%lu)", GetLastError());
             if (!quiet)
                 notify(L"Windows ile başlat açılamadı",
@@ -1528,6 +1541,7 @@ static int app_main(int quiet) {
     InitializeCriticalSection(&g_log_lock);
     WSAStartup(MAKEWORD(2, 2), &wsa);
     GetModuleFileNameW(NULL, g_exe, MAX_PATH);
+    g_self_exe = CreateFileW(g_exe, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, 0, NULL);
 
     if (SUCCEEDED(SHGetKnownFolderPath(&FOLDERID_ProgramData, 0, NULL, &pd))) {
         swprintf(g_dir, MAX_PATH, L"%ls\\TurkishDPI", pd);

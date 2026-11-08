@@ -340,27 +340,61 @@ int sys_install_dir(wchar_t *out, size_t cap) {
     return ok;
 }
 
-/* 1 if both files exist and have identical contents. */
-static int same_file_contents(const wchar_t *a, const wchar_t *b) {
-    HANDLE fa = CreateFileW(a, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, 0, NULL);
-    HANDLE fb = CreateFileW(b, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, 0, NULL);
-    int same = 0;
-    if (fa != INVALID_HANDLE_VALUE && fb != INVALID_HANDLE_VALUE) {
-        LARGE_INTEGER sa, sb;
-        if (GetFileSizeEx(fa, &sa) && GetFileSizeEx(fb, &sb) && sa.QuadPart == sb.QuadPart) {
-            static unsigned char ba[65536], bb[65536];   /* controller thread only */
-            DWORD ra, rb;
-            same = 1;
-            while (same && ReadFile(fa, ba, sizeof(ba), &ra, NULL) && ReadFile(fb, bb, sizeof(bb), &rb, NULL)) {
-                if (ra != rb || memcmp(ba, bb, ra) != 0) same = 0;
-                if (!ra) break;
-            }
-        }
+/* 1 if both open files have identical contents (a read error counts as different). */
+static int same_contents(HANDLE fa, HANDLE fb) {
+    static unsigned char ba[65536], bb[65536];   /* controller thread only */
+    LARGE_INTEGER sa, sb, zero;
+    DWORD ra, rb;
+    zero.QuadPart = 0;
+    if (!GetFileSizeEx(fa, &sa) || !GetFileSizeEx(fb, &sb) || sa.QuadPart != sb.QuadPart) return 0;
+    if (!SetFilePointerEx(fa, zero, NULL, FILE_BEGIN) || !SetFilePointerEx(fb, zero, NULL, FILE_BEGIN))
+        return 0;
+    for (;;) {
+        if (!ReadFile(fa, ba, sizeof(ba), &ra, NULL) || !ReadFile(fb, bb, sizeof(bb), &rb, NULL))
+            return 0;
+        if (ra != rb || memcmp(ba, bb, ra) != 0) return 0;
+        if (!ra) return 1;
     }
-    if (fa != INVALID_HANDLE_VALUE) CloseHandle(fa);
-    if (fb != INVALID_HANDLE_VALUE) CloseHandle(fb);
-    return same;
 }
+
+/* Writes the whole contents of an open file to dst (via dst.new, swapped in). */
+static int copy_from_handle(HANDLE src, const wchar_t *dst) {
+    static unsigned char buf[65536];
+    wchar_t tmp[MAX_PATH];
+    LARGE_INTEGER zero;
+    HANDLE out;
+    DWORD r, w;
+    int ok = 1;
+    zero.QuadPart = 0;
+    if (!SetFilePointerEx(src, zero, NULL, FILE_BEGIN)) return 0;
+    _snwprintf(tmp, MAX_PATH, L"%ls.new", dst);
+    tmp[MAX_PATH - 1] = 0;
+    out = CreateFileW(tmp, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (out == INVALID_HANDLE_VALUE) return 0;
+    while (ok) {
+        if (!ReadFile(src, buf, sizeof(buf), &r, NULL)) { ok = 0; break; }
+        if (!r) break;
+        ok = WriteFile(out, buf, r, &w, NULL) && w == r;
+    }
+    ok = ok && FlushFileBuffers(out);
+    CloseHandle(out);
+    if (ok && MoveFileExW(tmp, dst, MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) return 1;
+    DeleteFileW(tmp);
+    return 0;
+}
+
+/* Copies src (an open file) to dst unless dst already holds the same bytes. */
+static int install_one(HANDLE src, const wchar_t *dst) {
+    HANDLE cur = CreateFileW(dst, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, 0, NULL);
+    int same = 0;
+    if (cur != INVALID_HANDLE_VALUE) {
+        same = same_contents(src, cur);
+        CloseHandle(cur);
+    }
+    return same || copy_from_handle(src, dst);   /* a loaded driver file cannot be replaced */
+}
+
+int windivert_dll_ok(const wchar_t *path);   /* src/engine/windivert_dyn.c */
 
 /*
  * Copies the program (exe, WinDivert DLL + driver, licences) into the
@@ -370,18 +404,23 @@ static int same_file_contents(const wchar_t *a, const wchar_t *b) {
  * pointed at the folder the zip was extracted to (usually Downloads, which
  * any program of the user can write), replacing TurkishDPI.exe or planting a
  * DLL there would give that program administrator rights at the next logon.
- * Unchanged files are left alone (a loaded driver file cannot be replaced).
+ *
+ * The exe is copied from self_exe: a handle to the running image's file
+ * opened at start-up without delete sharing, so the file cannot be renamed
+ * away and replaced by another "TurkishDPI.exe" before it is copied. Every
+ * other file is opened without write/delete sharing and copied from that
+ * handle; WinDivert.dll must match the SHA-256 pinned at build time.
  */
-int sys_install_copy(const wchar_t *running_exe, wchar_t *installed_exe, size_t cap) {
+int sys_install_copy(HANDLE self_exe, const wchar_t *running_exe, wchar_t *installed_exe, size_t cap) {
     static const struct { const wchar_t *name; int required; } FILES[] = {
-        { L"TurkishDPI.exe", 1 }, { L"WinDivert.dll", 1 }, { L"WinDivert64.sys", 0 },
-        { L"WinDivert32.sys", 0 }, { L"LICENSE", 0 }, { L"NOTICE", 0 },
-        { L"WinDivert-LICENSE.txt", 0 }, { L"BENIOKU.txt", 0 },
+        { L"WinDivert.dll", 1 }, { L"WinDivert64.sys", 0 }, { L"WinDivert32.sys", 0 },
+        { L"LICENSE", 0 }, { L"NOTICE", 0 }, { L"WinDivert-LICENSE.txt", 0 }, { L"BENIOKU.txt", 0 },
     };
-    wchar_t dst_dir[MAX_PATH], src_dir[MAX_PATH], src[MAX_PATH], dst[MAX_PATH], tmp[MAX_PATH];
+    wchar_t dst_dir[MAX_PATH], src_dir[MAX_PATH], src[MAX_PATH], dst[MAX_PATH];
     wchar_t *slash;
     int drivers = 0;
 
+    if (self_exe == NULL || self_exe == INVALID_HANDLE_VALUE) return 0;
     if (!sys_install_dir(dst_dir, MAX_PATH)) return 0;
     if (!GetFullPathNameW(running_exe, MAX_PATH, src_dir, NULL)) return 0;
     if (!(slash = wcsrchr(src_dir, L'\\'))) return 0;
@@ -392,25 +431,37 @@ int sys_install_copy(const wchar_t *running_exe, wchar_t *installed_exe, size_t 
     if (!sys_secure_dir(dst_dir)) return 0;            /* admin-owned, no junctions */
 
     for (size_t i = 0; i < sizeof(FILES) / sizeof(FILES[0]); i++) {
-        DWORD attr;
+        HANDLE h;
+        int ok;
         _snwprintf(src, MAX_PATH, L"%ls\\%ls", src_dir, FILES[i].name);  src[MAX_PATH - 1] = 0;
         _snwprintf(dst, MAX_PATH, L"%ls\\%ls", dst_dir, FILES[i].name);  dst[MAX_PATH - 1] = 0;
-        attr = GetFileAttributesW(src);
-        if (attr == INVALID_FILE_ATTRIBUTES || (attr & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT))) {
+        h = CreateFileW(src, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING,
+                        FILE_FLAG_OPEN_REPARSE_POINT, NULL);
+        if (h == INVALID_HANDLE_VALUE) {
             if (FILES[i].required) return 0;
             continue;
         }
-        if (wcsstr(FILES[i].name, L".sys")) drivers++;
-        if (same_file_contents(src, dst)) continue;
-        /* copy next to the target, then swap it in: never a half-written file */
-        _snwprintf(tmp, MAX_PATH, L"%ls.new", dst);  tmp[MAX_PATH - 1] = 0;
-        if (!CopyFileW(src, tmp, FALSE)) return 0;
-        if (!MoveFileExW(tmp, dst, MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
-            DeleteFileW(tmp);
+        {
+            BY_HANDLE_FILE_INFORMATION fi;
+            if (!GetFileInformationByHandle(h, &fi) ||
+                (fi.dwFileAttributes & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT))) {
+                CloseHandle(h);
+                if (FILES[i].required) return 0;
+                continue;
+            }
+        }
+        if (i == 0 && !windivert_dll_ok(src)) {      /* never install a foreign DLL */
+            CloseHandle(h);
             return 0;
         }
+        if (wcsstr(FILES[i].name, L".sys")) drivers++;
+        ok = install_one(h, dst);
+        CloseHandle(h);
+        if (!ok) return 0;
     }
-    return drivers > 0;
+    /* the exe last: a task only ever points at a complete set of files */
+    _snwprintf(dst, MAX_PATH, L"%ls\\TurkishDPI.exe", dst_dir);  dst[MAX_PATH - 1] = 0;
+    return drivers > 0 && install_one(self_exe, dst);
 }
 
 void sys_uninstall_install_dir(const wchar_t *running_exe) {

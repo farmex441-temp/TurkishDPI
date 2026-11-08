@@ -92,14 +92,35 @@ static BOOL sha256_of_handle(HANDLE f, unsigned char out[32]) {
 static BOOL hash_matches(const unsigned char h[32], const char *hex) {
     static const char digits[] = "0123456789abcdef";
     for (int i = 0; i < 32; i++) {
-        char hi = hex[2 * i], lo = hex[2 * i + 1];
+        char hi = hex[2 * i], lo;
+        if (!hi) return FALSE;                 /* never read past a short string */
+        lo = hex[2 * i + 1];
+        if (!lo) return FALSE;
         if (hi >= 'A' && hi <= 'F') hi += 32;
         if (lo >= 'A' && lo <= 'F') lo += 32;
-        if (!hi || !lo || hi != digits[h[i] >> 4] || lo != digits[h[i] & 15]) return FALSE;
+        if (hi != digits[h[i] >> 4] || lo != digits[h[i] & 15]) return FALSE;
     }
     return hex[64] == 0;
 }
 #endif
+
+/* 1 if the file at path is the pinned WinDivert.dll (always 1 in a build
+ * without a pin). Used before the app copies the DLL into Program Files. */
+int windivert_dll_ok(const wchar_t *path) {
+#ifdef WINDIVERT_DLL_SHA256
+    unsigned char digest[32];
+    BOOL ok;
+    HANDLE f = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING,
+                           FILE_FLAG_SEQUENTIAL_SCAN, NULL);
+    if (f == INVALID_HANDLE_VALUE) return 0;
+    ok = sha256_of_handle(f, digest) && hash_matches(digest, WINDIVERT_DLL_SHA256);
+    CloseHandle(f);
+    return ok;
+#else
+    (void)path;
+    return 1;
+#endif
+}
 
 static BOOL CALLBACK wd_load(PINIT_ONCE o, PVOID p, PVOID *c) {
     wchar_t path[MAX_PATH];
@@ -128,6 +149,7 @@ static BOOL CALLBACK wd_load(PINIT_ONCE o, PVOID p, PVOID *c) {
 #endif
     /* Absolute path; its own imports (kernel32, advapi32) from System32 only. */
     h = LoadLibraryExW(path, NULL, LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_SYSTEM32);
+    if (!h) wd.err = GetLastError();   /* e.g. 193: DLL of the wrong architecture */
     if (pin != INVALID_HANDLE_VALUE) CloseHandle(pin);   /* mapped now: cannot change */
     if (!h) return TRUE;
 #define WD_SYM(field, type, name) wd.field = (type)(void *)GetProcAddress(h, name)
