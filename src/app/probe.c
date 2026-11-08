@@ -371,7 +371,7 @@ int probe_learn_block_ips(const char *clean_v4, unsigned short clean_port,
 
 void probe_flush_dns_cache(void) {
     typedef BOOL (WINAPI *flush_fn)(void);
-    HMODULE h = LoadLibraryW(L"dnsapi.dll");
+    HMODULE h = LoadLibraryExW(L"dnsapi.dll", NULL, LOAD_LIBRARY_SEARCH_SYSTEM32);
     if (h) {
         flush_fn f = (flush_fn)(void *)GetProcAddress(h, "DnsFlushResolverCache");
         if (f) f();

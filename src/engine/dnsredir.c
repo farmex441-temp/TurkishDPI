@@ -48,6 +48,7 @@ typedef struct udp_connrecord {
 static time_t last_cleanup = 0;
 static udp_connrecord_t *conntrack = NULL;
 static int hybrid = 0;
+static int builtins_added = 0;
 static uint32_t clean_v4[4], clean_v6[4];
 static uint16_t clean_v4port, clean_v6port;
 
@@ -67,7 +68,8 @@ static int n_block_v6 = 0;
 
 void dns_set_hybrid(int on) {
     hybrid = on;
-    if (on && !n_block_v4) {
+    if (on && !builtins_added) {   /* independent of argument order */
+        builtins_added = 1;
         dns_add_block_ip("195.175.254.2");          /* BTK / Turk Telekom block page */
         dns_add_block_ip("2a01:358:4014:a00::3");   /* same, IPv6 */
     }

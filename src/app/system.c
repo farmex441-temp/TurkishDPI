@@ -190,37 +190,112 @@ int sys_check_update(wchar_t *tag_out, size_t cap) {
 }
 
 /* ---------- folder security ---------- */
-/* Creates/locks a folder: owner Administrators, protected DACL with SYSTEM and
- * Administrators full control and Users read/execute only. A reparse point
- * (junction/symlink) planted in its place is refused. */
+static int owner_is_trusted(PSID owner) {
+    SID_IDENTIFIER_AUTHORITY nt = SECURITY_NT_AUTHORITY;
+    PSID admins = NULL, system = NULL;
+    int ok = 0;
+    if (!owner) return 0;
+    if (AllocateAndInitializeSid(&nt, 2, SECURITY_BUILTIN_DOMAIN_RID, DOMAIN_ALIAS_RID_ADMINS,
+                                 0, 0, 0, 0, 0, 0, &admins)) {
+        ok |= EqualSid(owner, admins);
+        FreeSid(admins);
+    }
+    if (AllocateAndInitializeSid(&nt, 1, SECURITY_LOCAL_SYSTEM_RID, 0, 0, 0, 0, 0, 0, 0, &system)) {
+        ok |= EqualSid(owner, system);
+        FreeSid(system);
+    }
+    if (!ok) {
+        /* Files we created ourselves: on default Windows settings an elevated
+         * administrator's files are owned by the user account, not the group. */
+        HANDLE tok;
+        if (OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &tok)) {
+            BYTE buf[256];
+            DWORD len = 0;
+            if (GetTokenInformation(tok, TokenUser, buf, sizeof(buf), &len))
+                ok = EqualSid(owner, ((TOKEN_USER *)buf)->User.Sid);
+            CloseHandle(tok);
+        }
+    }
+    return ok;
+}
+
+static void remove_tree_safe(const wchar_t *dir);
+
+/*
+ * Creates/locks a folder for an elevated process: owner Administrators,
+ * protected DACL (SYSTEM + Administrators full, Users read/execute).
+ * Works on an open handle (FILE_FLAG_OPEN_REPARSE_POINT), so the folder that
+ * was checked is the one that gets the new security - a junction swapped in
+ * between cannot redirect it. Entries left in it by other users are removed.
+ */
 int sys_secure_dir(const wchar_t *dir) {
     PSECURITY_DESCRIPTOR sd = NULL;
     PACL dacl = NULL;
     BOOL present = FALSE, def = FALSE;
     PSID admins = NULL;
     SID_IDENTIFIER_AUTHORITY nt = SECURITY_NT_AUTHORITY;
-    DWORD attr;
+    BY_HANDLE_FILE_INFORMATION info;
+    HANDLE h;
     int ok = 0;
 
     CreateDirectoryW(dir, NULL);
-    attr = GetFileAttributesW(dir);
-    if (attr == INVALID_FILE_ATTRIBUTES || !(attr & FILE_ATTRIBUTE_DIRECTORY) ||
-        (attr & FILE_ATTRIBUTE_REPARSE_POINT))
+    h = CreateFileW(dir, READ_CONTROL | WRITE_DAC | WRITE_OWNER | FILE_READ_ATTRIBUTES,
+                    FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, NULL, OPEN_EXISTING,
+                    FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT, NULL);
+    if (h == INVALID_HANDLE_VALUE) return 0;
+    if (!GetFileInformationByHandle(h, &info) ||
+        !(info.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) ||
+        (info.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT)) {
+        CloseHandle(h);
         return 0;
-    if (!ConvertStringSecurityDescriptorToSecurityDescriptorW(
-            L"D:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;0x1200a9;;;BU)", SDDL_REVISION_1, &sd, NULL))
-        return 0;
-    if (GetSecurityDescriptorDacl(sd, &present, &dacl, &def) &&
+    }
+    if (ConvertStringSecurityDescriptorToSecurityDescriptorW(
+            L"D:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;0x1200a9;;;BU)", SDDL_REVISION_1, &sd, NULL) &&
+        GetSecurityDescriptorDacl(sd, &present, &dacl, &def) &&
         AllocateAndInitializeSid(&nt, 2, SECURITY_BUILTIN_DOMAIN_RID, DOMAIN_ALIAS_RID_ADMINS,
                                  0, 0, 0, 0, 0, 0, &admins)) {
-        ok = SetNamedSecurityInfoW((LPWSTR)dir, SE_FILE_OBJECT,
-                                   OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION |
-                                   PROTECTED_DACL_SECURITY_INFORMATION,
-                                   admins, NULL, dacl, NULL) == ERROR_SUCCESS;
+        ok = SetSecurityInfo(h, SE_FILE_OBJECT,
+                             OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION |
+                             PROTECTED_DACL_SECURITY_INFORMATION,
+                             admins, NULL, dacl, NULL) == ERROR_SUCCESS;
         FreeSid(admins);
     }
-    LocalFree(sd);
-    return ok;
+    if (sd) LocalFree(sd);
+    CloseHandle(h);
+    if (!ok) return 0;
+
+    /* Anything inside that an ordinary user created (and so still controls
+     * through ownership) is removed; it is recreated by us when needed. */
+    {
+        wchar_t pat[MAX_PATH], path[MAX_PATH];
+        WIN32_FIND_DATAW fd;
+        HANDLE f;
+        swprintf(pat, MAX_PATH, L"%ls\\*", dir);
+        f = FindFirstFileW(pat, &fd);
+        if (f != INVALID_HANDLE_VALUE) {
+            do {
+                PSID owner = NULL;
+                PSECURITY_DESCRIPTOR osd = NULL;
+                if (!wcscmp(fd.cFileName, L".") || !wcscmp(fd.cFileName, L"..")) continue;
+                swprintf(path, MAX_PATH, L"%ls\\%ls", dir, fd.cFileName);
+                if (fd.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) {
+                    if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) RemoveDirectoryW(path);
+                    else DeleteFileW(path);
+                    continue;
+                }
+                if (GetNamedSecurityInfoW(path, SE_FILE_OBJECT, OWNER_SECURITY_INFORMATION,
+                                          &owner, NULL, NULL, NULL, &osd) == ERROR_SUCCESS) {
+                    if (!owner_is_trusted(owner)) {
+                        if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) remove_tree_safe(path);
+                        else DeleteFileW(path);
+                    }
+                    LocalFree(osd);
+                }
+            } while (FindNextFileW(f, &fd));
+            FindClose(f);
+        }
+    }
+    return 1;
 }
 
 /* ---------- uninstall / clean-up ---------- */
@@ -245,6 +320,10 @@ static void delete_tree(const wchar_t *dir) {
         FindClose(h);
     }
     if (!RemoveDirectoryW(dir)) MoveFileExW(dir, NULL, MOVEFILE_DELAY_UNTIL_REBOOT);
+}
+
+static void remove_tree_safe(const wchar_t *dir) {
+    delete_tree(dir);
 }
 
 void sys_uninstall(const wchar_t *data_dir) {

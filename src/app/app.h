@@ -15,7 +15,7 @@ typedef enum {
 } state_kind_t;
 
 enum { CMD_NONE, CMD_RESCAN, CMD_SELECT, CMD_AUTO, CMD_PAUSE, CMD_RESUME,
-       CMD_TESTSITE, CMD_RESTART, CMD_TOGGLE_PAUSE };
+       CMD_TESTSITE, CMD_RESTART, CMD_TOGGLE_PAUSE, CMD_AUTOSTART };
 
 typedef struct {
     state_kind_t kind;
@@ -33,6 +33,8 @@ typedef struct {
     int dns_ms;                 /* round trip of the chosen clean DNS */
     int hybrid;                 /* hybrid DNS on                      */
     int n_block_ips;            /* learned block-page addresses       */
+    long driver_err;            /* last WinDivert error code, 0 = none */
+    int autostart;              /* Windows logon task present (-1 unknown) */
     int learned;                /* presets with history on this net */
     wchar_t site_result[160];   /* result of the last site test   */
     DWORD started_tick;         /* when the current preset started */
@@ -56,6 +58,8 @@ void autostart_set(int on);
 void app_exit(void);
 void set_payment_protect(int on);
 void app_network_event(void);
+void app_open_url(const wchar_t *url);   /* in the user's (non-elevated) shell */
+void app_open_file(const wchar_t *path); /* Notepad from System32 */
 void app_repair_proxy(void);
 void app_uninstall(void);
 

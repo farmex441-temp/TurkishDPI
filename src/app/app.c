@@ -17,6 +17,7 @@
  */
 #define WIN32_LEAN_AND_MEAN
 #include <winsock2.h>
+#include <ws2tcpip.h>
 #include <windows.h>
 #include <shellapi.h>
 #include <shlobj.h>
@@ -31,6 +32,8 @@
 #include "system.h"
 
 int gdpi_main(int argc, char *argv[]);
+static DWORD run_hidden(const wchar_t *exe, const wchar_t *args);
+static void autostart_query(void);
 
 /* ---------- shared state ---------- */
 CRITICAL_SECTION g_lock;
@@ -136,9 +139,9 @@ static void set_targets_ui(const int *ok, const int *ms) {
     ui_refresh();
 }
 
-static void notify(const wchar_t *title, const wchar_t *text) {
+static int notify(const wchar_t *title, const wchar_t *text) {
     NOTIFYICONDATAW n;
-    if (g_quiet_start) return;
+    if (g_quiet_start) return 0;
     ZeroMemory(&n, sizeof(n));
     n.cbSize = sizeof(n);
     n.hWnd = ui_hwnd();
@@ -148,7 +151,7 @@ static void notify(const wchar_t *title, const wchar_t *text) {
     wcsncpy(n.szInfo, text, 255);
     n.dwInfoFlags = NIIF_USER | NIIF_LARGE_ICON | NIIF_NOSOUND;
     n.hBalloonIcon = LoadIconW(GetModuleHandleW(NULL), MAKEINTRESOURCEW(1));
-    Shell_NotifyIconW(NIM_MODIFY, &n);
+    return Shell_NotifyIconW(NIM_MODIFY, &n) ? 1 : 0;
 }
 
 /* ---------- config ---------- */
@@ -199,6 +202,11 @@ static void config_load(void) {
     GetPrivateProfileStringW(L"TurkishDPI", L"Control", g_control_buf, g_control_buf,
                              sizeof(g_control_buf) / sizeof(wchar_t), g_ini);
     g_ncontrol = split_hosts(g_control_buf, g_control);
+    if (g_ncontrol == 0) {   /* no control site = "offline" forever */
+        wcscpy(g_control_buf, L"www.google.com,www.microsoft.com");
+        g_ncontrol = split_hosts(g_control_buf, g_control);
+    }
+    g_ui.hybrid = g_dns_hybrid;
     targets_reload();
 }
 
@@ -211,23 +219,23 @@ static void config_save(void) {
     ini_set_int(L"WatchdogMinutes", g_watchdog_min);
 }
 
-static void targets_add(const wchar_t *host) {
+static int targets_add(const wchar_t *host) {
     wchar_t buf[512];
     for (int i = 0; i < g_ntargets; i++)
-        if (!_wcsicmp(g_targets[i], host)) return;
-    if (g_ntargets >= PROBE_MAX_HOSTS) return;
+        if (!_wcsicmp(g_targets[i], host)) return 1;
+    if (g_ntargets >= PROBE_MAX_HOSTS) return 0;
     buf[0] = 0;
     {
         size_t used = 0, need;
         for (int i = 0; i < g_ntargets; i++) {
             need = wcslen(g_targets[i]) + 1;
-            if (used + need >= 512) return;
+            if (used + need >= 512) return 0;
             memcpy(buf + used, g_targets[i], (need - 1) * sizeof(wchar_t));
             buf[used + need - 1] = L',';
             used += need;
         }
         need = wcslen(host);
-        if (used + need >= 512) return;   /* would not fit: do not save it truncated */
+        if (used + need >= 512) return 0;   /* would not fit: do not save it truncated */
         memcpy(buf + used, host, need * sizeof(wchar_t));
         buf[used + need] = 0;
     }
@@ -235,6 +243,8 @@ static void targets_add(const wchar_t *host) {
     wcscpy(g_targets_buf, buf);
     g_ntargets = split_hosts(g_targets_buf, g_targets);
     log_line("learned new target site");
+    set_targets_ui(NULL, NULL);
+    return 1;
 }
 
 /* ---------- engine process control ---------- */
@@ -488,6 +498,8 @@ static void pick_dns(void) {
 
 /* Learns which addresses this network's resolver answers blocked names with
  * (needs the engine stopped, so the real answers are seen). Kept per network. */
+static void load_block_ips(void);
+
 static void learn_block_ips(void) {
     char found[8][16];
     wchar_t sec[80], key[8], val[32];
@@ -503,14 +515,24 @@ static void learn_block_ips(void) {
         WritePrivateProfileStringW(sec, key, NULL, g_ini);
         log_line("learned %d block-page address(es), first %s", n, found[0]);
     }
-    /* use what is stored (just learned, or from earlier visits) */
+    load_block_ips();
+}
+
+/* Block-page addresses stored for the current network. Every value is
+ * validated: it ends up on the elevated engine's command line. */
+static void load_block_ips(void) {
+    wchar_t sec[80], key[8], val[32];
+    swprintf(sec, 80, L"net_%ls", smart_network_id());
     g_n_block_ips = 0;
     for (int i = 0; i < 8; i++) {
+        char a[16];
+        struct in_addr tmp;
         swprintf(key, 8, L"b%d", i);
         GetPrivateProfileStringW(sec, key, L"", val, 32, g_ini);
         if (!val[0]) break;
-        WideCharToMultiByte(CP_ACP, 0, val, -1, g_block_ips[g_n_block_ips], 16, NULL, NULL);
-        g_n_block_ips++;
+        if (WideCharToMultiByte(CP_ACP, 0, val, -1, a, sizeof(a), NULL, NULL) <= 0) continue;
+        if (inet_pton(AF_INET, a, &tmp) != 1) continue;
+        memcpy(g_block_ips[g_n_block_ips++], a, sizeof(a));
     }
     EnterCriticalSection(&g_lock);
     g_ui.n_block_ips = g_n_block_ips;
@@ -523,6 +545,9 @@ static int engine_fatal(void) {
     wchar_t st[64];
     if (!msg) return 0;
     swprintf(st, 64, L"Sürücü başlatılamadı (%ld)", g_engine_err);
+    EnterCriticalSection(&g_lock);
+    g_ui.driver_err = g_engine_err;
+    LeaveCriticalSection(&g_lock);
     set_state(ST_ERROR, st, msg);
     g_quiet_start = 0;
     if (g_engine_err != g_last_fatal) {   /* no repeated balloons from the watchdog */
@@ -537,6 +562,7 @@ static void announce(int p, int score) {
     g_preset = p;
     g_last_fatal = 0;
     g_last_score = score;
+    g_ui.driver_err = 0;
     config_save();
     swprintf(d, 160, L"%ls", PRESETS[p].name);
     if (score >= g_ntargets) {
@@ -564,8 +590,8 @@ static void system_checks(void) {
         wchar_t msg[200];
         swprintf(msg, 200, L"%ls çalışıyor. İki araç aynı bağlantıları değiştirirse siteler açılmaz; "
                            L"%ls'ı kapatın.", rival, rival);
-        notify(L"Çakışan program", msg);
-        wcscpy(g_rival_notified, rival);
+        if (notify(L"Çakışan program", msg))
+            wcscpy(g_rival_notified, rival);
         log_line("rival tool running");
     }
     if (broken) log_line("system proxy points at a dead local port");
@@ -582,6 +608,18 @@ void app_repair_proxy(void) {
     }
 }
 
+static HANDLE g_controller;
+static DWORD g_controller_id;
+
+/* Stops the controller thread (it checks g_quitting between steps) so that
+ * nothing restarts the engine or writes files while we tear down. */
+static void stop_controller(DWORD wait_ms) {
+    InterlockedExchange(&g_quitting, 1);
+    SetEvent(g_cmd_event);
+    if (g_controller && GetCurrentThreadId() != g_controller_id)
+        WaitForSingleObject(g_controller, wait_ms);
+}
+
 void app_uninstall(void) {
     NOTIFYICONDATAW n;
     ZeroMemory(&n, sizeof(n));
@@ -589,11 +627,9 @@ void app_uninstall(void) {
     n.hWnd = ui_hwnd();
     n.uID = 1;
     Shell_NotifyIconW(NIM_DELETE, &n);
-    InterlockedExchange(&g_quitting, 1);   /* the controller can start nothing now */
+    stop_controller(30000);
     engine_stop();
-    if (autostart_enabled()) autostart_set(0);
-    Sleep(500);
-    engine_stop();                         /* in case a start was already under way */
+    run_hidden(L"schtasks.exe", L"/Delete /F /TN \"TurkishDPI\"");
     sys_uninstall(g_dir);
     probe_flush_dns_cache();
     MessageBoxW(NULL, L"TurkishDPI kaldırıldı: başlangıç görevi, ayarlar, günlük ve sürücü silindi.\n"
@@ -753,11 +789,19 @@ static void auto_scan(void) {
         log_line("targets reachable without engine; standing by");
         return;
     }
-    if (engine_start(g_preset, g_dns))
-        set_state(ST_PARTIAL, L"Çalışan profil bulunamadı", PRESETS[g_preset].name);
-    else if (!engine_fatal())
-        set_state(ST_ERROR, L"Çalışan profil bulunamadı", L"Günlük dosyasına bakın");
-    notify(L"TurkishDPI", L"Hiçbir profil tüm test sitelerini açamadı.");
+    {
+        int was = g_ui.kind == ST_PARTIAL || g_ui.kind == ST_ERROR;
+        if (engine_start(g_preset, g_dns)) {
+            g_last_score = targets_score(NULL);   /* the watchdog compares against this */
+            set_state(ST_PARTIAL, L"Çalışan profil bulunamadı", PRESETS[g_preset].name);
+        } else if (engine_fatal()) {
+            return;                                /* it already explained itself */
+        } else {
+            g_last_score = 0;
+            set_state(ST_ERROR, L"Çalışan profil bulunamadı", L"Günlük dosyasına bakın");
+        }
+        if (!was) notify(L"TurkishDPI", L"Hiçbir profil tüm test sitelerini açamadı.");
+    }
 }
 
 static int health_ok(void) {
@@ -774,6 +818,8 @@ static int health_ok(void) {
 
 static void manual_start(int p) {
     int ms, score;
+    InterlockedExchange(&g_scan_aborted, 0);
+    if (g_dns_hybrid) load_block_ips();
     set_state(ST_SCANNING, L"Başlatılıyor…", PRESETS[p].name);
     if (!engine_start(p, g_dns)) {
         if (!engine_fatal()) set_state(ST_ERROR, L"Başlatılamadı", PRESETS[p].name);
@@ -826,7 +872,7 @@ static void site_test(const wchar_t *raw) {
     probe_flush_dns_cache();
     if (probe_https_many(h, 1, 6000, NULL, NULL) == 1) {
         site_result(L"✓ %ls açılıyor", host);
-        if (g_scan_aborted) auto_scan();   /* a scan we interrupted must still finish */
+        if (g_scan_aborted && g_auto) auto_scan();   /* a scan we interrupted must still finish */
         return;
     }
     if (!control_ok()) { site_result(L"İnternet yok, %ls test edilemedi", host); return; }
@@ -842,15 +888,18 @@ static void site_test(const wchar_t *raw) {
         probe_flush_dns_cache();
         if (probe_https_many(h, 1, 6000, NULL, NULL) == 1 && targets_score(NULL) >= g_ntargets) {
             InterlockedExchange(&g_scan_aborted, 0);
-            targets_add(host);
             smart_record(p, 1, 0);
-            site_result(L"✓ %ls açıldı – profil değişti ve site hatırlandı", host);
+            site_result(targets_add(host)
+                        ? L"✓ %ls açıldı – profil değişti ve site hatırlandı"
+                        : L"✓ %ls açıldı – profil değişti (izleme listesi dolu)", host);
             announce(p, g_ntargets);
             return;
         }
     }
     site_result(L"✗ %ls açılamadı: IP/sunucu engeli olabilir (DPI ile aşılamaz)", host);
-    if (!g_scan_aborted && prev >= 0 && engine_start(prev, g_dns))
+    if (!g_auto)
+        manual_start(g_preset);                /* a manual choice stays the user's */
+    else if (!g_scan_aborted && prev >= 0 && engine_start(prev, g_dns))
         announce(prev, targets_score(NULL));   /* the real score, not an assumed one */
     else
         auto_scan();
@@ -869,6 +918,7 @@ static DWORD WINAPI controller(LPVOID unused) {
     NotifyAddrChange(&notify_h, &ov);
 
     smart_network_changed();
+    if (!g_selftest) autostart_query();
     if (g_auto) auto_scan(); else manual_start(g_preset);
     if (g_selftest) selftest_finish();
 
@@ -903,19 +953,29 @@ static DWORD WINAPI controller(LPVOID unused) {
 
         if ((cmd = cmd_pop(&arg)) != CMD_NONE) {
             if (cmd == CMD_TOGGLE_PAUSE) cmd = g_paused ? CMD_RESUME : CMD_PAUSE;
+            if (cmd != CMD_TESTSITE) InterlockedExchange(&g_scan_aborted, 0);
             switch (cmd) {
             case CMD_RESCAN:  g_paused = 0; auto_scan(); break;
             case CMD_AUTO:    g_auto = 1; g_paused = 0; config_save(); auto_scan(); break;
             case CMD_SELECT:  if (arg >= 0 && arg < PRESET_COUNT) {
-                                  g_auto = 0; g_paused = 0; config_save(); manual_start((int)arg);
+                                  g_auto = 0; g_paused = 0; g_preset = (int)arg;
+                                  config_save(); manual_start((int)arg);
                               }
                               break;
             case CMD_PAUSE:   g_paused = 1; engine_stop(); probe_flush_dns_cache();
                               set_state(ST_PAUSED, L"Duraklatıldı", L"Açmak için düğmeye basın"); break;
-            case CMD_RESUME:
-            case CMD_RESTART: g_paused = 0;
+            case CMD_RESTART: /* settings changed: restart what runs, no full rescan */
+                              if (!g_paused && g_running_preset >= 0) {
+                                  int p = g_running_preset;
+                                  if (engine_start(p, g_dns)) announce(p, targets_score(NULL));
+                                  else if (!engine_fatal()) { if (g_auto) auto_scan(); else manual_start(g_preset); }
+                                  break;
+                              }
+                              /* fall through */
+            case CMD_RESUME:  g_paused = 0;
                               if (g_auto) auto_scan(); else manual_start(g_preset);
                               break;
+            case CMD_AUTOSTART: autostart_set((int)arg); break;
             case CMD_TESTSITE: {
                 wchar_t h[256];
                 EnterCriticalSection(&g_lock);
@@ -935,6 +995,7 @@ static DWORD WINAPI controller(LPVOID unused) {
             Sleep(4000);   /* let DHCP/DNS settle */
             log_line("network change detected");
             smart_network_changed();
+            if (g_dns_hybrid) load_block_ips();   /* this network's, not the last one's */
             if (!control_ok()) {
                 engine_stop();
                 set_state(ST_OFFLINE, L"İnternet bağlantısı yok", L"Bağlantı gelince otomatik başlayacak");
@@ -994,22 +1055,29 @@ void post_site_test(const wchar_t *host) {
 void set_payment_protect(int on) {
     g_payment_protect = on;
     config_save();
-    if (g_running_preset >= 0 || g_ui.kind == ST_SCANNING) post_cmd(CMD_RESTART, 0);
+    if (g_running_preset >= 0) post_cmd(CMD_RESTART, 0);
     else ui_refresh();
 }
 
 /* ---------- autostart via Task Scheduler (elevated, no UAC prompt) ---------- */
-static DWORD run_hidden(const wchar_t *cmdline) {
+/* Runs "<System32>\\<exe> <args>" hidden; the program is always taken from
+ * System32 (an elevated process must not pick up a planted copy). */
+static DWORD run_hidden(const wchar_t *exe, const wchar_t *args) {
     STARTUPINFOW si;
     PROCESS_INFORMATION pi;
-    wchar_t buf[1024];
+    wchar_t buf[2048], path[MAX_PATH];
+    UINT n = GetSystemDirectoryW(path, MAX_PATH);
     DWORD code = 1;
+    if (n == 0 || n + wcslen(exe) + 2 >= MAX_PATH) return 1;
+    wcscat(path, L"\\");
+    wcscat(path, exe);
+    _snwprintf(buf, 2047, L"\"%ls\" %ls", path, args);
+    buf[2047] = 0;
     ZeroMemory(&si, sizeof(si));
     si.cb = sizeof(si);
     si.dwFlags = STARTF_USESHOWWINDOW;
     si.wShowWindow = SW_HIDE;
-    wcsncpy(buf, cmdline, 1023); buf[1023] = 0;
-    if (CreateProcessW(NULL, buf, NULL, NULL, FALSE, CREATE_NO_WINDOW, NULL, NULL, &si, &pi)) {
+    if (CreateProcessW(path, buf, NULL, NULL, FALSE, CREATE_NO_WINDOW, NULL, NULL, &si, &pi)) {
         WaitForSingleObject(pi.hProcess, 15000);
         GetExitCodeProcess(pi.hProcess, &code);
         CloseHandle(pi.hProcess);
@@ -1018,28 +1086,100 @@ static DWORD run_hidden(const wchar_t *cmdline) {
     return code;
 }
 
-static int g_autostart_cache = -1;
+/* Known from the controller thread (schtasks can take seconds): the UI only
+ * reads the cached value. -1 = not known yet. */
+static volatile LONG g_autostart_cache = -1;
 
 int autostart_enabled(void) {
-    if (g_autostart_cache < 0)
-        g_autostart_cache = run_hidden(L"schtasks.exe /Query /TN \"TurkishDPI\"") == 0;
-    return g_autostart_cache;
+    return g_autostart_cache == 1;
 }
 
-void autostart_set(int on) {
-    wchar_t cmd[1024];
-    if (on)
-        swprintf(cmd, 1024, L"schtasks.exe /Create /F /RL HIGHEST /SC ONLOGON /DELAY 0000:10 "
-                            L"/TN \"TurkishDPI\" /TR \"\\\"%ls\\\" --tray\"", g_exe);
-    else
-        wcscpy(cmd, L"schtasks.exe /Delete /F /TN \"TurkishDPI\"");
-    if (run_hidden(cmd) != 0) {
-        MessageBoxW(ui_hwnd(), L"Başlangıç görevi ayarlanamadı.", L"TurkishDPI", MB_ICONWARNING);
-        g_autostart_cache = -1;
-    } else {
-        g_autostart_cache = on;
-    }
+static void autostart_query(void) {
+    LONG v = run_hidden(L"schtasks.exe", L"/Query /TN \"TurkishDPI\"") == 0;
+    InterlockedExchange(&g_autostart_cache, v);
+    EnterCriticalSection(&g_lock);
+    g_ui.autostart = (int)v;
+    LeaveCriticalSection(&g_lock);
     ui_refresh();
+}
+
+static void xml_escape(const wchar_t *in, wchar_t *out, size_t cap) {
+    size_t o = 0;
+    for (; *in && o + 7 < cap; in++) {
+        const wchar_t *r = NULL;
+        if (*in == L'&') r = L"&amp;";
+        else if (*in == L'<') r = L"&lt;";
+        else if (*in == L'>') r = L"&gt;";
+        else if (*in == L'"') r = L"&quot;";
+        if (r) { wcscpy(out + o, r); o += wcslen(r); }
+        else out[o++] = *in;
+    }
+    out[o] = 0;
+}
+
+/*
+ * Logon task defined in XML: schtasks' command-line form inherits the
+ * defaults "only on AC power", "stop on battery" and "stop after 3 days",
+ * which silently turn protection off on laptops.
+ */
+void autostart_set(int on) {
+    int ok = 0;
+    if (on) {
+        wchar_t xml_path[MAX_PATH], exe[MAX_PATH * 2], user[256] = L"", args[MAX_PATH + 64];
+        wchar_t xml[4096];
+        DWORD ulen = 256;
+        HANDLE f;
+        DWORD w;
+        xml_escape(g_exe, exe, MAX_PATH * 2);
+        GetUserNameW(user, &ulen);
+        {
+            wchar_t dom[128] = L"", uq[300], esc[600];
+            GetEnvironmentVariableW(L"USERDOMAIN", dom, 128);
+            _snwprintf(uq, 299, L"%ls%ls%ls", dom, dom[0] ? L"\\" : L"", user);
+            uq[299] = 0;
+            xml_escape(uq, esc, 600);
+            _snwprintf(xml, 4095,
+                L"<?xml version=\"1.0\" encoding=\"UTF-16\"?>\r\n"
+                L"<Task version=\"1.2\" xmlns=\"http://schemas.microsoft.com/windows/2004/02/mit/task\">\r\n"
+                L"  <RegistrationInfo><Description>TurkishDPI</Description></RegistrationInfo>\r\n"
+                L"  <Triggers><LogonTrigger><Enabled>true</Enabled><UserId>%ls</UserId>"
+                L"<Delay>PT10S</Delay></LogonTrigger></Triggers>\r\n"
+                L"  <Principals><Principal id=\"Author\"><UserId>%ls</UserId>"
+                L"<LogonType>InteractiveToken</LogonType><RunLevel>HighestAvailable</RunLevel>"
+                L"</Principal></Principals>\r\n"
+                L"  <Settings><MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>"
+                L"<DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>"
+                L"<StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>"
+                L"<AllowHardTerminate>true</AllowHardTerminate><StartWhenAvailable>true</StartWhenAvailable>"
+                L"<RunOnlyIfNetworkAvailable>false</RunOnlyIfNetworkAvailable>"
+                L"<IdleSettings><StopOnIdleEnd>false</StopOnIdleEnd><RestartOnIdle>false</RestartOnIdle></IdleSettings>"
+                L"<AllowStartOnDemand>true</AllowStartOnDemand><Enabled>true</Enabled><Hidden>false</Hidden>"
+                L"<RunOnlyIfIdle>false</RunOnlyIfIdle><WakeToRun>false</WakeToRun>"
+                L"<ExecutionTimeLimit>PT0S</ExecutionTimeLimit><Priority>7</Priority></Settings>\r\n"
+                L"  <Actions Context=\"Author\"><Exec><Command>%ls</Command><Arguments>--tray</Arguments>"
+                L"</Exec></Actions>\r\n"
+                L"</Task>\r\n", esc, esc, exe);
+            xml[4095] = 0;
+        }
+        /* written to the admin-only data folder, removed right after use */
+        swprintf(xml_path, MAX_PATH, L"%ls\\autostart.xml", g_dir);
+        f = CreateFileW(xml_path, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+        if (f != INVALID_HANDLE_VALUE) {
+            static const WCHAR bom = 0xFEFF;
+            WriteFile(f, &bom, sizeof(bom), &w, NULL);
+            WriteFile(f, xml, (DWORD)(wcslen(xml) * sizeof(wchar_t)), &w, NULL);
+            CloseHandle(f);
+            _snwprintf(args, MAX_PATH + 63, L"/Create /F /TN \"TurkishDPI\" /XML \"%ls\"", xml_path);
+            args[MAX_PATH + 63] = 0;
+            ok = run_hidden(L"schtasks.exe", args) == 0;
+            DeleteFileW(xml_path);
+        }
+    } else {
+        ok = run_hidden(L"schtasks.exe", L"/Delete /F /TN \"TurkishDPI\"") == 0;
+    }
+    if (!ok)
+        MessageBoxW(ui_hwnd(), L"Başlangıç görevi ayarlanamadı.", L"TurkishDPI", MB_ICONWARNING);
+    autostart_query();
 }
 
 /* ---------- conflicting tools ---------- */
@@ -1078,7 +1218,7 @@ void app_exit(void) {
     n.hWnd = ui_hwnd();
     n.uID = 1;
     Shell_NotifyIconW(NIM_DELETE, &n);
-    InterlockedExchange(&g_quitting, 1);
+    stop_controller(5000);
     engine_stop();
     probe_flush_dns_cache();
     log_line("exit");
@@ -1114,7 +1254,12 @@ static int app_main(int quiet) {
     }
     /* Admin-only folder (users may read): we run elevated, so a folder that
      * users can write to would let them plant links or files we act on. */
-    sys_secure_dir(g_dir);
+    if (!sys_secure_dir(g_dir)) {
+        MessageBoxW(NULL, L"Veri klasörü güvenli hale getirilemedi:\n%ProgramData%\\TurkishDPI\n\n"
+                          L"Klasör bir bağlantı (junction) olabilir veya başka bir kullanıcıya ait olabilir. "
+                          L"Klasörü silip TurkishDPI'ı yeniden başlatın.", L"TurkishDPI", MB_ICONERROR);
+        return 1;
+    }
     swprintf(g_ini, MAX_PATH, L"%ls\\TurkishDPI.ini", g_dir);
     swprintf(g_log, MAX_PATH, L"%ls\\TurkishDPI.log", g_dir);
     log_rotate();
@@ -1141,8 +1286,8 @@ static int app_main(int quiet) {
     if (!ui_init(GetModuleHandleW(NULL))) return 1;
     if (!quiet) ui_show();
 
-    t = CreateThread(NULL, 256 * 1024, controller, NULL, STACK_SIZE_PARAM_IS_A_RESERVATION, NULL);
-    if (t) CloseHandle(t);
+    g_controller = CreateThread(NULL, 256 * 1024, controller, NULL, STACK_SIZE_PARAM_IS_A_RESERVATION,
+                                &g_controller_id);
     if (!g_selftest && ini_int(L"CheckUpdates", 1)) {
         t = CreateThread(NULL, 64 * 1024, update_thread, NULL, STACK_SIZE_PARAM_IS_A_RESERVATION, NULL);
         if (t) CloseHandle(t);
@@ -1156,6 +1301,26 @@ static int app_main(int quiet) {
     }
     app_exit();
     return 0;
+}
+
+void app_open_url(const wchar_t *url) {
+    /* explorer.exe hands the URL to the already running, non-elevated shell,
+     * so the browser does not start with administrator rights */
+    wchar_t ex[MAX_PATH];
+    UINT n = GetWindowsDirectoryW(ex, MAX_PATH);
+    if (n == 0 || n + 14 >= MAX_PATH) return;
+    wcscat(ex, L"\\explorer.exe");
+    ShellExecuteW(NULL, L"open", ex, url, NULL, SW_SHOWNORMAL);
+}
+
+void app_open_file(const wchar_t *path) {
+    wchar_t np[MAX_PATH], arg[MAX_PATH + 2];
+    UINT n = GetSystemDirectoryW(np, MAX_PATH);
+    if (n == 0 || n + 14 >= MAX_PATH) return;
+    wcscat(np, L"\\notepad.exe");
+    _snwprintf(arg, MAX_PATH + 1, L"\"%ls\"", path);
+    arg[MAX_PATH + 1] = 0;
+    ShellExecuteW(NULL, L"open", np, arg, NULL, SW_SHOWNORMAL);
 }
 
 /* Fires network re-check from the UI thread (sleep resume). */

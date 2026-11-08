@@ -267,6 +267,27 @@ static void add_filter_str(int proto, int port) {
     free(current_filter);
 }
 
+/*
+ * TurkishDPI: answers of the clean resolver on its non-standard port. Only
+ * that server's answers are diverted - a bare "udp port N" clause would also
+ * catch unrelated traffic on the same port (mDNS on 5353, QUIC on 443).
+ * Queries to it never need diverting: the redirected copies are injected by
+ * the engine itself.
+ */
+static void add_dns_answer_filter(const char *ip, int port, int is_v6) {
+    const char *fmt = is_v6
+        ? " or (udp and !impostor and !loopback and inbound and ipv6.SrcAddr == %s and udp.SrcPort == %d)"
+        : " or (udp and !impostor and !loopback and inbound and ip.SrcAddr == %s and udp.SrcPort == %d)";
+    char *current_filter = filter_string;
+    size_t new_filter_size = strlen(current_filter) + strlen(fmt) + strlen(ip) + 16;
+    char *new_filter = malloc(new_filter_size);
+    if (!new_filter) return;
+    snprintf(new_filter, new_filter_size, "%s", current_filter);
+    snprintf(new_filter + strlen(new_filter), new_filter_size - strlen(new_filter), fmt, ip, port);
+    filter_string = new_filter;
+    free(current_filter);
+}
+
 static void add_ip_id_str(int id) {
     char *newstr;
     const char *ipid = " or ip.Id == %d";
@@ -634,6 +655,7 @@ int gdpi_main(int argc, char *argv[]) {
     } packet_type;
     bool debug_exit = false;
     int do_payment_exclude = 1;
+    char dnsv4_str[INET6_ADDRSTRLEN] = "", dnsv6_str[INET6_ADDRSTRLEN] = "";
     int i, should_reinject, should_recalc_checksum = 0;
     int sni_ok = 0;
     int opt;
@@ -858,6 +880,7 @@ int gdpi_main(int argc, char *argv[]) {
                         puts("DNS address parameter error!");
                         exit(ERROR_DNS_V4_ADDR);
                     }
+                    snprintf(dnsv4_str, sizeof(dnsv4_str), "%s", optarg);
                     add_filter_str(IPPROTO_UDP, 53);
                     flush_dns_cache();
                     break;
@@ -874,6 +897,7 @@ int gdpi_main(int argc, char *argv[]) {
                         puts("DNS address parameter error!");
                         exit(ERROR_DNS_V6_ADDR);
                     }
+                    snprintf(dnsv6_str, sizeof(dnsv6_str), "%s", optarg);
                     add_filter_str(IPPROTO_UDP, 53);
                     flush_dns_cache();
                     break;
@@ -890,7 +914,7 @@ int gdpi_main(int argc, char *argv[]) {
                 }
                 dnsv4_port = atousi(optarg, "DNS port parameter error!");
                 if (dnsv4_port != 53) {
-                    add_filter_str(IPPROTO_UDP, dnsv4_port);
+                    add_dns_answer_filter(dnsv4_str, dnsv4_port, 0);
                 }
                 dnsv4_port = htons(dnsv4_port);
                 break;
@@ -903,7 +927,7 @@ int gdpi_main(int argc, char *argv[]) {
                 }
                 dnsv6_port = atousi(optarg, "DNS port parameter error!");
                 if (dnsv6_port != 53) {
-                    add_filter_str(IPPROTO_UDP, dnsv6_port);
+                    add_dns_answer_filter(dnsv6_str, dnsv6_port, 1);
                 }
                 dnsv6_port = htons(dnsv6_port);
                 break;
@@ -1311,11 +1335,6 @@ int gdpi_main(int argc, char *argv[]) {
 
             debug("packet_type: %d, packet_v4: %d, packet_v6: %d\n", packet_type, packet_v4, packet_v6);
 
-            /* Payment/bank names seen in DNS answers: remember their addresses. */
-            if ((packet_type == ipv4_udp_data || packet_type == ipv6_udp_data) && !addr.Outbound &&
-                ppUdpHdr->SrcPort == htons(53) && exclude_enabled())
-                exclude_learn_dns(packet_data, packet_dataLen);
-
             if (packet_type == ipv4_tcp_data || packet_type == ipv6_tcp_data) {
                 //printf("Got parsed packet, len=%d!\n", packet_dataLen);
                 /* Got a TCP packet WITH DATA */
@@ -1679,6 +1698,14 @@ int gdpi_main(int argc, char *argv[]) {
                     }
                 }
             }
+
+            /* Payment/bank names in DNS answers that reach the system (also the
+             * clean resolver's, rewritten to port 53 above): remember their
+             * addresses, so those connections stay untouched. */
+            if (should_reinject && !addr.Outbound && ppUdpHdr && packet_data &&
+                (packet_type == ipv4_udp_data || packet_type == ipv6_udp_data) &&
+                ppUdpHdr->SrcPort == htons(53) && exclude_enabled())
+                exclude_learn_dns(packet_data, packet_dataLen);
 
             if (should_reinject) {
                 //printf("Re-injecting!\n");

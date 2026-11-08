@@ -201,7 +201,8 @@ static void paint(HDC dc, RECT client) {
     EnterCriticalSection(&g_lock);
     st = g_ui;
     LeaveCriticalSection(&g_lock);
-    g_banner_kind = st.kind == ST_ERROR && wcsstr(st.status, L"Sürücü") ? 4
+    g_banner_kind = st.kind == ST_ERROR &&
+                    (st.driver_err == 2 || st.driver_err == 126 || st.driver_err == 1275) ? 4
                   : st.proxy_broken ? 2 : st.rival[0] ? 3 : st.update_tag[0] ? 1 : 0;
 
     FillRect(dc, &client, bg);
@@ -268,7 +269,7 @@ static void paint(HDC dc, RECT client) {
         DWORD dcol = st.target_ok[i] < 0 ? ARGB(255, 0x5C, 0x63, 0x75)
                    : st.target_ok[i] ? ARGB(255, 0x22, 0xC5, 0x5E) : ARGB(255, 0xEF, 0x44, 0x44);
         GdipCreateSolidFill(dcol, &b);
-        GdipFillEllipse(g, b, SF(38), SF(430 + i * 16.5f + 5), SF(8), SF(8));
+        GdipFillEllipse(g, b, SF(38), SF(430 + i * 15.0f + 4), SF(8), SF(8));
         GdipDeleteBrush(b);
     }
     /* site test input + buttons */
@@ -334,7 +335,7 @@ static void paint(HDC dc, RECT client) {
         text(dc, f_label, C_FAINT, rc(200, 406, 204, 14), buf, DT_RIGHT | DT_SINGLELINE);
     }
     for (int i = 0; i < st.ntargets && i < PROBE_MAX_HOSTS; i++) {
-        int y = 428 + (int)(i * 16.5f);
+        int y = 428 + i * 15;
         text(dc, f_small, C_TEXT, rc(54, y, 240, 18), st.target[i], DT_LEFT | DT_SINGLELINE | DT_END_ELLIPSIS);
         if (st.target_ok[i] < 0) wcscpy(buf, L"—");
         else if (st.target_ok[i]) swprintf(buf, 32, L"%d ms", st.target_ms[i]);
@@ -349,7 +350,7 @@ static void paint(HDC dc, RECT client) {
     if (st.st_packets) {
         swprintf(buf, 160, L"%lu paket · %lu HTTPS · %lu HTTP · %lu DNS · %lu ödeme atlandı",
                  st.st_packets, st.st_https, st.st_http, st.st_dns, st.st_excluded);
-        text(dc, f_label, C_FAINT, rc(36, 546, 368, 14), buf, DT_LEFT | DT_SINGLELINE | DT_END_ELLIPSIS);
+        text(dc, f_label, C_FAINT, rc(36, 549, 368, 14), buf, DT_LEFT | DT_SINGLELINE | DT_END_ELLIPSIS);
     }
     /* banner text */
     if (g_banner_kind) {
@@ -486,7 +487,7 @@ static int hit(int x, int y) {
     if (PtInRect(&r_profile, p)) return HIT_PROFILE;
     if (PtInRect(&r_settings, p)) return HIT_SETTINGS;
     if (PtInRect(&r_test, p)) return HIT_TEST;
-    if (g_banner_kind && PtInRect(&r_banner, p)) return HIT_BANNER;
+    if (g_banner_kind && g_banner_kind != 3 && PtInRect(&r_banner, p)) return HIT_BANNER;
     return HIT_NONE;
 }
 
@@ -526,7 +527,7 @@ static void command(int id) {
     }
     switch (id) {
     case IDM_AUTO:      post_cmd(CMD_AUTO, 0); break;
-    case IDM_AUTOSTART: autostart_set(!autostart_enabled()); break;
+    case IDM_AUTOSTART: post_cmd(CMD_AUTOSTART, !autostart_enabled()); break;
     case IDM_PAYMENT:
         if (g_payment_protect &&
             MessageBoxW(g_wnd, L"Ödeme koruması kapatılırsa banka ve ödeme sitelerinin trafiği de "
@@ -537,11 +538,11 @@ static void command(int id) {
         set_payment_protect(!g_payment_protect);
         InvalidateRect(g_wnd, NULL, FALSE);
         break;
-    case IDM_LOG:       ShellExecuteW(NULL, L"open", L"notepad.exe", g_log, NULL, SW_SHOWNORMAL); break;
-    case IDM_INI:       ShellExecuteW(NULL, L"open", L"notepad.exe", g_ini, NULL, SW_SHOWNORMAL); break;
-    case IDM_GITHUB:    ShellExecuteW(NULL, L"open", TURKISHDPI_URL, NULL, NULL, SW_SHOWNORMAL); break;
+    case IDM_LOG:       app_open_file(g_log); break;
+    case IDM_INI:       app_open_file(g_ini); break;
+    case IDM_GITHUB:    app_open_url(TURKISHDPI_URL); break;
     case IDM_EXIT:      app_exit(); break;
-    case IDM_UPDATE:    ShellExecuteW(NULL, L"open", TURKISHDPI_RELEASES_URL, NULL, NULL, SW_SHOWNORMAL); break;
+    case IDM_UPDATE:    app_open_url(TURKISHDPI_RELEASES_URL); break;
     case IDM_PROXY:
         if (MessageBoxW(g_wnd, L"Windows'un proxy ayarı bu bilgisayarda artık çalışmayan bir programı "
                                L"gösteriyor (eski bir DPI/proxy aracı). Bu yüzden bazı programlar internete "
@@ -560,7 +561,7 @@ static void command(int id) {
             L"     TurkishDPI.exe'nin bulunduğu klasör\n"
             L"3) Kaspersky kullanıyorsanız kaldırmanız gerekebilir.\n\n"
             L"Tamam'a basınca Windows Güvenliği açılır.", L"Antivirüs yardımı", MB_ICONINFORMATION);
-        ShellExecuteW(NULL, L"open", L"windowsdefender://threat", NULL, NULL, SW_SHOWNORMAL);
+        app_open_url(L"windowsdefender://threat");
         break;
     case IDM_UNINSTALL:
         if (MessageBoxW(g_wnd, L"TurkishDPI durdurulacak; Windows başlangıç görevi, ayarlar, öğrenilen "
@@ -594,9 +595,15 @@ static UINT window_dpi(HWND h) {
 }
 
 static void fit_window(void) {
+    typedef BOOL (WINAPI *adj_fn)(LPRECT, DWORD, BOOL, DWORD, UINT);
     RECT r = { 0, 0, S(BASE_W), S(BASE_H) };
     DWORD style = (DWORD)GetWindowLongW(g_wnd, GWL_STYLE);
-    AdjustWindowRect(&r, style, FALSE);
+    /* per-monitor DPI: the frame must be sized for this window's DPI,
+     * not the system DPI (Windows 10 1607+; older systems fall back) */
+    adj_fn adj = (adj_fn)(void *)GetProcAddress(GetModuleHandleW(L"user32.dll"),
+                                                "AdjustWindowRectExForDpi");
+    if (!adj || !adj(&r, style, FALSE, 0, window_dpi(g_wnd)))
+        AdjustWindowRect(&r, style, FALSE);
     SetWindowPos(g_wnd, NULL, 0, 0, r.right - r.left, r.bottom - r.top,
                  SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
 }
@@ -757,6 +764,19 @@ int ui_init(HINSTANCE inst) {
                      SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
     }
     g_taskbar_created = RegisterWindowMessageW(L"TaskbarCreated");
+    {
+        /* We run elevated: UIPI drops messages from the (non-elevated)
+         * Explorer unless allowed, so the icon would never come back after
+         * Explorer restarts and tray clicks could be lost. */
+        typedef BOOL (WINAPI *filter_fn)(HWND, UINT, DWORD, void *);
+        filter_fn f = (filter_fn)(void *)GetProcAddress(GetModuleHandleW(L"user32.dll"),
+                                                        "ChangeWindowMessageFilterEx");
+        if (f) {
+            f(g_wnd, g_taskbar_created, 1 /* MSGFLT_ALLOW */, NULL);
+            f(g_wnd, WM_TRAY, 1, NULL);
+            f(g_wnd, WM_COMMAND, 1, NULL);
+        }
+    }
     tray_add();
     tray_update();
     return 1;
