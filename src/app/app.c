@@ -42,7 +42,7 @@ int g_auto = 1, g_preset = 0, g_paused = 0, g_payment_protect = 1;
 wchar_t g_log[MAX_PATH], g_ini[MAX_PATH];
 
 static wchar_t g_dir[MAX_PATH], g_exe[MAX_PATH];
-static HANDLE g_job, g_cmd_event, g_net_event, g_resume_event;
+static HANDLE g_job, g_cmd_event, g_net_event, g_resume_event, g_quit_event;
 static CRITICAL_SECTION g_log_lock;   /* file I/O never blocks the UI's g_lock */
 /* Small command queue: clicks are never lost or merged (UI -> controller). */
 #define CMD_QUEUE 16
@@ -615,6 +615,7 @@ static DWORD g_controller_id;
  * nothing restarts the engine or writes files while we tear down. */
 static void stop_controller(DWORD wait_ms) {
     InterlockedExchange(&g_quitting, 1);
+    if (g_quit_event) SetEvent(g_quit_event);
     SetEvent(g_cmd_event);
     if (g_controller && GetCurrentThreadId() != g_controller_id)
         WaitForSingleObject(g_controller, wait_ms);
@@ -640,7 +641,9 @@ void app_uninstall(void) {
 
 static DWORD WINAPI update_thread(LPVOID u) {
     (void)u;
-    Sleep(20000);   /* do not compete with the first scan */
+    /* Waits on an event instead of sleeping: the thread ends at once on exit,
+     * and nothing here looks like a long "sleep to outwait a sandbox". */
+    if (WaitForSingleObject(g_quit_event, 20000) == WAIT_OBJECT_0) return 0;
     for (;;) {
         wchar_t tag[32];
         if (sys_check_update(tag, 32)) {
@@ -651,7 +654,8 @@ static DWORD WINAPI update_thread(LPVOID u) {
             log_line("update available");
             return 0;
         }
-        Sleep(24u * 3600u * 1000u);
+        for (int h = 0; h < 24; h++)   /* once a day, checked hourly */
+            if (WaitForSingleObject(g_quit_event, 3600u * 1000u) == WAIT_OBJECT_0) return 0;
     }
 }
 
@@ -677,8 +681,26 @@ static void selftest_finish(void) {
              pok[0], pok[1], pok[2], ex0, ex1);
     log_line("SELFTEST stats packets=%lu https=%lu http=%lu dns=%lu",
              g_ui.st_packets, g_ui.st_https, g_ui.st_http, g_ui.st_dns);
+    /* Latency the engine adds: the same unblocked sites, with and without it
+     * (best of three rounds each, connection set-up time only). */
+    {
+        int on = -1, off = -1, round_ms[PROBE_MAX_HOSTS], okv[PROBE_MAX_HOSTS];
+        for (int pass = 0; pass < 2; pass++) {
+            int *best = pass ? &off : &on;
+            if (pass) { engine_stop(); Sleep(500); }
+            for (int k = 0; k < 3; k++) {
+                int sum = 0, n = 0;
+                probe_https_many(g_control, g_ncontrol, 5000, okv, round_ms);
+                for (int i = 0; i < g_ncontrol; i++)
+                    if (okv[i]) { sum += round_ms[i]; n++; }
+                if (n && (*best < 0 || sum / n < *best)) *best = sum / n;
+            }
+        }
+        log_line("SELFTEST latency (control sites, TCP+TLS): with engine %d ms, without %d ms, "
+                 "difference %d ms", on, off, (on >= 0 && off >= 0) ? on - off : 0);
+    }
     log_line("SELFTEST %s", (g_ui.kind == ST_ACTIVE || g_ui.kind == ST_STANDBY) &&
-                            pok[0] + pok[1] + pok[2] == 3 ? "PASS" : "CHECK");
+                            pok[0] + pok[1] + pok[2] == 3 && ex1 > ex0 ? "PASS" : "CHECK");
     app_exit();
 }
 
@@ -1280,6 +1302,7 @@ static int app_main(int quiet) {
     g_cmd_event = CreateEventW(NULL, FALSE, FALSE, NULL);
     g_net_event = CreateEventW(NULL, TRUE, FALSE, NULL);
     g_resume_event = CreateEventW(NULL, FALSE, FALSE, NULL);
+    g_quit_event = CreateEventW(NULL, TRUE, FALSE, NULL);
     g_engine_active = CreateEventW(NULL, TRUE, FALSE, NULL);
 
     if (!g_selftest) check_conflicts();

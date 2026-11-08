@@ -96,8 +96,10 @@ def build(dot=None):
         d.ellipse((cx - r, cy - r, cx + r, cy + r), fill=dot + (255,))
     return base
 
-def save_ico(img, path, sizes=(16, 20, 24, 32, 40, 48, 64, 128, 256)):
-    img.save(path, format="ICO", sizes=[(s, s) for s in sizes])
+def save_ico(img, path, sizes=(16, 20, 24, 32, 40, 48, 64, 96, 128)):
+    # Plain (uncompressed) bitmaps: compressed PNG frames make the resource
+    # section look like packed/encrypted data to antivirus heuristics.
+    img.save(path, format="ICO", sizes=[(s, s) for s in sizes], bitmap_format="bmp")
 
 def main():
     os.makedirs(RES, exist_ok=True)

@@ -17,7 +17,7 @@ CFLAGS  := -std=gnu11 -O2 -pipe -Wall -Wextra -Wno-unused-parameter \
            -D_WIN32_WINNT=0x0601 -DWINVER=0x0601 \
            -I$(WINDIVERT)/include -Isrc/engine -Isrc/app \
            -ffunction-sections -fdata-sections
-LDFLAGS := -mwindows -s -static -Wl,--gc-sections \
+LDFLAGS := -mwindows -static -Wl,--gc-sections \
            -Wl,--dynamicbase,--nxcompat
 ifeq ($(ARCH),x86_64)
 LDFLAGS += -Wl,--high-entropy-va

@@ -172,25 +172,39 @@ enum ERROR_CODE{
 
 static int running_from_service = 0;
 
-/* Live counters, reported to the TurkishDPI app as "STATS ..." lines. */
+/*
+ * Live counters, reported to the TurkishDPI app as "STATS ..." lines.
+ * Written only by the packet loop; a small reporter thread prints them every
+ * 2 s when they changed. (Reporting from the packet loop itself only happened
+ * when the next packet arrived, which with the narrow filter can be much later.)
+ */
 static struct {
-    unsigned long packets, https, http, excluded, dns;
-    unsigned long last_report_tick;
-    unsigned long reported_packets;
+    volatile unsigned long packets, https, http, excluded, dns;
 } stats;
 
 int gdpi_report_stats = 0;   /* set by the TurkishDPI app for its --engine child */
 
-static void stats_maybe_report(void) {
-    unsigned long now = GetTickCount();
+static DWORD WINAPI stats_reporter(LPVOID unused) {
+    unsigned long last[5] = { ~0ul, 0, 0, 0, 0 };
+    (void)unused;
+    for (;;) {
+        unsigned long now[5] = { stats.packets, stats.https, stats.http, stats.excluded, stats.dns };
+        if (memcmp(now, last, sizeof(now)) != 0) {
+            memcpy(last, now, sizeof(now));
+            printf("STATS packets=%lu https=%lu http=%lu excluded=%lu dns=%lu\n",
+                   now[0], now[1], now[2], now[3], now[4]);
+            fflush(stdout);
+        }
+        Sleep(2000);
+    }
+    return 0;
+}
+
+static void stats_start_reporter(void) {
+    HANDLE t;
     if (!gdpi_report_stats) return;
-    if (now - stats.last_report_tick < 3000 || stats.packets == stats.reported_packets)
-        return;
-    stats.last_report_tick = now;
-    stats.reported_packets = stats.packets;
-    printf("STATS packets=%lu https=%lu http=%lu excluded=%lu dns=%lu\n",
-           stats.packets, stats.https, stats.http, stats.excluded, stats.dns);
-    fflush(stdout);
+    t = CreateThread(NULL, 64 * 1024, stats_reporter, NULL, STACK_SIZE_PARAM_IS_A_RESERVATION, NULL);
+    if (t) CloseHandle(t);
 }
 static int exiting = 0;
 static HANDLE filters[MAX_FILTERS];
@@ -1280,6 +1294,7 @@ int gdpi_main(int argc, char *argv[]) {
     }
     printf("Filter activated, GoodbyeDPI is now running!\n");
     fflush(stdout);
+    stats_start_reporter();
     /* The packet loop is latency sensitive: give it a small priority boost. */
     SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL);
     signal(SIGINT, sigint_handler);
@@ -1287,7 +1302,6 @@ int gdpi_main(int argc, char *argv[]) {
     while (1) {
         if (WinDivertRecv(w_filter, packet, sizeof(packet), &packetLen, &addr)) {
             stats.packets++;
-            stats_maybe_report();
             debug("Got %s packet, len=%d!\n", addr.Outbound ? "outbound" : "inbound",
                    packetLen);
             should_reinject = 1;
