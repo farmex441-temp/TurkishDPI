@@ -369,7 +369,13 @@ SHA-256 in the workflow.
   The parser extracts every file of the real v2.0.0 zips (Info-ZIP deflate),
   120 Python-made zips and a .NET-made zip identically. (Windows PowerShell
   5.1's Compress-Archive writes backslashes in names; those zips are refused
-  by design - releases are made by Info-ZIP in CI.)
+  by design - releases are made by Info-ZIP in CI.) Released 2026-11-08;
+  then a 1.9.9 build updated itself to the published v2.0.1 (byte-identical
+  release exe, `.old` removed, Program Files copy refreshed to v2.0.1).
+  v2.0.0 users must download 2.0.1 by hand once (no updater in 2.0.0).
+  Elevated test scripts must stop the app before its engine: killing the
+  engine first makes the app start a new one that is orphaned (suspended,
+  outside the job) when the app is killed right after.
 - After rc2 (on main, not yet tagged): second bug-hunting round - app layer
   (17 findings: folder-security race, laptop autostart, tray icon after
   Explorer restart, manual mode overridden by site test, watchdog balloon
