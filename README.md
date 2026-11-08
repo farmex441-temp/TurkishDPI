@@ -47,9 +47,10 @@
 
 [**Releases**](https://github.com/farmex441-temp/TurkishDPI/releases/latest) sayfasından:
 
-- **`TurkishDPI.exe`** — tek dosyalık 64-bit sürüm (WinDivert içine gömülü). Önerilen.
-- `TurkishDPI-x86.exe` — 32-bit Windows için tek dosya.
-- `TurkishDPI-vX-x64.zip` / `-x86.zip` — klasik paket (exe + WinDivert dosyaları yan yana).
+- **`TurkishDPI-vX-x64.zip`** — 64-bit Windows (önerilen). Zip'i bir klasöre çıkarıp `TurkishDPI.exe`'yi çalıştırın; `WinDivert.dll` ve `WinDivert64.sys` exe ile aynı klasörde kalmalı.
+- `TurkishDPI-vX-x86.zip` — 32-bit Windows.
+
+> Exe'nin içine sürücü gömülmez ve program diske hiçbir sürücü bırakmaz: v1.0'daki tek dosyalık sürüm, içindeki sürücü yüzünden bazı antivirüslerce işaretleniyordu.
 
 ## Kullanım
 
@@ -110,7 +111,7 @@ Eski GoodbyeDPI `.cmd` betiklerinde `goodbyedpi.exe` yerine `TurkishDPI.exe` yaz
 
 ## Sorun giderme
 
-- **Antivirüs:** Windows Defender'ın işaretlediği şey WinDivert'in resmi zip arşivindeki örnek araçlardır; TurkishDPI bu arşivi dağıtmaz, yalnızca imzalı `WinDivert.dll` ve sürücüyü içerir (Defender taramasında temiz). Başka bir antivirüs engellerse uygulamadaki *Ayarlar → Antivirüs sorunu yardımı* adım adım yol gösterir; TurkishDPI hiçbir zaman antivirüs ayarlarınızı kendisi değiştirmez.
+- **Antivirüs:** TurkishDPI.exe sürücü taşımaz ve diske dosya bırakmaz. Paketteki `WinDivert64.sys`, WinDivert'in resmi imzalı sürücüsüdür; bazı üreticiler (ör. Elastic, Arctic Wolf) **her** WinDivert sürücüsünü genel bir kuralla "WinDivert" olarak etiketler. Bu, GoodbyeDPI ve zapret'te de aynıdır ve imzalı sürücü değiştirilemez. Windows Defender'ın işaretlediği şey ise WinDivert'in resmi zip arşivindeki örnek araçlardır; TurkishDPI bunları dağıtmaz. Başka bir antivirüs engellerse uygulamadaki *Ayarlar → Antivirüs sorunu yardımı* adım adım yol gösterir; TurkishDPI hiçbir zaman antivirüs ayarlarınızı kendisi değiştirmez.
 - **Kaspersky:** GoodbyeDPI'ı engeller; tamamen kaldırılması gerekir.
 - **Eski GoodbyeDPI / zapret hizmeti:** TurkishDPI açılışta tespit eder ve kaldırmayı önerir.
 - Ayrıntılı kayıt: menüden **Günlüğü aç**.
@@ -119,8 +120,9 @@ Eski GoodbyeDPI `.cmd` betiklerinde `goodbyedpi.exe` yerine `TurkishDPI.exe` yaz
 
 ```bash
 # MinGW-w64 (Linux/MSYS2) veya llvm-mingw
-make ARCH=x86_64 WINDIVERT=WinDivert-2.2.2-A           # exe + yanına WinDivert dosyaları
-make ARCH=x86_64 WINDIVERT=WinDivert-2.2.2-A EMBED=1   # tek dosya
+make ARCH=x86_64      # 64-bit
+make ARCH=i686        # 32-bit
+# WinDivert.dll ve WinDivert64.sys exe ile aynı klasöre konur
 ```
 
 GitHub Actions her `v*` etiketi için x64/x86 sürümlerini derleyip Release'e yükler.

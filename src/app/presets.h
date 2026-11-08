@@ -44,9 +44,12 @@ typedef struct {
 } dns_server_t;
 
 static const dns_server_t DNS_SERVERS[] = {
-    { "77.88.8.8",     "2a02:6b8::feed:0ff",        1253 },  /* Yandex (GoodbyeDPI-Turkey default) */
-    { "77.88.8.1",     "2a02:6b8:0:1::feed:0ff",    1253 },  /* Yandex secondary */
-    { "94.140.14.140", "2a10:50c0::1:ff",           5353 },  /* AdGuard unfiltered */
+    { "77.88.8.8",      "2a02:6b8::feed:0ff",        1253 },  /* Yandex (GoodbyeDPI-Turkey default) */
+    { "77.88.8.1",      "2a02:6b8:0:1::feed:0ff",    1253 },  /* Yandex secondary */
+    { "94.140.14.140",  "2a10:50c0::1:ff",           5353 },  /* AdGuard unfiltered */
+    { "94.140.14.141",  "2a10:50c0::2:ff",           5353 },  /* AdGuard unfiltered secondary */
+    { "208.67.222.222", "2620:119:35::35",           5353 },  /* OpenDNS */
+    { "208.67.220.220", "2620:119:53::53",           443  },  /* OpenDNS on 443 */
 };
 #define DNS_SERVER_COUNT ((int)(sizeof(DNS_SERVERS) / sizeof(DNS_SERVERS[0])))
 

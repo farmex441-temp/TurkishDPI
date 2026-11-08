@@ -315,7 +315,7 @@ static void paint(HDC dc, RECT client) {
     text(dc, f_label, C_FAINT, rc(34, 328, 110, 14), L"AĞ", DT_LEFT | DT_SINGLELINE);
     text(dc, f_value, C_TEXT, rc(34, 346, 106, 22), st.network[0] ? st.network : L"—",
          DT_LEFT | DT_SINGLELINE | DT_END_ELLIPSIS);
-    text(dc, f_label, C_FAINT, rc(170, 328, 110, 14), L"GECİKME", DT_LEFT | DT_SINGLELINE);
+    text(dc, f_label, C_FAINT, rc(170, 328, 110, 14), L"BAĞLANTI (TCP+TLS)", DT_LEFT | DT_SINGLELINE);
     if (st.avg_ms > 0) swprintf(buf, 32, L"%d ms", st.avg_ms); else wcscpy(buf, L"—");
     text(dc, f_value, C_TEXT, rc(170, 346, 106, 22), buf, DT_LEFT | DT_SINGLELINE);
     text(dc, f_label, C_FAINT, rc(306, 328, 110, 14), L"ÖĞRENİLEN", DT_LEFT | DT_SINGLELINE);
@@ -327,7 +327,10 @@ static void paint(HDC dc, RECT client) {
     if (st.preset >= 0) {
         wchar_t ip[32];
         MultiByteToWideChar(CP_ACP, 0, DNS_SERVERS[st.dns].v4, -1, ip, 32);
-        swprintf(buf, 160, L"DNS %ls:%u", ip, DNS_SERVERS[st.dns].port);
+        if (st.dns_ms > 0)
+            swprintf(buf, 160, L"%lsDNS %ls · %d ms", st.hybrid ? L"HİBRİT " : L"", ip, st.dns_ms);
+        else
+            swprintf(buf, 160, L"%lsDNS %ls", st.hybrid ? L"HİBRİT " : L"", ip);
         text(dc, f_label, C_FAINT, rc(200, 406, 204, 14), buf, DT_RIGHT | DT_SINGLELINE);
     }
     for (int i = 0; i < st.ntargets && i < PROBE_MAX_HOSTS; i++) {
@@ -503,7 +506,7 @@ static void command(int id);
 
 static void click(int id) {
     switch (id) {
-    case HIT_POWER:    post_cmd(g_paused ? CMD_RESUME : CMD_PAUSE, 0); break;
+    case HIT_POWER:    post_cmd(CMD_TOGGLE_PAUSE, 0); break;
     case HIT_RESCAN:   post_cmd(CMD_RESCAN, 0); break;
     case HIT_PROFILE:  profile_menu(); break;
     case HIT_SETTINGS: settings_menu(); break;
@@ -566,7 +569,7 @@ static void command(int id) {
             app_uninstall();
         break;
     case IDM_SHOW:      ui_show(); break;
-    case IDM_PAUSE:     post_cmd(g_paused ? CMD_RESUME : CMD_PAUSE, 0); break;
+    case IDM_PAUSE:     post_cmd(CMD_TOGGLE_PAUSE, 0); break;
     case IDM_RESCAN:    post_cmd(CMD_RESCAN, 0); break;
     }
     (void)buf;
@@ -619,7 +622,7 @@ static LRESULT CALLBACK wndproc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
         g_wnd = h;
         apply_dpi(window_dpi(h));
         g_edit = CreateWindowExW(0, L"EDIT", L"", WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_AUTOHSCROLL,
-                                 0, 0, 10, 10, h, (HMENU)1, g_inst, NULL);
+                                 0, 0, 10, 10, h, (HMENU)100, g_inst, NULL);
         SendMessageW(g_edit, WM_SETFONT, (WPARAM)f_body, FALSE);
         SendMessageW(g_edit, EM_SETCUEBANNER, TRUE, (LPARAM)L"ör. discord.com");
         SendMessageW(g_edit, EM_SETLIMITTEXT, 200, 0);
@@ -679,7 +682,8 @@ static LRESULT CALLBACK wndproc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
         click(hit(GET_X_LPARAM(lp), GET_Y_LPARAM(lp)));
         return 0;
     case WM_COMMAND:
-        if (LOWORD(wp) >= 1000) command(LOWORD(wp));
+        if (LOWORD(wp) == IDOK) do_site_test();          /* Enter in the site box */
+        else if (LOWORD(wp) >= 1000) command(LOWORD(wp));
         return 0;
     case WM_TIMER:
         g_anim = (g_anim + 6) % 360;

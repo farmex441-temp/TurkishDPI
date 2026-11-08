@@ -15,7 +15,7 @@ typedef enum {
 } state_kind_t;
 
 enum { CMD_NONE, CMD_RESCAN, CMD_SELECT, CMD_AUTO, CMD_PAUSE, CMD_RESUME,
-       CMD_TESTSITE, CMD_RESTART };
+       CMD_TESTSITE, CMD_RESTART, CMD_TOGGLE_PAUSE };
 
 typedef struct {
     state_kind_t kind;
@@ -29,7 +29,10 @@ typedef struct {
     wchar_t target[PROBE_MAX_HOSTS][64];
     int target_ok[PROBE_MAX_HOSTS];    /* -1 unknown, 0 fail, 1 ok */
     int target_ms[PROBE_MAX_HOSTS];
-    int avg_ms;
+    int avg_ms;                 /* average TCP+TLS set-up time        */
+    int dns_ms;                 /* round trip of the chosen clean DNS */
+    int hybrid;                 /* hybrid DNS on                      */
+    int n_block_ips;            /* learned block-page addresses       */
     int learned;                /* presets with history on this net */
     wchar_t site_result[160];   /* result of the last site test   */
     DWORD started_tick;         /* when the current preset started */
@@ -68,6 +71,7 @@ extern int g_payment_domains;
 /* smart.c */
 void smart_network_changed(void);           /* re-read network identity      */
 const wchar_t *smart_network_name(void);
+const wchar_t *smart_network_id(void);
 void smart_order(int *order, int n);         /* best-first preset order       */
 void smart_record(int preset, int ok, int avg_ms);
 int  smart_known(int preset);                /* has history on this network   */

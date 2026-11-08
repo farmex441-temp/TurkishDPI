@@ -13,6 +13,8 @@
 #define INTERNET_OPTION_REFRESH 37
 #define INTERNET_OPTION_SETTINGS_CHANGED 39
 #include <shellapi.h>
+#include <aclapi.h>
+#include <sddl.h>
 #include <stdio.h>
 #include <string.h>
 #include <wchar.h>
@@ -187,6 +189,40 @@ int sys_check_update(wchar_t *tag_out, size_t cap) {
     return found;
 }
 
+/* ---------- folder security ---------- */
+/* Creates/locks a folder: owner Administrators, protected DACL with SYSTEM and
+ * Administrators full control and Users read/execute only. A reparse point
+ * (junction/symlink) planted in its place is refused. */
+int sys_secure_dir(const wchar_t *dir) {
+    PSECURITY_DESCRIPTOR sd = NULL;
+    PACL dacl = NULL;
+    BOOL present = FALSE, def = FALSE;
+    PSID admins = NULL;
+    SID_IDENTIFIER_AUTHORITY nt = SECURITY_NT_AUTHORITY;
+    DWORD attr;
+    int ok = 0;
+
+    CreateDirectoryW(dir, NULL);
+    attr = GetFileAttributesW(dir);
+    if (attr == INVALID_FILE_ATTRIBUTES || !(attr & FILE_ATTRIBUTE_DIRECTORY) ||
+        (attr & FILE_ATTRIBUTE_REPARSE_POINT))
+        return 0;
+    if (!ConvertStringSecurityDescriptorToSecurityDescriptorW(
+            L"D:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;0x1200a9;;;BU)", SDDL_REVISION_1, &sd, NULL))
+        return 0;
+    if (GetSecurityDescriptorDacl(sd, &present, &dacl, &def) &&
+        AllocateAndInitializeSid(&nt, 2, SECURITY_BUILTIN_DOMAIN_RID, DOMAIN_ALIAS_RID_ADMINS,
+                                 0, 0, 0, 0, 0, 0, &admins)) {
+        ok = SetNamedSecurityInfoW((LPWSTR)dir, SE_FILE_OBJECT,
+                                   OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION |
+                                   PROTECTED_DACL_SECURITY_INFORMATION,
+                                   admins, NULL, dacl, NULL) == ERROR_SUCCESS;
+        FreeSid(admins);
+    }
+    LocalFree(sd);
+    return ok;
+}
+
 /* ---------- uninstall / clean-up ---------- */
 static void delete_tree(const wchar_t *dir) {
     wchar_t pat[MAX_PATH], path[MAX_PATH];
@@ -198,7 +234,12 @@ static void delete_tree(const wchar_t *dir) {
         do {
             if (!wcscmp(fd.cFileName, L".") || !wcscmp(fd.cFileName, L"..")) continue;
             swprintf(path, MAX_PATH, L"%ls\\%ls", dir, fd.cFileName);
-            if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) delete_tree(path);
+            if (fd.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) {
+                /* junction/symlink: remove the link itself, never follow it */
+                if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) RemoveDirectoryW(path);
+                else DeleteFileW(path);
+            }
+            else if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) delete_tree(path);
             else if (!DeleteFileW(path)) MoveFileExW(path, NULL, MOVEFILE_DELAY_UNTIL_REBOOT);
         } while (FindNextFileW(h, &fd));
         FindClose(h);
@@ -207,6 +248,7 @@ static void delete_tree(const wchar_t *dir) {
 }
 
 void sys_uninstall(const wchar_t *data_dir) {
+    DWORD attr = GetFileAttributesW(data_dir);
     SC_HANDLE scm = OpenSCManagerW(NULL, NULL, SC_MANAGER_CONNECT);
     if (scm) {
         static const wchar_t *svcs[] = { L"WinDivert", L"WinDivert14", L"TurkishDPI" };
@@ -221,5 +263,7 @@ void sys_uninstall(const wchar_t *data_dir) {
         }
         CloseServiceHandle(scm);
     }
-    delete_tree(data_dir);
+    if (attr != INVALID_FILE_ATTRIBUTES && (attr & FILE_ATTRIBUTE_DIRECTORY) &&
+        !(attr & FILE_ATTRIBUTE_REPARSE_POINT))
+        delete_tree(data_dir);
 }

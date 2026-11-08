@@ -101,6 +101,10 @@ void smart_network_changed(void) {
     g_ui.learned = smart_learned_count();
 }
 
+const wchar_t *smart_network_id(void) {
+    return g_net_id;
+}
+
 const wchar_t *smart_network_name(void) {
     return g_net_name;
 }

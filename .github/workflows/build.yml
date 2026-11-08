@@ -16,7 +16,25 @@ env:
   WINDIVERT_DIR: WinDivert-2.2.2-A
 
 jobs:
+  test:
+    # Unit tests run natively on Windows (DNS race, forged-answer detection,
+    # payment exclusion), with the sanitizer-free MinGW that ships on the runner.
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+      - name: Unit tests
+        run: |
+          mkdir -p build
+          gcc -O2 -Wall -Isrc/engine tests/exclude_test.c src/engine/exclude.c src/engine/utils/getline.c -o build/exclude_test.exe
+          gcc -O2 -Wall -Isrc/engine tests/dns_test.c src/engine/dnsredir.c -lws2_32 -o build/dns_test.exe
+          ./build/exclude_test.exe
+          ./build/dns_test.exe
+
   build:
+    needs: test
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -34,22 +52,14 @@ jobs:
         run: |
           for a in x86_64 i686; do
             make ARCH=$a WINDIVERT=$WINDIVERT_DIR OUT=build/$a -j4
-            make ARCH=$a WINDIVERT=$WINDIVERT_DIR OUT=build/$a-single EMBED=1 -j4
           done
-
-      - name: Build tests
-        run: |
-          x86_64-w64-mingw32-gcc -O2 -Isrc/engine tests/exclude_test.c src/engine/exclude.c src/engine/utils/getline.c -o build/exclude_test.exe
-          x86_64-w64-mingw32-gcc -O2 -Isrc/app tests/probe_test.c src/app/probe.c -lws2_32 -lwinhttp -o build/probe_test.exe
 
       - name: Package
         run: |
           V="${GITHUB_REF_NAME}"; [[ "$GITHUB_REF" == refs/tags/* ]] || V="dev-${GITHUB_SHA::7}"
           mkdir -p dist
-          # Single-file builds (WinDivert embedded)
-          cp build/x86_64-single/TurkishDPI.exe dist/TurkishDPI.exe
-          cp build/i686-single/TurkishDPI.exe   dist/TurkishDPI-x86.exe
-          # Classic zip builds (exe + WinDivert files side by side)
+          # Only WinDivert's signed DLL and driver are shipped, never the
+          # sample tools from its archive (those trigger antivirus alerts).
           for a in x86_64 i686; do
             w=x64; [ $a = i686 ] && w=x86
             d=TurkishDPI-$V-$w
@@ -75,3 +85,4 @@ jobs:
         with:
           files: dist/*
           generate_release_notes: true
+          prerelease: ${{ contains(github.ref_name, '-') }}

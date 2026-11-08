@@ -21,7 +21,7 @@ KULLANIM
 
 ÖNEMLİ
 - WinDivert.dll ve WinDivert64.sys dosyaları TurkishDPI.exe ile aynı
-  klasörde durmalıdır (tek dosyalık sürümde bunlar exe'nin içindedir).
+  klasörde durmalıdır (zip'in tamamını aynı klasöre çıkarın).
 - Bazı antivirüsler WinDivert'i "HackTool/RiskWare" olarak işaretler; bu
   bir yanlış alarmdır. Klasörü istisnalara ekleyin. Kaspersky kullanıyorsanız
   tamamen kaldırmanız gerekebilir.

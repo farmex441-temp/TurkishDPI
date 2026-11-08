@@ -82,9 +82,20 @@ WINSOCK_API_LINKAGE INT WSAAPI inet_pton(INT Family, LPCSTR pStringBuf, PVOID pA
          ")" \
          " and (" DIVERT_NO_LOCALNETSv4_SRC " or " DIVERT_NO_LOCALNETSv6_SRC "))) or " \
         "(outbound and " \
-         "(tcp.DstPort == 80 or tcp.DstPort == 443) and tcp.Ack and " \
+         "((tcp.DstPort == 80 and tcp.Ack and tcp.PayloadLength > 0) or " \
+          "(tcp.DstPort == 443 and tcp.Ack and tcp.PayloadLength >= 2 and " \
+           "tcp.Payload[0] == 0x16 and tcp.Payload[1] == 0x03)) and " \
          "(" DIVERT_NO_LOCALNETSv4_DST " or " DIVERT_NO_LOCALNETSv6_DST "))" \
         "))"
+/*
+ * TurkishDPI: outbound packets are only diverted when the engine can act on
+ * them: HTTP requests on port 80 and TLS handshake records (ClientHello) on
+ * port 443. Upstream GoodbyeDPI diverted every outbound ACK of every HTTPS
+ * connection to user space and re-injected it unchanged; skipping those in
+ * the kernel removes two context switches per packet, which lowers latency
+ * and CPU use under load (downloads, streaming, games) without changing what
+ * the engine does to the packets it needs.
+ */
 
 // Filter for blocking QUIC/HTTP3 traffic
 #define FILTER_PASSIVE_BLOCK_QUIC "outbound and !impostor and !loopback and udp " \
@@ -168,8 +179,11 @@ static struct {
     unsigned long reported_packets;
 } stats;
 
+int gdpi_report_stats = 0;   /* set by the TurkishDPI app for its --engine child */
+
 static void stats_maybe_report(void) {
     unsigned long now = GetTickCount();
+    if (!gdpi_report_stats) return;
     if (now - stats.last_report_tick < 3000 || stats.packets == stats.reported_packets)
         return;
     stats.last_report_tick = now;
@@ -224,6 +238,8 @@ static struct option long_options[] = {
     {"debug-exit",  optional_argument, 0,  'x' },
     {"exclude",     required_argument, 0,  '#' },
     {"no-payment-exclude", no_argument, 0, '&' },
+    {"dns-hybrid",  no_argument,       0,  '~' },
+    {"dns-block-ip",required_argument, 0,  '^' },
     {0,             0,                 0,   0  }
 };
 
@@ -481,7 +497,7 @@ static int extract_sni(const char *pktdata, unsigned int pktlen,
             */
             d[ptr+3] - d[ptr+5] == 2 && d[ptr+5] - d[ptr+8] == 3)
             {
-                if (ptr + 8 + d[ptr+8] > pktlen) {
+                if (ptr + 9 + d[ptr+8] > pktlen) {
                     return FALSE;
                 }
                 hnaddr = &d[ptr+9];
@@ -1012,6 +1028,13 @@ int gdpi_main(int argc, char *argv[]) {
             case '&': // --no-payment-exclude
                 do_payment_exclude = 0;
                 break;
+            case '~': // --dns-hybrid
+                dns_set_hybrid(1);
+                break;
+            case '^': // --dns-block-ip
+                if (!dns_add_block_ip(optarg))
+                    printf("WARNING: bad --dns-block-ip %s\n", optarg);
+                break;
             default:
                 puts("Usage: goodbyedpi.exe [OPTION...]\n"
                 " -p          block passive DPI\n"
@@ -1072,6 +1095,9 @@ int gdpi_main(int argc, char *argv[]) {
                 " --no-payment-exclude     also modify traffic to banks/payment systems (NOT recommended).\n"
                 "                          By default 100+ bank, card, 3-D Secure and payment domains are\n"
                 "                          passed through untouched.\n"
+                " --dns-hybrid             send DNS queries to the original resolver too and use the first\n"
+                "                          trustworthy answer (faster, CDN-local); forged answers are dropped.\n"
+                " --dns-block-ip <ip>      treat this DNS answer address as a block page (repeatable).\n"
                 " --max-payload [value]    packets with TCP payload data more than [value] won't be processed.\n"
                 "                          Use this option to reduce CPU usage by skipping huge amount of data\n"
                 "                          (like file transfers) in already established sessions.\n"
@@ -1098,6 +1124,9 @@ int gdpi_main(int argc, char *argv[]) {
 
     if (do_payment_exclude)
         exclude_load_builtin();
+    dns_set_clean(dnsv4_addr, dnsv4_port, (const uint32_t *)dnsv6_addr.s6_addr, dnsv6_port);
+    if (dns_hybrid_enabled())
+        printf("DNS mode: hybrid (fastest trustworthy answer)\n");
     if (exclude_enabled())
         printf("Excluded (untouched) domains: payment/bank list %s\n",
                do_payment_exclude ? "on" : "off");
@@ -1177,6 +1206,11 @@ int gdpi_main(int argc, char *argv[]) {
              "Fragmentation has no effect.");
         die();
     }
+
+    /* Without DNS redirection DNS is not diverted at all, but the payment
+     * exclusion still needs to see the answers to learn bank/payment addresses. */
+    if (exclude_enabled() && !do_dnsv4_redirect && !do_dnsv6_redirect)
+        add_filter_str(IPPROTO_UDP, 53);
 
     if (max_payload_size)
         add_maxpayloadsize_str(max_payload_size);
@@ -1277,6 +1311,11 @@ int gdpi_main(int argc, char *argv[]) {
 
             debug("packet_type: %d, packet_v4: %d, packet_v6: %d\n", packet_type, packet_v4, packet_v6);
 
+            /* Payment/bank names seen in DNS answers: remember their addresses. */
+            if ((packet_type == ipv4_udp_data || packet_type == ipv6_udp_data) && !addr.Outbound &&
+                ppUdpHdr->SrcPort == htons(53) && exclude_enabled())
+                exclude_learn_dns(packet_data, packet_dataLen);
+
             if (packet_type == ipv4_tcp_data || packet_type == ipv6_tcp_data) {
                 //printf("Got parsed packet, len=%d!\n", packet_dataLen);
                 /* Got a TCP packet WITH DATA */
@@ -1324,7 +1363,9 @@ int gdpi_main(int argc, char *argv[]) {
                             sni_ok = extract_sni(packet_data, packet_dataLen,
                                         &host_addr, &host_len);
                         }
-                        if (sni_ok && exclude_check_hostname(host_addr, host_len)) {
+                        if ((sni_ok && exclude_check_hostname(host_addr, host_len)) ||
+                            (packet_v4 ? exclude_check_ip(&ppIpHdr->DstAddr, 0)
+                                       : exclude_check_ip(ppIpV6Hdr->DstAddr, 1))) {
                             /* payment / bank: leave the connection untouched */
                             sni_ok = 0;
                             stats.excluded++;
@@ -1372,7 +1413,9 @@ int gdpi_main(int argc, char *argv[]) {
                         http_host_find, &hdr_name_addr, &hdr_value_addr, &hdr_value_len) &&
                         hdr_value_len > 0 && hdr_value_len <= HOST_MAXLEN &&
                         (do_blacklist ? blackwhitelist_check_hostname(hdr_value_addr, hdr_value_len) : 1) &&
-                        !exclude_check_hostname(hdr_value_addr, hdr_value_len))
+                        !exclude_check_hostname(hdr_value_addr, hdr_value_len) &&
+                        !(packet_v4 ? exclude_check_ip(&ppIpHdr->DstAddr, 0)
+                                    : exclude_check_ip(ppIpV6Hdr->DstAddr, 1)))
                     {
                         host_addr = hdr_value_addr;
                         host_len = hdr_value_len;
@@ -1546,7 +1589,30 @@ int gdpi_main(int argc, char *argv[]) {
             else if ((do_dnsv4_redirect && (packet_type == ipv4_udp_data)) ||
                      (do_dnsv6_redirect && (packet_type == ipv6_udp_data)))
             {
-                if (!addr.Outbound) {
+                if (!addr.Outbound && dns_hybrid_enabled()) {
+                    int verdict = packet_v4
+                        ? dns_handle_incoming_hybrid(&ppIpHdr->DstAddr, ppUdpHdr->DstPort,
+                                                     &ppIpHdr->SrcAddr, ppUdpHdr->SrcPort,
+                                                     packet_data, packet_dataLen, &dns_conn_info, 0)
+                        : dns_handle_incoming_hybrid(ppIpV6Hdr->DstAddr, ppUdpHdr->DstPort,
+                                                     ppIpV6Hdr->SrcAddr, ppUdpHdr->SrcPort,
+                                                     packet_data, packet_dataLen, &dns_conn_info, 1);
+                    if (verdict == DNS_IN_REWRITE) {
+                        if (packet_v4)
+                            ppIpHdr->SrcAddr = dns_conn_info.dstip[0];
+                        else
+                            ipv6_copy_addr(ppIpV6Hdr->SrcAddr, dns_conn_info.dstip);
+                        ppUdpHdr->DstPort = dns_conn_info.srcport;
+                        ppUdpHdr->SrcPort = dns_conn_info.dstport;
+                        should_recalc_checksum = 1;
+                        stats.dns++;
+                    }
+                    else if (verdict == DNS_IN_DROP) {
+                        should_reinject = 0;
+                    }
+                    /* PASS / NOT_OURS: deliver unchanged */
+                }
+                else if (!addr.Outbound) {
                     if ((packet_v4 && dns_handle_incoming(&ppIpHdr->DstAddr, ppUdpHdr->DstPort,
                                         packet_data, packet_dataLen,
                                         &dns_conn_info, 0))
@@ -1585,6 +1651,9 @@ int gdpi_main(int argc, char *argv[]) {
                                         ppIpV6Hdr->DstAddr, ppUdpHdr->DstPort,
                                         packet_data, packet_dataLen, 1)))
                     {
+                        /* Hybrid: the original query also goes out unchanged. */
+                        if (dns_hybrid_enabled())
+                            WinDivertSend(w_filter, packet, packetLen, NULL, &addr);
                         /* Changing destination IP and port to the values
                          * from configuration */
                         if (packet_v4) {
@@ -1595,7 +1664,8 @@ int gdpi_main(int argc, char *argv[]) {
                             ipv6_copy_addr(ppIpV6Hdr->DstAddr, (uint32_t*)dnsv6_addr.s6_addr);
                             ppUdpHdr->DstPort = dnsv6_port;
                         }
-                        stats.dns++;
+                        if (!dns_hybrid_enabled())
+                            stats.dns++;
                         should_recalc_checksum = 1;
                     }
                     else {
