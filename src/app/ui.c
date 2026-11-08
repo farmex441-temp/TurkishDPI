@@ -1332,6 +1332,19 @@ static LRESULT CALLBACK wndproc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
     case WM_DRAWITEM:
         draw_item((const DRAWITEMSTRUCT *)lp);
         return TRUE;
+    case WM_ACTIVATE: {
+        /* like a dialog: remember the focused control, restore it (or the
+         * current tab) on activation so the keyboard always has a target */
+        static HWND last;
+        if (LOWORD(wp) == WA_INACTIVE) {
+            HWND f = GetFocus();
+            if (f && GetParent(f) == h) last = f;
+        } else if (!g_preview_shot) {
+            HWND f = last && IsWindowVisible(last) ? last : ctl(ID_TAB0 + g_page)->hwnd;
+            SetFocus(f);
+        }
+        return 0;
+    }
     case WM_CTLCOLOREDIT:
         SetTextColor((HDC)wp, P->text);
         SetBkColor((HDC)wp, P->sunken);
