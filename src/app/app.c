@@ -1276,13 +1276,12 @@ static void site_test(const wchar_t *raw) {
         resume_interrupted_scan();
         break;
     case SITE_NO_NET:
-        if (g_scan_aborted) {
-            resume_interrupted_scan();   /* auto_scan finds the link down and goes offline */
-        } else {
-            engine_stop();
-            set_state(ST_OFFLINE, L"İnternet bağlantısı yok", L"Bağlantı gelince otomatik başlayacak");
-            log_line("site test: control sites unreachable, waiting for network");
-        }
+        /* The engine was not touched. One failed probe round may be a short
+         * glitch: the result line says so and the watchdog handles a link
+         * that is really down. Only a scan we interrupted must still finish
+         * (auto_scan finds the link down and goes offline itself). */
+        log_line("site test: control sites unreachable");
+        resume_interrupted_scan();
         break;
     case SITE_INTERRUPTED:
         if (g_quitting) break;
