@@ -130,13 +130,16 @@ int sys_proxy_repair(void) {
 }
 
 /* ---------- updates ---------- */
+/* This build's version packed like a Windows file version (build 0). */
+static unsigned long long own_version(void) {
+    return (unsigned long long)TURKISHDPI_VER_MAJOR << 48 | (unsigned long long)TURKISHDPI_VER_MINOR << 32 |
+           (unsigned long long)TURKISHDPI_VER_PATCH << 16;
+}
+
+/* 1 if tag is a strict "vX.Y.Z" (upd_tag_parse) newer than this build. */
 static int version_newer(const char *tag) {
-    int a = 0, b = 0, c = 0;
-    if (*tag == 'v' || *tag == 'V') tag++;
-    if (sscanf(tag, "%d.%d.%d", &a, &b, &c) < 2) return 0;
-    if (a != TURKISHDPI_VER_MAJOR) return a > TURKISHDPI_VER_MAJOR;
-    if (b != TURKISHDPI_VER_MINOR) return b > TURKISHDPI_VER_MINOR;
-    return c > TURKISHDPI_VER_PATCH;
+    uint64_t v;
+    return upd_tag_parse(tag, &v) && v > own_version();
 }
 
 int sys_check_update(wchar_t *tag_out, size_t cap) {
@@ -565,11 +568,6 @@ static unsigned long long file_version(const wchar_t *path) {
     return ver;
 }
 
-static unsigned long long own_version(void) {
-    return (unsigned long long)TURKISHDPI_VER_MAJOR << 48 | (unsigned long long)TURKISHDPI_VER_MINOR << 32 |
-           (unsigned long long)TURKISHDPI_VER_PATCH << 16;
-}
-
 /* src/engine/windivert_dyn.c */
 int windivert_file_pinned(const wchar_t *name);
 int windivert_handle_ok(HANDLE f, const wchar_t *name);
@@ -994,6 +992,17 @@ int sys_update_install(const wchar_t *tag_w, void **self_exe_p, const wchar_t *r
         if (r == 0 && UPD_ITEMS[i].kind == 0) { *why = "no exe in zip"; goto out; }
     }
     if (upd_pe_machine(data[0], dlen[0]) != UPD_MACHINE) { *why = "exe for another CPU"; goto out; }
+    /* the exe itself must be the tagged version and newer than this one: a
+     * release built from an un-bumped version.h would otherwise update every
+     * user in a loop, and an older exe under a newer tag would be a downgrade */
+    {
+        uint64_t tag_ver = 0, exe_ver = upd_pe_file_version(data[0], dlen[0]);
+        if (!upd_tag_parse(tag, &tag_ver) || (exe_ver & ~0xFFFFull) != tag_ver) {
+            *why = "exe version differs from the tag";
+            goto out;
+        }
+        if (tag_ver <= own_version()) { *why = "release is not newer than this version"; goto out; }
+    }
 
     /* 3. where we run from: the folder, and the exe's real (long) name in it
      * taken from its locked handle - the start path may use 8.3 names */

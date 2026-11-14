@@ -20,7 +20,15 @@ uint32_t upd_crc32(const unsigned char *p, size_t n);
  * exactly there. */
 int upd_inflate(const unsigned char *in, size_t in_len, unsigned char *out, size_t out_len);
 
-/* "v2.0.1": a release tag that is safe to put into a URL path. */
+/*
+ * Strict release tag "vMAJOR.MINOR.PATCH": lowercase 'v', exactly three
+ * numeric parts of 1-5 digits without leading zeros, each <= 65535, nothing
+ * else (pre-release tags like "v2.0.1-rc1" are refused). On success *ver
+ * (may be NULL) = MAJOR<<48 | MINOR<<32 | PATCH<<16, the packing of a
+ * Windows file version with build 0.
+ */
+int upd_tag_parse(const char *tag, uint64_t *ver);
+/* upd_tag_parse without the value: a tag that is safe to put into a URL path. */
 int upd_tag_ok(const char *tag);
 
 /* Finds "<64 hex>  <name>" (sha256sum format, also "*<name>") in SHA256SUMS.txt. */
@@ -38,5 +46,16 @@ int upd_zip_extract(const unsigned char *zip, size_t n, const char *name,
 
 /* IMAGE_FILE_HEADER.Machine of a PE image (0x8664 x64, 0x14c x86), 0 if not a PE. */
 unsigned upd_pe_machine(const unsigned char *p, size_t n);
+
+/*
+ * File version of a PE image from its VERSIONINFO resource
+ * (VS_FIXEDFILEINFO dwFileVersionMS << 32 | dwFileVersionLS, i.e.
+ * major<<48 | minor<<32 | patch<<16 | build), 0 when there is none or the
+ * image is malformed. Walks the section table and the resource directory
+ * (RT_VERSION, first name, first language) with every offset bounds-checked;
+ * it does not scan for the 0xFEEF04BD signature, which also occurs as an
+ * immediate in code (our own exe compares against it).
+ */
+uint64_t upd_pe_file_version(const unsigned char *p, size_t n);
 
 #endif

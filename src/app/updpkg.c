@@ -225,14 +225,37 @@ int upd_inflate(const unsigned char *in, size_t in_len, unsigned char *out, size
 }
 
 /* ---------- small checks ---------- */
-int upd_tag_ok(const char *tag) {
-    size_t n = strlen(tag);
-    if (n < 2 || n > 24 || (tag[0] != 'v' && tag[0] != 'V')) return 0;
-    for (size_t i = 1; i < n; i++) {
-        char c = tag[i];
-        if (!((c >= '0' && c <= '9') || c == '.')) return 0;
+/* "v<a>.<b>.<c>": exactly three parts, 1-5 digits each, no leading zero
+ * (except "0" itself), every value <= 65535 so it fits the 16-bit fields of
+ * a Windows file version. Digits are accumulated in an unsigned long that
+ * never exceeds 99999, so there is no overflow on any input. */
+int upd_tag_parse(const char *tag, uint64_t *ver) {
+    const char *p = tag;
+    uint64_t v = 0;
+    if (!p || *p++ != 'v') return 0;
+    for (int part = 0; part < 3; part++) {
+        unsigned long x = 0;
+        int digits = 0;
+        const char *start = p;
+        while (*p >= '0' && *p <= '9') {
+            if (++digits > 5) return 0;
+            x = x * 10 + (unsigned long)(*p - '0');
+            p++;
+        }
+        if (digits == 0 || x > 0xFFFFu || (digits > 1 && *start == '0')) return 0;
+        v = v << 16 | x;
+        if (part < 2) {
+            if (*p != '.') return 0;
+            p++;
+        }
     }
-    return tag[1] >= '0' && tag[1] <= '9';
+    if (*p) return 0;
+    if (ver) *ver = v << 16;
+    return 1;
+}
+
+int upd_tag_ok(const char *tag) {
+    return upd_tag_parse(tag, NULL);
 }
 
 static int hexval(char c) {
@@ -277,6 +300,91 @@ unsigned upd_pe_machine(const unsigned char *p, size_t n) {
     pe = rd32(p + 0x3C);
     if (pe > n || n - pe < 24 || memcmp(p + pe, "PE\0\0", 4) != 0) return 0;
     return (unsigned)rd16(p + pe + 4);
+}
+
+/*
+ * File offset of [rva, rva+len) through the section table, or 0 when the
+ * range is not wholly inside one section's raw data and the file. All sums
+ * in 64 bits: none of the 32-bit fields can wrap.
+ */
+static int rva_to_off(const unsigned char *p, size_t n, size_t sect, unsigned nsect,
+                      uint32_t rva, uint32_t len, size_t *off) {
+    for (unsigned i = 0; i < nsect; i++) {
+        const unsigned char *s = p + sect + (size_t)i * 40;
+        uint64_t vsize = rd32(s + 8), va = rd32(s + 12), raw = rd32(s + 16), ptr = rd32(s + 20);
+        uint64_t span = vsize && vsize < raw ? vsize : raw;   /* the part that is both mapped and in the file */
+        if (rva >= va && (uint64_t)rva + len <= va + span) {
+            uint64_t o = ptr + (rva - va);
+            if (o > n || n - o < len) return 0;
+            *off = (size_t)o;
+            return 1;
+        }
+    }
+    return 0;
+}
+
+/* The first entry of the resource directory at dir (offset inside the
+ * resource section r[0..rlen)) whose ID is want, or simply the first entry
+ * when want < 0. *child = its OffsetToData. */
+static int res_entry(const unsigned char *r, uint32_t rlen, uint32_t dir, long want, uint32_t *child) {
+    uint32_t total;
+    if (dir > rlen || rlen - dir < 16) return 0;
+    total = rd16(r + dir + 12) + rd16(r + dir + 14);   /* named + ID entries */
+    if ((rlen - dir - 16) / 8 < total) return 0;
+    for (uint32_t i = 0; i < total; i++) {
+        const unsigned char *e = r + dir + 16 + (size_t)i * 8;
+        uint32_t name = rd32(e);
+        if (want >= 0 && ((name & 0x80000000u) || name != (uint32_t)want)) continue;
+        *child = rd32(e + 4);
+        return 1;
+    }
+    return 0;
+}
+
+uint64_t upd_pe_file_version(const unsigned char *p, size_t n) {
+    static const char key[] = "VS_VERSION_INFO";
+    uint32_t pe, optsz, nrva, ddoff, res_rva, res_size, c1, c2, c3, data_rva, data_size;
+    unsigned nsect;
+    size_t opt, sect, roff, voff;
+    const unsigned char *r, *v;
+    if (n < 0x40 || p[0] != 'M' || p[1] != 'Z') return 0;
+    pe = rd32(p + 0x3C);
+    if (pe > n || n - pe < 24 || memcmp(p + pe, "PE\0\0", 4) != 0) return 0;
+    nsect = (unsigned)rd16(p + pe + 6);
+    optsz = rd16(p + pe + 20);
+    opt = (size_t)pe + 24;
+    if (n - opt < optsz) return 0;
+    sect = opt + optsz;
+    if ((n - sect) / 40 < nsect) return 0;
+    /* data directory 2 (resources) in a PE32 or PE32+ optional header */
+    if (optsz < 2) return 0;
+    if (rd16(p + opt) == 0x10b) ddoff = 96;
+    else if (rd16(p + opt) == 0x20b) ddoff = 112;
+    else return 0;
+    if (optsz < ddoff + 3 * 8) return 0;
+    nrva = rd32(p + opt + ddoff - 4);
+    if (nrva < 3) return 0;
+    res_rva = rd32(p + opt + ddoff + 2 * 8);
+    res_size = rd32(p + opt + ddoff + 2 * 8 + 4);
+    if (!res_rva || !res_size || !rva_to_off(p, n, sect, nsect, res_rva, res_size, &roff)) return 0;
+    r = p + roff;
+    /* type RT_VERSION (16) -> first name -> first language -> data entry;
+     * a fixed depth of three, so a directory pointing at itself cannot loop */
+    if (!res_entry(r, res_size, 0, 16, &c1) || !(c1 & 0x80000000u)) return 0;
+    if (!res_entry(r, res_size, c1 & 0x7FFFFFFFu, -1, &c2) || !(c2 & 0x80000000u)) return 0;
+    if (!res_entry(r, res_size, c2 & 0x7FFFFFFFu, -1, &c3) || (c3 & 0x80000000u)) return 0;
+    if (c3 > res_size || res_size - c3 < 16) return 0;
+    data_rva = rd32(r + c3);
+    data_size = rd32(r + c3 + 4);
+    /* VS_VERSIONINFO: wLength, wValueLength, wType, L"VS_VERSION_INFO\0",
+     * padding to 40, then VS_FIXEDFILEINFO (52 bytes) */
+    if (data_size < 40 + 52 || !rva_to_off(p, n, sect, nsect, data_rva, data_size, &voff)) return 0;
+    v = p + voff;
+    if (rd16(v) < 40 + 52 || rd16(v) > data_size || rd16(v + 2) < 52) return 0;
+    for (size_t i = 0; i < sizeof(key); i++)   /* UTF-16LE, terminator included */
+        if (v[6 + 2 * i] != (unsigned char)key[i] || v[7 + 2 * i] != 0) return 0;
+    if (rd32(v + 40) != 0xFEEF04BDu) return 0;
+    return (uint64_t)rd32(v + 48) << 32 | rd32(v + 52);
 }
 
 /* 1 if the entry name is "name" or "<folder>/name" (one level, no "..",
