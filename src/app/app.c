@@ -1953,6 +1953,43 @@ static int lock_self_exe(void) {
     return 1;
 }
 
+/* 1 if the process is elevated (its token says so); 0 if not or unknown. */
+static int process_elevated(DWORD pid) {
+    HANDLE p, tok = NULL;
+    TOKEN_ELEVATION el;
+    DWORD len = 0;
+    int r = 0;
+    p = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+    if (!p) return 0;
+    if (OpenProcessToken(p, TOKEN_QUERY, &tok)) {
+        if (GetTokenInformation(tok, TokenElevation, &el, sizeof(el), &len) && el.TokenIsElevated)
+            r = 1;
+        CloseHandle(tok);
+    }
+    CloseHandle(p);
+    return r;
+}
+
+/*
+ * The running instance's main window. Any program of the same user can
+ * register a window class with our name, so only a window whose process is
+ * elevated is accepted (the real instance always is: requireAdministrator).
+ * Image paths are not compared: the Program Files copy and a downloaded
+ * copy are different files.
+ */
+static HWND find_running_window(DWORD *pid_out) {
+    HWND w = NULL;
+    while ((w = FindWindowExW(NULL, w, L"TurkishDPI_main", NULL)) != NULL) {
+        DWORD pid = 0;
+        GetWindowThreadProcessId(w, &pid);
+        if (pid && pid != GetCurrentProcessId() && process_elevated(pid)) {
+            *pid_out = pid;
+            return w;
+        }
+    }
+    return NULL;
+}
+
 static int app_main(int quiet) {
     HANDLE mtx, t;
     MSG m;
@@ -1971,16 +2008,17 @@ static int app_main(int quiet) {
         /* Bring the running instance's window to front. Not through WM_TRAY:
          * that one is open to every program (UIPI allow-list) and therefore
          * only acted on when the pointer is on our tray icon. */
-        HWND w = FindWindowW(L"TurkishDPI_main", NULL);
         UINT show = RegisterWindowMessageW(TURKISHDPI_SHOW_MSG);
+        DWORD pid = 0;
+        HWND w;
         if (g_selftest) return 3;   /* another instance is running: cannot self-test */
-        if (w && show && !quiet) {
-            DWORD pid = 0;
+        if (quiet || !show) return 0;
+        w = find_running_window(&pid);
+        if (w) {
             /* We were just started by the user, so we may take the
              * foreground; hand that right to the running instance, or its
              * SetForegroundWindow only flashes the taskbar button. */
-            GetWindowThreadProcessId(w, &pid);
-            if (pid) AllowSetForegroundWindow(pid);
+            AllowSetForegroundWindow(pid);
             PostMessageW(w, show, 0, 0);
         }
         return 0;
