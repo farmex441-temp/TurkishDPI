@@ -54,10 +54,11 @@ jobs:
           # (-Wall -Wextra -Werror); the same script builds the 32-bit and
           # msvcrt cross builds in the "build" job.
           bash .github/scripts/build-tests.sh gcc build/tests
-          for t in build/tests/*.exe; do
-            echo "== $t"
-            "$t"
-          done
+          while read -r n; do
+            echo "== $n"
+            [ -f "build/tests/$n.exe" ] || { echo "::error::build/tests/$n.exe was not built"; exit 1; }
+            "./build/tests/$n.exe"
+          done < build/tests/EXPECTED
       - name: WinDivert.dll pinning test
         run: |
           # Any harmless DLL stands in for WinDivert.dll: with its own hash it
@@ -124,8 +125,8 @@ jobs:
           cd /d "%GITHUB_WORKSPACE%" || exit /b 1
           mkdir build
           rem vcvars64 puts the ASan runtime DLL's folder on PATH
-          cl /nologo /W3 /fsanitize=address /Zi /MD /D_CRT_SECURE_NO_WARNINGS /Dssize_t=intptr_t /Isrc/engine tests\dns_test.c src\engine\dns.c /Fobuild\ /Fe:build\dns_asan.exe /link ws2_32.lib || exit /b 1
-          cl /nologo /W3 /fsanitize=address /Zi /MD /D_CRT_SECURE_NO_WARNINGS /Dssize_t=intptr_t /Isrc/engine tests\exclude_test.c src\engine\exclude.c /Fobuild\ /Fe:build\exclude_asan.exe /link ws2_32.lib || exit /b 1
+          cl /nologo /W3 /std:c17 /utf-8 /fsanitize=address /Zi /MD /D_CRT_SECURE_NO_WARNINGS /Dssize_t=intptr_t /Isrc/engine tests\dns_test.c src\engine\dns.c /Fobuild\ /Fe:build\dns_asan.exe /link ws2_32.lib || exit /b 1
+          cl /nologo /W3 /std:c17 /utf-8 /fsanitize=address /Zi /MD /D_CRT_SECURE_NO_WARNINGS /Dssize_t=intptr_t /Isrc/engine tests\exclude_test.c src\engine\exclude.c /Fobuild\ /Fe:build\exclude_asan.exe /link ws2_32.lib || exit /b 1
           cd build
           .\dns_asan.exe || exit /b 1
           .\exclude_asan.exe || exit /b 1
@@ -148,10 +149,11 @@ jobs:
           export TEST_ONLY="diag_test updpkg_test test_proto test_tcpdpi test_udpdpi test_rawscope xlate_test pieces_test policy_test desync_test"
           export TEST_LIBS="" TEST_EXT=""
           bash .github/scripts/build-tests.sh gcc build/san -g -O1 -fsanitize=address,undefined -fno-sanitize-recover=all
-          for t in build/san/*; do
-            echo "== $t"
-            "$t"
-          done
+          while read -r n; do
+            echo "== $n"
+            [ -x "build/san/$n" ] || { echo "::error::build/san/$n was not built"; exit 1; }
+            "./build/san/$n"
+          done < build/san/EXPECTED
 
   build:
     needs: [test, test-asan-windows, test-sanitizers]
@@ -323,10 +325,12 @@ jobs:
           # The shipped exe is a 32/64-bit msvcrt build, but the "test" job only
           # runs the native build of the runner's gcc: build the same tests the
           # way the exe is built; the "smoke" job runs them.
+          rc=0
           for a in x86_64 i686; do
-            bash .github/scripts/build-tests.sh $a-w64-mingw32-gcc dist-tests/$a -static
+            bash .github/scripts/build-tests.sh $a-w64-mingw32-gcc dist-tests/$a -static || rc=1
           done
           ls -l dist-tests/*
+          exit $rc
 
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
@@ -364,8 +368,13 @@ jobs:
         run: |
           $failed = 0
           foreach ($a in 'x86_64', 'i686') {
-            $tests = @(Get-ChildItem -Path "dist-tests/$a" -Filter *.exe | Sort-Object Name)
-            if ($tests.Count -eq 0) { Write-Host "::error::no unit tests found for $a"; $failed++ }
+            $expected = @(Get-Content -Path "dist-tests/$a/EXPECTED" | Where-Object { $_ })
+            if ($expected.Count -eq 0) { Write-Host "::error::no unit tests listed for $a"; $failed++ }
+            $tests = @()
+            foreach ($n in $expected) {
+              $f = Get-Item -Path "dist-tests/$a/$n.exe" -ErrorAction SilentlyContinue
+              if ($f) { $tests += $f } else { Write-Host "::error::unit test $a/$n.exe is missing"; $failed++ }
+            }
             foreach ($t in $tests) {
               Write-Host "== $a/$($t.Name)"
               $p = Start-Process -FilePath $t.FullName -PassThru -NoNewWindow
