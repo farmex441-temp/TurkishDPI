@@ -40,6 +40,7 @@ static void autostart_migrate(void);
 CRITICAL_SECTION g_lock;
 ui_state_t g_ui;
 int g_auto = 1, g_preset = 0, g_paused = 0, g_payment_protect = 1;
+int g_payment_shown = 1;
 wchar_t g_log[MAX_PATH], g_ini[MAX_PATH];
 
 static wchar_t g_dir[MAX_PATH], g_exe[MAX_PATH];
@@ -255,6 +256,7 @@ static void config_load(void) {
     g_dns = ini_int(L"Dns", 0);
     if (g_dns < 0 || g_dns >= DNS_SERVER_COUNT) g_dns = 0;
     g_payment_protect = ini_int(L"PaymentProtection", 1) != 0;
+    g_payment_shown = g_payment_protect;   /* before the UI and the controller exist */
     g_dns_hybrid = ini_int(L"DnsHybrid", 1) != 0;
     g_watchdog_min = ini_int(L"WatchdogMinutes", 10);
     if (g_watchdog_min < 1) g_watchdog_min = 1;
@@ -1201,6 +1203,27 @@ static void update_install(void) {
     if (r == -1) app_open_url(TURKISHDPI_RELEASES_URL);
 }
 
+/* A setting the engine's command line depends on changed (CMD_RESTART,
+ * CMD_PAYMENT): restart what runs, no full rescan. While paused nothing
+ * runs and nothing is started: the new setting applies at resume. */
+static void restart_running(int interrupted) {
+    set_reason(WHY_SETTINGS);
+    if (g_paused) {
+        log_line("settings changed while paused: applied on resume");
+        return;
+    }
+    /* mid-scan the running preset is only a candidate */
+    if (g_running_preset >= 0 && !interrupted) {
+        int p = g_running_preset;
+        if (engine_start(p, g_dns)) announce(p, targets_score(NULL));
+        else if (!engine_fatal()) { if (g_auto) auto_scan(); else manual_start(g_preset); }
+        return;
+    }
+    /* nothing runs (stand-by, offline, error): the next start uses the new
+     * setting; an interrupted scan must still finish */
+    if (interrupted) { if (g_auto) auto_scan(); else manual_start(g_preset); }
+}
+
 /* ---------- controller thread ---------- */
 static DWORD WINAPI controller(LPVOID unused) {
     OVERLAPPED ov;
@@ -1268,17 +1291,21 @@ static DWORD WINAPI controller(LPVOID unused) {
             case CMD_PAUSE:   g_paused = 1; engine_stop(); probe_flush_dns_cache();
                               set_state(ST_PAUSED, L"Duraklatıldı", L"Açmak için düğmeye basın"); break;
             case CMD_RESTART: /* settings changed: restart what runs, no full rescan */
-                              set_reason(WHY_SETTINGS);
-                              /* mid-scan the running preset is only a candidate */
-                              if (!g_paused && g_running_preset >= 0 && !interrupted) {
-                                  int p = g_running_preset;
-                                  if (engine_start(p, g_dns)) announce(p, targets_score(NULL));
-                                  else if (!engine_fatal()) { if (g_auto) auto_scan(); else manual_start(g_preset); }
-                                  break;
+                              restart_running(interrupted);
+                              break;
+            case CMD_PAYMENT: /* the UI's toggle: the flag, the ini and the engine change here */
+                              if ((arg != 0) != (g_payment_protect != 0)) {
+                                  g_payment_protect = arg != 0;
+                                  config_save();
+                                  log_line("payment protection %s", g_payment_protect ? "on" : "off");
+                                  restart_running(interrupted);
+                              } else if (interrupted && !g_paused) {
+                                  /* no change (e.g. off and on again): only finish the scan */
+                                  if (g_auto) auto_scan(); else manual_start(g_preset);
                               }
-                              /* fall through */
+                              break;
             case CMD_RESUME:  g_paused = 0;
-                              if (cmd == CMD_RESUME) set_reason(WHY_RESUME_PAUSE);
+                              set_reason(WHY_RESUME_PAUSE);
                               if (g_auto) auto_scan(); else manual_start(g_preset);
                               break;
             case CMD_AUTOSTART: autostart_set((int)arg);
@@ -1395,11 +1422,12 @@ void post_site_test(const wchar_t *host) {
     post_cmd(CMD_TESTSITE, 0);
 }
 
+/* UI thread: shown at once, applied by the controller (CMD_PAYMENT saves
+ * the ini and restarts what runs; a paused app stays paused). */
 void set_payment_protect(int on) {
-    g_payment_protect = on;
-    config_save();
-    if (g_running_preset >= 0) post_cmd(CMD_RESTART, 0);
-    else ui_refresh();
+    g_payment_shown = on != 0;
+    post_cmd(CMD_PAYMENT, on != 0);
+    ui_refresh();
 }
 
 /* ---------- autostart via Task Scheduler (elevated, no UAC prompt) ---------- */

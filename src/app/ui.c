@@ -839,7 +839,7 @@ static void update_controls(void) {
             show = show && bk != 0;
             break;
         case ID_PAYLINE:
-            if (g_payment_protect)
+            if (g_payment_shown)
                 _snwprintf(buf, 199, L"Ödeme koruması açık · %d+ banka ve ödeme sitesi hariç",
                            g_payment_domains);
             else
@@ -856,7 +856,7 @@ static void update_controls(void) {
                                        : L"Windows açılışında başlat: kapalı");
             break;
         case ID_T_PAY:
-            wcscpy(buf, g_payment_protect ? L"Ödeme koruması: açık" : L"Ödeme koruması: kapalı");
+            wcscpy(buf, g_payment_shown ? L"Ödeme koruması: açık" : L"Ödeme koruması: kapalı");
             break;
         case ID_L_LOG:     wcscpy(buf, L"Günlüğü aç"); break;
         case ID_L_INI:     wcscpy(buf, L"Gelişmiş ayarlar"); break;
@@ -1071,7 +1071,7 @@ static const wchar_t *toggle_desc(int id) {
 }
 
 static int toggle_on(int id) {
-    return id == ID_T_AUTO ? g_auto : id == ID_T_START ? ui_autostart() : g_payment_protect;
+    return id == ID_T_AUTO ? g_auto : id == ID_T_START ? ui_autostart() : g_payment_shown;
 }
 
 static void draw_ring(HDC dc, RECT r, const ui_state_t *st, int hot, int focus, int pressed) {
@@ -1254,10 +1254,10 @@ static void draw_item(const DRAWITEMSTRUCT *d) {
     }
     case K_PAYLINE: {
         RECT tr = r;
-        COLORREF col = g_payment_protect ? P->ok : P->warn;
-        glyph(mem, g_payment_protect ? GL_CHECK : GL_BANG, SF(8), r.bottom / 2.0f, SF(10), SF(1.5f), col);
+        COLORREF col = g_payment_shown ? P->ok : P->warn;
+        glyph(mem, g_payment_shown ? GL_CHECK : GL_BANG, SF(8), r.bottom / 2.0f, SF(10), SF(1.5f), col);
         tr.left = S(20);
-        text(mem, f_caption, g_payment_protect ? (hot ? P->text : P->text2) : P->warn, tr, label,
+        text(mem, f_caption, g_payment_shown ? (hot ? P->text : P->text2) : P->warn, tr, label,
              DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
         if (focus) focus_ring(mem, r, 6);
         break;
@@ -1446,7 +1446,7 @@ static void do_click(int id) {
         /* flip local mock values so toggles can be reviewed; nothing is saved */
         if (id == ID_T_AUTO) g_auto = !g_auto;
         else if (id == ID_T_START) g_ui.autostart = !g_ui.autostart;
-        else if (id == ID_T_PAY) g_payment_protect = !g_payment_protect;
+        else if (id == ID_T_PAY) g_payment_shown = !g_payment_shown;
         else if (id == ID_EXIT) { PostMessageW(g_wnd, WM_CLOSE, 0, 0); return; }
         else { wchar_t n[200]; GetWindowTextW(ctl(id)->hwnd, n, 200); preview_action(n); return; }
         update_controls();
@@ -1502,13 +1502,13 @@ static void command(int id) {
     case IDM_AUTO:      post_cmd(CMD_AUTO, 0); break;
     case IDM_AUTOSTART: post_cmd(CMD_AUTOSTART, !autostart_enabled()); break;
     case IDM_PAYMENT:
-        if (g_payment_protect &&
+        if (g_payment_shown &&
             MessageBoxW(g_wnd, L"Ödeme koruması kapatılırsa banka ve ödeme sitelerinin trafiği de "
                                L"değiştirilir. Bu, 3D Secure ve ödeme hatalarına yol açabilir.\n\n"
                                L"Yine de kapatılsın mı?", L"TurkishDPI",
                         MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2) != IDYES)
             break;
-        set_payment_protect(!g_payment_protect);
+        set_payment_protect(!g_payment_shown);
         update_controls();
         break;
     case IDM_LOG:       app_open_file(g_log); break;
@@ -1920,7 +1920,7 @@ static int preview_fill(const char *name) {
     g_ui.learned = 3;
     g_ui.scan_total = 10;
     wcscpy(g_ui.network, L"Ev Wi-Fi");
-    g_auto = 1; g_preset = 4; g_paused = 0; g_payment_protect = 1;
+    g_auto = 1; g_preset = 4; g_paused = 0; g_payment_shown = 1;
     pv_targets(3, t3, ok3, ms3);
     g_ui.st_packets = 18432; g_ui.st_https = 812; g_ui.st_http = 37;
     g_ui.st_dns = 655; g_ui.st_excluded = 6;
@@ -2003,7 +2003,7 @@ static int preview_fill(const char *name) {
         g_auto = 0; g_preset = 7; g_ui.preset = 7;
         pv_state(ST_ACTIVE, L"Koruma aktif", L"Superonline (-9)");
     } else if (!strcmp(name, "payment-off")) {
-        g_payment_protect = 0;
+        g_payment_shown = 0;
     } else {
         return 0;
     }

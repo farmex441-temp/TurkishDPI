@@ -20,7 +20,8 @@ typedef enum {
 } state_kind_t;
 
 enum { CMD_NONE, CMD_RESCAN, CMD_SELECT, CMD_AUTO, CMD_PAUSE, CMD_RESUME,
-       CMD_TESTSITE, CMD_RESTART, CMD_TOGGLE_PAUSE, CMD_AUTOSTART, CMD_UPDATE };
+       CMD_TESTSITE, CMD_RESTART, CMD_TOGGLE_PAUSE, CMD_AUTOSTART, CMD_UPDATE,
+       CMD_PAYMENT /* arg: 1 on, 0 off */ };
 
 typedef struct {
     state_kind_t kind;
@@ -57,13 +58,16 @@ typedef struct {
 extern CRITICAL_SECTION g_lock;
 extern ui_state_t g_ui;
 extern int g_auto, g_preset, g_paused, g_payment_protect;
+/* Payment protection as the UI shows it (UI thread only): changed at once by
+ * a click, while g_payment_protect belongs to the controller (CMD_PAYMENT). */
+extern int g_payment_shown;
 extern wchar_t g_log[MAX_PATH], g_ini[MAX_PATH];
 void post_cmd(LONG cmd, LONG arg);
 void post_site_test(const wchar_t *host);
 int  autostart_enabled(void);
 void autostart_set(int on);
 void app_exit(void);
-void set_payment_protect(int on);
+void set_payment_protect(int on);        /* UI thread: shows it, posts CMD_PAYMENT */
 void app_network_event(void);
 void app_open_url(const wchar_t *url);   /* in the user's (non-elevated) shell */
 void app_open_file(const wchar_t *path); /* Notepad from System32 */
