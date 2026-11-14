@@ -1250,11 +1250,24 @@ static site_end_t site_test_run(const wchar_t *raw, int prev) {
     return SITE_NOT_FOUND;
 }
 
-/* A scan that a site test interrupted must still finish (it was an
- * auto_scan, also when a "rescan" ran in manual mode). */
-static void resume_interrupted_scan(void) {
-    if (!g_scan_aborted) return;
-    log_line("site test: resuming the interrupted scan");
+/*
+ * Finishes a scan that a command interrupted (auto_scan gives way to every
+ * queued command); called by every command or site-test ending that does
+ * not replace the scan itself. One rule everywhere, also in manual mode
+ * (g_auto == 0), where a scan only exists because the user pressed
+ * "Yeniden tara": an interrupted scan is finished as a scan, which is what
+ * the user asked for. If yet another command is queued, nothing is started
+ * (a scan begun now would give way at once and only cost a DNS measurement):
+ * the "interrupted" flag stays set and that command replaces or finishes it.
+ */
+static void finish_interrupted_scan(void) {
+    if (g_paused || g_quitting) return;
+    if (cmd_pending()) {
+        InterlockedExchange(&g_scan_aborted, 1);
+        log_line("scan: interrupted scan left to the next queued command");
+        return;
+    }
+    log_line("scan: finishing the interrupted scan");
     auto_scan();
 }
 
@@ -1273,7 +1286,7 @@ static void site_test(const wchar_t *raw) {
 
     switch (site_test_run(raw, prev)) {
     case SITE_UNTOUCHED:
-        resume_interrupted_scan();
+        if (g_scan_aborted) finish_interrupted_scan();
         break;
     case SITE_NO_NET:
         /* The engine was not touched. One failed probe round may be a short
@@ -1281,7 +1294,7 @@ static void site_test(const wchar_t *raw) {
          * that is really down. Only a scan we interrupted must still finish
          * (auto_scan finds the link down and goes offline itself). */
         log_line("site test: control sites unreachable");
-        resume_interrupted_scan();
+        if (g_scan_aborted) finish_interrupted_scan();
         break;
     case SITE_INTERRUPTED:
         if (g_quitting) break;
@@ -1303,9 +1316,11 @@ static void site_test(const wchar_t *raw) {
         log_line("site test: previous state restored (preset %d)", prev);
         break;
     case SITE_NOT_FOUND:
-        if (!g_auto)
+        if (g_scan_aborted)
+            finish_interrupted_scan();             /* the scan we interrupted, in either mode */
+        else if (!g_auto)
             manual_start(g_preset);                /* a manual choice stays the user's */
-        else if (!g_scan_aborted && prev >= 0 && engine_start(prev, g_dns))
+        else if (prev >= 0 && engine_start(prev, g_dns))
             announce(prev, targets_score(NULL));   /* the real score, not an assumed one */
         else
             auto_scan();
@@ -1371,8 +1386,8 @@ static void restart_running(int interrupted) {
         return;
     }
     /* nothing runs (stand-by, offline, error): the next start uses the new
-     * setting; an interrupted scan must still finish */
-    if (interrupted) { if (g_auto) auto_scan(); else manual_start(g_preset); }
+     * setting; an interrupted scan must still finish (with the new setting) */
+    if (interrupted) finish_interrupted_scan();
 }
 
 /* ---------- controller thread ---------- */
@@ -1424,8 +1439,10 @@ static DWORD WINAPI controller(LPVOID unused) {
 
         if ((cmd = cmd_pop(&arg)) != CMD_NONE) {
             /* auto_scan gives way to any queued command; a command that does
-             * not replace the scan must finish it afterwards, otherwise the
-             * engine stays on whatever preset was being tried. */
+             * not replace the scan must finish it afterwards
+             * (finish_interrupted_scan), otherwise the engine stays on
+             * whatever preset was being tried. CMD_TESTSITE keeps the flag:
+             * site_test finishes the scan itself. */
             int interrupted = g_scan_aborted != 0;
             if (cmd != CMD_TESTSITE) InterlockedExchange(&g_scan_aborted, 0);
             switch (cmd) {
@@ -1451,14 +1468,14 @@ static DWORD WINAPI controller(LPVOID unused) {
                                   config_save();
                                   log_line("payment protection %s", g_payment_protect ? "on" : "off");
                                   restart_running(interrupted);
-                              } else if (interrupted && !g_paused) {
+                              } else if (interrupted) {
                                   /* no change (e.g. off and on again): only finish the scan */
-                                  if (g_auto) auto_scan(); else manual_start(g_preset);
+                                  finish_interrupted_scan();
                               }
                               break;
             case CMD_RESUME:  if (!g_paused) {
                                   log_line("resume: not paused, ignored");
-                                  if (interrupted) auto_scan();   /* the scan it interrupted */
+                                  if (interrupted) finish_interrupted_scan();
                                   break;
                               }
                               g_paused = 0;
@@ -1466,14 +1483,14 @@ static DWORD WINAPI controller(LPVOID unused) {
                               set_reason(WHY_RESUME_PAUSE);
                               if (g_auto) auto_scan(); else manual_start(g_preset);
                               break;
-            /* An interrupted scan is finished also in manual mode: it was an
-             * auto_scan (a "rescan"), and is never left on a candidate. */
+            /* commands that do not replace a scan finish it (see
+             * finish_interrupted_scan for the rule, also in manual mode) */
             case CMD_AUTOSTART: autostart_set((int)arg);
-                              if (interrupted && !g_paused) auto_scan();
+                              if (interrupted) finish_interrupted_scan();
                               break;
             case CMD_UPDATE:  update_install();
                               if (g_quitting) return 0;
-                              if (interrupted && !g_paused) auto_scan();
+                              if (interrupted) finish_interrupted_scan();
                               break;
             case CMD_TESTSITE: {
                 wchar_t h[256];
