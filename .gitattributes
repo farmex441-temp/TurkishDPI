@@ -2,3 +2,6 @@
 *.ico binary
 *.png binary
 *.cmd text eol=crlf
+*.dll binary
+*.sys binary
+*.bmp binary
