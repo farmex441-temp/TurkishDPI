@@ -9,6 +9,10 @@
 #define WM_TRAY    (WM_APP + 1)
 #define WM_STATUS  (WM_APP + 2)
 #define WM_UPDATE_DONE (WM_APP + 3)   /* controller -> UI: wParam 1 restart, 2 broken */
+/* Registered message a second (elevated) start posts to bring the running
+ * window forward. Never added to the UIPI allow-list: only processes at our
+ * integrity level or above can post it, unlike WM_TRAY. */
+#define TURKISHDPI_SHOW_MSG L"TurkishDPI.Show"
 
 typedef enum {
     ST_STARTING, ST_SCANNING, ST_ACTIVE, ST_PARTIAL, ST_STANDBY,

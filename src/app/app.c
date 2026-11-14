@@ -1789,10 +1789,21 @@ static int app_main(int quiet) {
         return 1;
     }
     if (GetLastError() == ERROR_ALREADY_EXISTS) {
-        /* Bring the running instance's window to front. */
+        /* Bring the running instance's window to front. Not through WM_TRAY:
+         * that one is open to every program (UIPI allow-list) and therefore
+         * only acted on when the pointer is on our tray icon. */
         HWND w = FindWindowW(L"TurkishDPI_main", NULL);
+        UINT show = RegisterWindowMessageW(TURKISHDPI_SHOW_MSG);
         if (g_selftest) return 3;   /* another instance is running: cannot self-test */
-        if (w && !quiet) PostMessageW(w, WM_TRAY, 0, WM_LBUTTONUP);
+        if (w && show && !quiet) {
+            DWORD pid = 0;
+            /* We were just started by the user, so we may take the
+             * foreground; hand that right to the running instance, or its
+             * SetForegroundWindow only flashes the taskbar button. */
+            GetWindowThreadProcessId(w, &pid);
+            if (pid) AllowSetForegroundWindow(pid);
+            PostMessageW(w, show, 0, 0);
+        }
         return 0;
     }
 

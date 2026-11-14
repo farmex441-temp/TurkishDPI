@@ -167,6 +167,7 @@ static COLORREF mix(COLORREF a, COLORREF b, int pct) {   /* pct of b over a */
 static HWND g_wnd, g_edit;
 static HINSTANCE g_inst;
 static UINT g_taskbar_created;
+static UINT g_show_msg;              /* TURKISHDPI_SHOW_MSG: a second start */
 static ULONG_PTR g_gdip;
 static float g_scale = 1.0f;
 static HFONT f_display, f_title, f_body, f_caption, f_label, f_button;
@@ -1641,6 +1642,10 @@ static void create_controls(HWND h) {
 
 static LRESULT CALLBACK wndproc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
     if (msg == g_taskbar_created && msg) { g_tray_tries = 0; tray_add(); tray_update(); return 0; }
+    /* Posted by a second start of the (elevated) exe. Not in the UIPI
+     * allow-list, so unprivileged programs cannot post it. Never registered
+     * in --ui-preview (g_show_msg stays 0). */
+    if (msg == g_show_msg && msg) { ui_show(); return 0; }
     switch (msg) {
     case WM_CREATE:
         g_wnd = h;
@@ -1814,6 +1819,7 @@ int ui_init(HINSTANCE inst) {
     }
     if (g_ui_preview) return 1;   /* no tray icon, no UIPI changes */
     g_taskbar_created = RegisterWindowMessageW(L"TaskbarCreated");
+    g_show_msg = RegisterWindowMessageW(TURKISHDPI_SHOW_MSG);   /* deliberately not allowed below */
     {
         /* We run elevated: UIPI drops messages from the (non-elevated)
          * Explorer unless allowed, so the icon would never come back after
