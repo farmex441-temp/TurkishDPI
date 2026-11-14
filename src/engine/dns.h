@@ -43,7 +43,7 @@ int  dns_add_block_ip(const char *ip);
  * check for an answer whose sender is not known to be local; in the hybrid
  * race (dns_handle_incoming_hybrid) an answer from the asked resolver may
  * carry RFC 1918 / 169.254 addresses when that resolver's own address is
- * local (LAN, VPN, CGNAT, loopback, ULA, link-local). */
+ * local (RFC 1918, 169.254, loopback, ULA, link-local; not CGNAT). */
 int  dns_answer_is_forged(const char *data, unsigned int len);
 /* 1 for a well-formed DNS question (outgoing) or answer (incoming). */
 int  dns_is_dns_packet(const char *data, unsigned int len, int outgoing);

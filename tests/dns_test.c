@@ -29,6 +29,40 @@ static int build(unsigned char *m, unsigned short id, int rcode, int type, const
     return o;
 }
 
+/* Like build(), with a second A record appended to the answer section. */
+static int build2(unsigned char *m, unsigned short id, const unsigned char a1[4], const unsigned char a2[4]) {
+    int o = build(m, id, 0, 1, a1, 4);
+    m[7] = 2;                       /* ANCOUNT */
+    m[o++] = 0xC0; m[o++] = 12;
+    m[o++] = 0; m[o++] = 1; m[o++] = 0; m[o++] = 1;
+    m[o++] = 0; m[o++] = 0; m[o++] = 0; m[o++] = 60;
+    m[o++] = 0; m[o++] = 4;
+    memcpy(m + o, a2, 4); o += 4;
+    return o;
+}
+
+/* Question from local:lport to resolver:53, which answers A 192.168.1.20.
+ * accepted: expect DNS_IN_PASS (and the clean duplicate dropped); otherwise
+ * expect DNS_IN_DROP and the clean answer rewritten. */
+static void lan_answer_case(const uint32_t local[4], uint16_t lport, const uint32_t resolver[4],
+                            const uint32_t clean[4], uint16_t cport, const unsigned char *q,
+                            int v6, int accepted, const char *what) {
+    unsigned char m[512], lan[4] = { 192, 168, 1, 20 }, real[4] = { 162, 159, 137, 232 };
+    uint16_t p53 = htons(53);
+    conntrack_info_t ci;
+    int n;
+    char msg[160];
+    EXPECT(dns_handle_outgoing(local, lport, resolver, p53, (const char *)q, 29, (uint8_t)v6), "tracked for edge");
+    n = build(m, (unsigned short)(q[0] << 8 | q[1]), 0, 1, lan, 4);
+    snprintf(msg, sizeof(msg), "%s: %s", what, accepted ? "accepted" : "strict (dropped)");
+    EXPECT(dns_handle_incoming_hybrid(local, lport, resolver, p53, (char *)m, (unsigned)n, &ci, (uint8_t)v6)
+           == (accepted ? DNS_IN_PASS : DNS_IN_DROP), msg);
+    n = build(m, (unsigned short)(q[0] << 8 | q[1]), 0, 1, real, 4);
+    snprintf(msg, sizeof(msg), "%s: clean answer %s", what, accepted ? "dropped as duplicate" : "rewritten");
+    EXPECT(dns_handle_incoming_hybrid(local, lport, clean, cport, (char *)m, (unsigned)n, &ci, (uint8_t)v6)
+           == (accepted ? DNS_IN_DROP : DNS_IN_REWRITE), msg);
+}
+
 int main(void) {
     unsigned char m[512];
     unsigned char blk[4] = { 195, 175, 254, 2 }, real[4] = { 162, 159, 137, 232 }, lo[4] = { 127, 0, 0, 1 };
@@ -128,7 +162,6 @@ int main(void) {
                 { "192.168.1.1", "192.168.1.20",  "router answers a LAN name" },
                 { "10.8.0.1",    "10.0.0.20",     "VPN resolver answers an intranet name" },
                 { "172.20.0.53", "172.20.4.4",    "172.16/12 resolver and answer" },
-                { "100.64.0.1",  "192.168.1.20",  "CGNAT resolver answers a LAN name" },
                 { "192.168.1.1", "169.254.10.10", "link-local answer from a LAN resolver" },
             };
             for (unsigned i = 0; i < sizeof(ok) / sizeof(ok[0]); i++) {
@@ -219,6 +252,63 @@ int main(void) {
             EXPECT(dns_handle_incoming_hybrid(local, lport, pub, p53, (char *)m, (unsigned)n, &ci, 0) == DNS_IN_DROP,
                    "public resolver's LAN answer still dropped");
         }
+        /* 4h) a CGNAT resolver (100.64/10) is usually the carrier's own one:
+         *     strict - its private answer is dropped, the clean one rewritten */
+        {
+            uint32_t cg[4] = { 0 };
+            inet_pton(AF_INET, "100.64.0.1", cg);
+            lan_answer_case(local, lport, cg, clean, cport, q, 0, 0, "CGNAT resolver answers a LAN name");
+            EXPECT(dns_handle_outgoing(local, lport, cg, p53, (char *)q, 29, 0), "tracked for 4h");
+            n = build(m, 0x1234, 0, 1, real, 4);
+            EXPECT(dns_handle_incoming_hybrid(local, lport, clean, cport, (char *)m, (unsigned)n, &ci, 0) == DNS_IN_REWRITE &&
+                   ci.dstip[0] == cg[0], "rewrite targets the CGNAT resolver");
+        }
+        /* 4i) port check: the question went to 192.168.1.1:53; an answer from
+         *     192.168.1.1:5353 is not the asked resolver but a third party, so
+         *     the strict check applies: its LAN address makes it DNS_IN_DROP,
+         *     the race is not ended and the clean answer is rewritten */
+        {
+            unsigned char lan[4] = { 192, 168, 1, 20 };
+            uint16_t p5353 = htons(5353);
+            EXPECT(dns_handle_outgoing(local, lport, isp, p53, (char *)q, 29, 0), "tracked for 4i");
+            n = build(m, 0x1234, 0, 1, lan, 4);
+            EXPECT(dns_handle_incoming_hybrid(local, lport, isp, p5353, (char *)m, (unsigned)n, &ci, 0) == DNS_IN_DROP,
+                   "LAN answer from the resolver's address but another port dropped");
+            n = build(m, 0x1234, 0, 1, real, 4);
+            EXPECT(dns_handle_incoming_hybrid(local, lport, clean, cport, (char *)m, (unsigned)n, &ci, 0) == DNS_IN_REWRITE,
+                   "race not ended by the wrong-port answer: clean answer rewritten");
+            EXPECT(ci.dstip[0] == isp[0] && ci.dstport == p53, "rewrite targets 192.168.1.1:53");
+        }
+        /* 4j) range edges of the local-resolver test, each answering 192.168.1.20 */
+        {
+            static const struct { const char *resolver; int accepted; } edge[] = {
+                { "172.15.0.1", 0 }, { "172.32.0.1", 0 }, { "169.253.0.1", 0 },
+                { "100.63.255.255", 0 }, { "100.64.0.1", 0 }, { "100.127.255.254", 0 }, { "100.128.0.1", 0 },
+                { "172.16.0.1", 1 }, { "172.31.255.254", 1 }, { "169.254.1.1", 1 }, { "127.0.0.1", 1 },
+            };
+            for (unsigned i = 0; i < sizeof(edge) / sizeof(edge[0]); i++) {
+                uint32_t res[4] = { 0 };
+                inet_pton(AF_INET, edge[i].resolver, res);
+                lan_answer_case(local, lport, res, clean, cport, q, 0, edge[i].accepted, edge[i].resolver);
+            }
+        }
+        /* 4k) mixed answer from a LAN resolver: a LAN address and the block
+         *     page in one message -> dropped, the clean answer rewritten */
+        {
+            unsigned char lan[4] = { 192, 168, 1, 20 };
+            EXPECT(dns_handle_outgoing(local, lport, isp, p53, (char *)q, 29, 0), "tracked for 4k");
+            n = build2(m, 0x1234, lan, blk);
+            EXPECT(dns_handle_incoming_hybrid(local, lport, isp, p53, (char *)m, (unsigned)n, &ci, 0) == DNS_IN_DROP,
+                   "LAN address plus block page from a LAN resolver dropped");
+            n = build(m, 0x1234, 0, 1, real, 4);
+            EXPECT(dns_handle_incoming_hybrid(local, lport, clean, cport, (char *)m, (unsigned)n, &ci, 0) == DNS_IN_REWRITE,
+                   "clean answer rewritten after a mixed answer");
+            /* the second record is really parsed: two LAN addresses pass */
+            EXPECT(dns_handle_outgoing(local, lport, isp, p53, (char *)q, 29, 0), "tracked for 4k2");
+            n = build2(m, 0x1234, lan, lan);
+            EXPECT(dns_handle_incoming_hybrid(local, lport, isp, p53, (char *)m, (unsigned)n, &ci, 0) == DNS_IN_PASS,
+                   "two LAN addresses from a LAN resolver pass");
+        }
     }
 
     /* 5) IPv6: ULA / link-local resolvers and answers */
@@ -239,6 +329,9 @@ int main(void) {
         inet_pton(AF_INET, "94.140.14.140", &clean4);
         dns_set_clean(clean4, cport, clean6, cport);
 
+        /* Regression guards: the next two cases (ULA and link-local AAAA from
+         * a ULA / link-local resolver) also passed before the local-resolver
+         * rule - bad_v6 never rejected those addresses. */
         EXPECT(dns_handle_outgoing(local6, lport, res6, p53, (char *)q, 29, 1), "v6 tracked");
         n = build(m, 0x4321, 0, 28, ula, 16);
         EXPECT(dns_handle_incoming_hybrid(local6, lport, res6, p53, (char *)m, (unsigned)n, &ci, 1) == DNS_IN_PASS,
@@ -259,6 +352,19 @@ int main(void) {
         }
         EXPECT(dns_handle_incoming_hybrid(local6, lport, res6, p53, (char *)m, (unsigned)n, &ci, 1) == DNS_IN_PASS,
                "ULA resolver answers a private A record");
+
+        /* IPv6 range edges, each asked resolver answering A 192.168.1.20 */
+        {
+            static const struct { const char *resolver; int accepted; } edge[] = {
+                { "fec0::1", 0 }, { "fe00::1", 0 }, { "::ffff:192.168.1.1", 0 },
+                { "fd00::1", 1 }, { "fc00::1", 1 }, { "fe80::1", 1 }, { "febf::1", 1 }, { "::1", 1 },
+            };
+            for (unsigned i = 0; i < sizeof(edge) / sizeof(edge[0]); i++) {
+                uint32_t res[4] = { 0 };
+                inet_pton(AF_INET6, edge[i].resolver, res);
+                lan_answer_case(local6, lport, res, clean6, cport, q, 1, edge[i].accepted, edge[i].resolver);
+            }
+        }
 
         /* block page from a ULA resolver: dropped, clean rewritten */
         EXPECT(dns_handle_outgoing(local6, lport, res6, p53, (char *)q, 29, 1), "v6 tracked for block");

@@ -122,15 +122,20 @@ static int bad_v6(const unsigned char *a) {
     return 0;
 }
 
-/* A resolver on the LAN, a VPN, the carrier's NAT or this machine: RFC 1918,
- * 169.254/16, 100.64/10 (CGNAT, also Tailscale), 127/8; IPv6 ULA fc00::/7,
- * link-local fe80::/10, ::1. Such a resolver answers local names (router
- * pages, NAS, printers, intranet) with LAN addresses. */
+/* A resolver on the LAN, a VPN or this machine: RFC 1918, 169.254/16, 127/8;
+ * IPv6 ULA fc00::/7, link-local fe80::/10, ::1. Such a resolver answers local
+ * names (router pages, NAS, printers, intranet) with LAN addresses. CGNAT
+ * 100.64/10 is deliberately not local: there it is usually the carrier's own
+ * (censoring) resolver.
+ * Residual risk: a home router forwards its ISP's answers, so a censor that
+ * answered with an RFC 1918 / 169.254 address would now be accepted unless
+ * that address is on the block list (built-in, --dns-block-ip, learned per
+ * network by the app). Turkish block pages are public addresses. */
 static int resolver_is_local(const uint32_t ip[4], int v6) {
     unsigned char a[16];
     memcpy(a, ip, v6 ? 16 : 4);
     if (!v6)
-        return lan_v4(a) || a[0] == 127 || (a[0] == 100 && (a[1] & 0xC0) == 64);
+        return lan_v4(a) || a[0] == 127;
     if ((a[0] & 0xFE) == 0xFC) return 1;                          /* fc00::/7 */
     if (a[0] == 0xFE && (a[1] & 0xC0) == 0x80) return 1;          /* fe80::/10 */
     {
