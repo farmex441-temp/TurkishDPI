@@ -45,17 +45,20 @@ Bu sürüm yeni özellik getirmez; 2.0.1'deki hataları ve zayıf noktaları gid
 
 ### Test
 
-Bu tabloyu yayından önce yayıncı doldurur.
+13 birim testi x64 ve x86'da geçti. Aşağıdakiler 14 Kasım 2026'da geliştiricinin kendi bilgisayarında (Windows 11, Türk Telekom hattı, Ethernet) yönetici olarak, bu sürümün yerel derlemeleriyle yapıldı; yayın exe'sini GitHub derler.
 
-| Test | x64 | x86 |
-|---|---|---|
-| Birim testleri (13) | | |
-| `--selftest` (taramalar, ödeme koruması) | | |
-| Engelli sitelerin açılması | | |
-| Büyük ilk paket (ağ kartında segmentasyon yükü açık) | | |
-| Yerel adlar (modem sayfası) | | |
-| 2.0.1'den **Güncelle →** | | |
-| Arayüz (ekran okuyucu, klavye) | | |
+| Test | Sonuç |
+|---|---|
+| Kendi kendine test, x64 | Geçti: engelli 3 sitenin 3'ü açıldı (ortalama 164 ms), ödeme siteleri dokunulmadan geçti, motorun eklediği gecikme −1 ms |
+| Kendi kendine test, x86 | Geçti: 3/3 (ortalama 109 ms), ödeme siteleri dokunulmadan geçti, gecikme farkı +2 ms |
+| Tarayıcıyla engelli siteler (Chromium 156; discord.com, roblox.com, wattpad.com, wikipedia.org, github.com) | Beşi de açıldı |
+| İkinci açılış | Çalışan pencere öne geldi (tepsiden ve küçültülmüşken); `--tray` ile ikinci açılış sessiz kaldı |
+| Duraklatma + ayar | Duraklatılmışken ödeme koruması değiştirildi: durum duraklatılmış kaldı, yeni ayar sonraki açılışta uygulandı |
+| Çıkış | Pencere hemen gizlendi, program kapandı |
+| Eksik sürücü dosyası | Tek deneme yapıldı, başka profil denenmedi, `WinDivert64.sys` adı geçen metin gösterildi, öğrenilmiş veriler değişmedi |
+| Tek tıkla güncelleme | 1.9.9 etiketli bir derleme yaklaşık 2 saniyede yayımlanmış v2.0.1'e güncellendi; exe yayındakiyle birebir aynıydı |
+
+Büyük ilk paket düzeltmesi bu bilgisayarda gerçek hatta denenemedi: tarayıcı testinde motora gelen en büyük ilk paket 1412 bayttı, yani tek pakette sığmayan bir paket görülmedi. Bu yol birim testleriyle ve bağımsız bir doğrulamayla sınandı.
 
 ### Bilinen sınırlar
 
@@ -65,4 +68,5 @@ Bu tabloyu yayından önce yayıncı doldurur.
 - Dosyalar kod imzalı değildir. Güncelleme denetimleri bozuk ya da yolda değiştirilmiş indirmeyi yakalar; GitHub hesabının kendisinin ele geçirilmesine karşı koruma sağlamaz.
 - ARM işlemcili Windows desteklenmez (WinDivert'in ARM64 sürücüsü yoktur). Windows hizmeti olarak değil, oturum açılışında görev olarak çalışır.
 - WinDivert sürücüsü bazı antivirüslerde "WinDivert/RiskTool" olarak işaretlenir; bu, WinDivert kullanan her araçta görülen bir yanlış alarmdır.
+- Windows 7/8.1, IPv6 ve diğer operatörler bu sürümde denenmedi.
 - 2.0.0'dan gelenler güncelleme düğmesine sahip değildir; 2.0.2'yi elle indirin.
