@@ -852,8 +852,10 @@ static HANDLE open_update_dir(const wchar_t *running_exe, wchar_t *real, DWORD c
     if (!GetFullPathNameW(running_exe, MAX_PATH, dir, NULL) || !(slash = wcsrchr(dir, L'\\')))
         return INVALID_HANDLE_VALUE;
     *slash = 0;
+    /* no delete sharing: while we hold it the folder cannot be renamed (nor
+     * can any folder above it), so paths built from real stay in it */
     h = CreateFileW(dir, FILE_LIST_DIRECTORY | FILE_TRAVERSE | FILE_READ_ATTRIBUTES | SYNCHRONIZE,
-                    FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, NULL, OPEN_EXISTING,
+                    FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, OPEN_EXISTING,
                     FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT, NULL);
     if (h == INVALID_HANDLE_VALUE) return h;
     if (!GetFileInformationByHandle(h, &fi) || !(fi.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) ||
@@ -875,16 +877,20 @@ typedef struct { union { LONG Status; PVOID Pointer; } u; ULONG_PTR Information;
 typedef LONG (NTAPI *nt_set_info_t)(HANDLE, upd_iosb_t *, PVOID, ULONG, int);
 #define UPD_FILE_RENAME_INFORMATION 10
 
-static int rename_in(HANDLE f, HANDLE dirh, const wchar_t *name, int replace) {
+/* Returns the NTSTATUS (>= 0 success; STATUS_ACCESS_DENIED when f lacks
+ * DELETE access, STATUS_OBJECT_NAME_COLLISION when the name is taken and
+ * replace is 0). */
+static LONG rename_in_st(HANDLE f, HANDLE dirh, const wchar_t *name, int replace) {
     union { FILE_RENAME_INFO ri; BYTE b[sizeof(FILE_RENAME_INFO) + MAX_PATH * sizeof(wchar_t)]; } u;
     static nt_set_info_t set_info;
     upd_iosb_t io;
     size_t n = wcslen(name);
-    if (n == 0 || n >= MAX_PATH || wcschr(name, L'\\') || wcschr(name, L'/') || wcschr(name, L':')) return 0;
+    if (n == 0 || n >= MAX_PATH || wcschr(name, L'\\') || wcschr(name, L'/') || wcschr(name, L':'))
+        return (LONG)0xC0000033L;   /* STATUS_OBJECT_NAME_INVALID */
     if (!set_info) {
         HMODULE nt = GetModuleHandleW(L"ntdll.dll");
         set_info = nt ? (nt_set_info_t)(void *)GetProcAddress(nt, "NtSetInformationFile") : NULL;
-        if (!set_info) return 0;
+        if (!set_info) return (LONG)0xC0000002L;   /* STATUS_NOT_IMPLEMENTED */
     }
     ZeroMemory(&u, sizeof(u));
     u.ri.ReplaceIfExists = replace ? TRUE : FALSE;
@@ -892,7 +898,11 @@ static int rename_in(HANDLE f, HANDLE dirh, const wchar_t *name, int replace) {
     u.ri.FileNameLength = (DWORD)(n * sizeof(wchar_t));
     memcpy(u.ri.FileName, name, n * sizeof(wchar_t));
     return set_info(f, &io, &u.ri, (ULONG)(sizeof(FILE_RENAME_INFO) + n * sizeof(wchar_t)),
-                    UPD_FILE_RENAME_INFORMATION) >= 0;
+                    UPD_FILE_RENAME_INFORMATION);
+}
+
+static int rename_in(HANDLE f, HANDLE dirh, const wchar_t *name, int replace) {
+    return rename_in_st(f, dirh, name, replace) >= 0;
 }
 
 /* 1 if the open file holds exactly data[0..len) (read from the start). */
@@ -982,83 +992,132 @@ static int same_file(const BY_HANDLE_FILE_INFORMATION *a, const BY_HANDLE_FILE_I
            a->nFileIndexLow == b->nFileIndexLow;
 }
 
-/* Re-opens the running exe like lock_self_exe (read, no write/delete
- * sharing) and checks it is the same file as before. */
-static HANDLE relock_self(const wchar_t *running_exe, const BY_HANDLE_FILE_INFORMATION *was) {
-    BY_HANDLE_FILE_INFORMATION fi;
-    HANDLE h = CreateFileW(running_exe, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, 0, NULL);
-    if (h == INVALID_HANDLE_VALUE) return h;
-    if (!GetFileInformationByHandle(h, &fi) || !same_file(&fi, was)) {
-        CloseHandle(h);
-        return INVALID_HANDLE_VALUE;
+/* Opens the running exe by path for the move: read + delete access, sharing
+ * only reads (nobody else may write, rename or delete it while we hold it),
+ * no link followed, and it must be the file we had locked. A scanner may
+ * hold the file for a moment, so a few short retries. */
+static HANDLE open_original(const wchar_t *path, const BY_HANDLE_FILE_INFORMATION *was) {
+    for (int i = 0; i < 20; i++) {
+        BY_HANDLE_FILE_INFORMATION fi;
+        HANDLE h = CreateFileW(path, GENERIC_READ | DELETE | SYNCHRONIZE | FILE_READ_ATTRIBUTES, FILE_SHARE_READ,
+                               NULL, OPEN_EXISTING, FILE_FLAG_OPEN_REPARSE_POINT, NULL);
+        if (h != INVALID_HANDLE_VALUE) {
+            if (GetFileInformationByHandle(h, &fi) && same_file(&fi, was)) return h;
+            CloseHandle(h);
+            return INVALID_HANDLE_VALUE;          /* another file under that name */
+        }
+        if (GetLastError() != ERROR_SHARING_VIOLATION) return INVALID_HANDLE_VALUE;
+        Sleep(50);
     }
-    return h;
+    return INVALID_HANDLE_VALUE;
 }
 
-int sys_update_install(const wchar_t *tag_w, void **self_exe_p, const wchar_t *running_exe,
-                       void **lock_out, const char **why) {
-    HANDLE *self_exe = (HANDLE *)self_exe_p;
-    char tag[32], path[256], asset[96];
-    unsigned char *sums = NULL, *zip = NULL, *data[UPD_NITEMS];
-    size_t sums_len = 0, zip_len = 0, dlen[UPD_NITEMS];
-    unsigned char want[32], got[32];
-    wchar_t real[MAX_PATH * 2], base[MAX_PATH], tmp[MAX_PATH], old[MAX_PATH], cur[MAX_PATH];
-    wchar_t wname[64], fp[MAX_PATH * 2];
+/* Re-opens the running exe like lock_self_exe (read, no write/delete
+ * sharing) and checks it is the same file as before; a few short retries. */
+static HANDLE relock_self(const wchar_t *running_exe, const BY_HANDLE_FILE_INFORMATION *was) {
+    for (int i = 0; i < 20; i++) {
+        BY_HANDLE_FILE_INFORMATION fi;
+        HANDLE h = CreateFileW(running_exe, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, 0, NULL);
+        if (h != INVALID_HANDLE_VALUE) {
+            if (GetFileInformationByHandle(h, &fi) && same_file(&fi, was)) return h;
+            CloseHandle(h);
+            return INVALID_HANDLE_VALUE;
+        }
+        if (GetLastError() != ERROR_SHARING_VIOLATION) return INVALID_HANDLE_VALUE;
+        Sleep(50);
+    }
+    return INVALID_HANDLE_VALUE;
+}
+
+/* Renames the open file f to a free "<base>.<number>.old" in dirh (the name
+ * sys_update_cleanup removes at the next start). Returns the NTSTATUS of the
+ * last attempt (>= 0 on success). */
+static LONG rename_aside(HANDLE f, HANDLE dirh, const wchar_t *base) {
+    LONG st = (LONG)0xC0000033L;   /* STATUS_OBJECT_NAME_INVALID */
+    DWORD t = GetTickCount();
+    for (DWORD k = 0; k < 8; k++) {
+        wchar_t name[MAX_PATH];
+        if (!wfmt(name, MAX_PATH, L"%ls.%lu.old", base, (unsigned long)(t + k))) return st;
+        st = rename_in_st(f, dirh, name, 0);
+        if (st >= 0 || st != (LONG)0xC0000035L) return st;   /* only a name collision is worth another try */
+    }
+    return st;
+}
+
+/*
+ * Puts the original exe (open handle ho) back under its name, whatever sits
+ * there now: a plain file that nobody holds open is replaced by the rename
+ * itself; anything else (a file held open with delete sharing, a link, a
+ * directory) is opened without following links, checked to be in the
+ * folder, and renamed aside first. Fails only when the name cannot be freed
+ * (held open without delete sharing, or a directory with open files).
+ */
+static int put_back(HANDLE ho, HANDLE dirh, const wchar_t *real, const wchar_t *base) {
+    wchar_t path[MAX_PATH], fp[MAX_PATH * 2];
+    if (!path_join(path, MAX_PATH, real, base)) return 0;
+    for (int attempt = 0; attempt < 4; attempt++) {
+        HANDLE h;
+        int moved = 0;
+        if (rename_in(ho, dirh, base, 1)) return 1;
+        h = open_entry(path, DELETE | FILE_READ_ATTRIBUTES);
+        if (h == INVALID_HANDLE_VALUE) {
+            DWORD e = GetLastError();
+            if (e == ERROR_FILE_NOT_FOUND || e == ERROR_PATH_NOT_FOUND) continue;   /* gone meanwhile */
+            return 0;
+        }
+        /* exactly real\base: the entry itself, in this folder */
+        if (final_path(h, fp, MAX_PATH * 2) && !_wcsicmp(fp, path)) moved = rename_aside(h, dirh, base) >= 0;
+        CloseHandle(h);
+        if (!moved) return 0;
+    }
+    return 0;
+}
+
+#ifdef UPD_TEST
+/* tests/update_install_test.c: plays the other process at these points */
+enum { UPD_STEP_UNLOCKED = 1, UPD_STEP_MOVED_ASIDE, UPD_STEP_NEW_IN_PLACE };
+void upd_test_hook(int step, const wchar_t *real, const wchar_t *base);
+#define UPD_HOOK(step) upd_test_hook((step), real, base)
+#else
+#define UPD_HOOK(step) ((void)0)
+#endif
+
+/*
+ * (b) of the update: installs the checked package files (data/dlen as in
+ * UPD_ITEMS, data[0] = the exe) into the folder the running exe is in.
+ * self_exe: the running exe's lock (read, no write/delete sharing; it may
+ * also carry DELETE access, then it is used for the move directly).
+ *
+ * Invariant: from the moment the running exe is moved aside until the end,
+ * a handle to it (ho, sharing only reads) stays open, so it cannot be
+ * changed, replaced or held by anyone else, and every failure puts it back
+ * under its name - replacing or moving away whatever sits there - and keeps
+ * ho as the new lock. Every exit leaves either the old exe or the verified
+ * new exe (locked in *lock_out) under the exe's name, no temp file, and no
+ * handle of ours open besides that lock. Texts are only replaced after the
+ * exe step succeeded, so a failed update never mixes versions.
+ * Returns as sys_update_install.
+ */
+static int upd_install_files(HANDLE *self_exe, const wchar_t *running_exe, unsigned char *const data[],
+                             const size_t dlen[], HANDLE *lock_out, const char **why) {
+    static char why_buf[160];
+    wchar_t real[MAX_PATH * 2], base[MAX_PATH], tmp[MAX_PATH], cur[MAX_PATH], wname[64], fp[MAX_PATH * 2];
     const wchar_t *slash;
-    BY_HANDLE_FILE_INFORMATION self_fi, fi;
-    HANDLE dirh = INVALID_HANDLE_VALUE, hn = INVALID_HANDLE_VALUE, ho = INVALID_HANDLE_VALUE, lock;
-    int rc = 0, r;
+    BY_HANDLE_FILE_INFORMATION self_fi, new_fi, fi;
+    HANDLE dirh, hn = INVALID_HANDLE_VALUE, ho = INVALID_HANDLE_VALUE, lock;
+    LONG st;
+    int rc = 0;
 
     *lock_out = INVALID_HANDLE_VALUE;
     *why = "";
-    memset(data, 0, sizeof(data));
-    memset(dlen, 0, sizeof(dlen));
-    if (!WideCharToMultiByte(CP_UTF8, 0, tag_w, -1, tag, sizeof(tag), NULL, NULL) || !upd_tag_ok(tag)) {
-        *why = "bad tag";
-        return 0;
-    }
-    snprintf(asset, sizeof(asset), "TurkishDPI-%s-" UPD_ARCH ".zip", tag);
+    base[0] = 0;
 
-    /* 1. checksums, then the package, checked against them */
-    snprintf(path, sizeof(path), TURKISHDPI_REPO_PATH_A "/releases/download/%s/SHA256SUMS.txt", tag);
-    if ((r = http_get(path, 64 * 1024, 30 * 1000, &sums, &sums_len)) != HG_OK) {
-        *why = r == HG_TIMEOUT ? "download SHA256SUMS.txt: took longer than 30 s"
-             : r == HG_TOO_BIG ? "download SHA256SUMS.txt: too large" : "download SHA256SUMS.txt";
-        goto out;
-    }
-    if (!upd_sums_find((const char *)sums, sums_len, asset, want)) { *why = "zip not in SHA256SUMS.txt"; goto out; }
-    snprintf(path, sizeof(path), TURKISHDPI_REPO_PATH_A "/releases/download/%s/%s", tag, asset);
-    if ((r = http_get(path, 64u * 1024 * 1024, 3 * 60 * 1000, &zip, &zip_len)) != HG_OK) {
-        *why = r == HG_TIMEOUT ? "download zip: took longer than 3 minutes"
-             : r == HG_TOO_BIG ? "download zip: too large" : "download zip";
-        goto out;
-    }
-    if (!sha256_mem(zip, zip_len, got) || memcmp(want, got, 32) != 0) { *why = "zip SHA-256 mismatch"; goto out; }
-
-    /* 2. the files we take from it */
-    for (size_t i = 0; i < UPD_NITEMS; i++) {
-        int r = upd_zip_extract(zip, zip_len, UPD_ITEMS[i].name, &data[i], &dlen[i]);
-        if (r < 0) { *why = "broken zip"; goto out; }
-        if (r == 0 && UPD_ITEMS[i].kind == 0) { *why = "no exe in zip"; goto out; }
-    }
-    if (upd_pe_machine(data[0], dlen[0]) != UPD_MACHINE) { *why = "exe for another CPU"; goto out; }
-    /* the exe itself must be the tagged version and newer than this one: a
-     * release built from an un-bumped version.h would otherwise update every
-     * user in a loop, and an older exe under a newer tag would be a downgrade */
-    {
-        uint64_t tag_ver = 0, exe_ver = upd_pe_file_version(data[0], dlen[0]);
-        if (!upd_tag_parse(tag, &tag_ver) || (exe_ver & ~0xFFFFull) != tag_ver) {
-            *why = "exe version differs from the tag";
-            goto out;
-        }
-        if (tag_ver <= own_version()) { *why = "release is not newer than this version"; goto out; }
-    }
-
-    /* 3. where we run from: the folder, and the exe's real (long) name in it
-     * taken from its locked handle - the start path may use 8.3 names */
+    /* 1. where we run from: the folder (held so it cannot be renamed), and the
+     * exe's real (long) name in it taken from its locked handle - the start
+     * path may use 8.3 names */
     if ((dirh = open_update_dir(running_exe, real, MAX_PATH * 2)) == INVALID_HANDLE_VALUE) {
         *why = "open folder";
-        goto out;
+        return 0;
     }
     if (!final_path(*self_exe, fp, MAX_PATH * 2) || !path_within(fp, real, 0) ||
         !(slash = wcsrchr(fp, L'\\')) || slash != fp + wcslen(real) || wcslen(slash + 1) + 24 >= MAX_PATH) {
@@ -1066,9 +1125,13 @@ int sys_update_install(const wchar_t *tag_w, void **self_exe_p, const wchar_t *r
         goto out;
     }
     wcscpy(base, slash + 1);
-    if (!path_join(cur, MAX_PATH, real, base)) { *why = "exe path"; goto out; }
+    if (!path_join(cur, MAX_PATH, real, base) || !wfmt(tmp, MAX_PATH, L"%ls.upd-new", base)) {
+        *why = "exe path";
+        goto out;
+    }
 
-    /* 4. WinDivert must stay as it is: the running build pins these files */
+    /* 2. WinDivert must stay as it is: the running build pins these files.
+     * Every one the folder has must be in the zip with the same bytes. */
     for (size_t i = 0; i < UPD_NITEMS; i++) {
         wchar_t p[MAX_PATH];
         DWORD attr;
@@ -1087,67 +1150,170 @@ int sys_update_install(const wchar_t *tag_w, void **self_exe_p, const wchar_t *r
         }
     }
 
-    /* 5. texts (licences, read-me): best effort */
+    /* 3. the new exe, written under a temporary name (no sharing) */
+    if ((hn = write_new(real, tmp, data[0], dlen[0])) == INVALID_HANDLE_VALUE ||
+        !GetFileInformationByHandle(hn, &new_fi)) {
+        *why = "write exe";
+        goto out;
+    }
+    if (!GetFileInformationByHandle(*self_exe, &self_fi)) { *why = "self info"; goto out; }
+
+    /* 4. the running exe moved aside; ho stays open until the end */
+    st = rename_aside(*self_exe, dirh, base);
+    if (st >= 0) {
+        ho = *self_exe;                     /* the lock had DELETE access: no gap at all */
+        *self_exe = INVALID_HANDLE_VALUE;
+    } else if (st == (LONG)0xC0000022L) {   /* STATUS_ACCESS_DENIED: a read-only lock */
+        /* it denies delete sharing, so it must go before a DELETE handle can
+         * be opened; the gap is closed again by open_original, which shares
+         * only reads */
+        CloseHandle(*self_exe);
+        *self_exe = INVALID_HANDLE_VALUE;
+        UPD_HOOK(UPD_STEP_UNLOCKED);
+        ho = open_original(cur, &self_fi);
+        if (ho == INVALID_HANDLE_VALUE) {
+            *why = "running exe busy or not found in its folder";
+            *self_exe = relock_self(running_exe, &self_fi);
+            if (*self_exe == INVALID_HANDLE_VALUE) {
+                *why = "running exe busy or replaced; it could not be locked again";
+                rc = -2;
+            }
+            goto out;
+        }
+        if (rename_aside(ho, dirh, base) < 0) {
+            *why = "move running exe aside";
+            *self_exe = ho;                 /* reads shared only: a valid lock */
+            ho = INVALID_HANDLE_VALUE;
+            goto out;
+        }
+    } else {
+        *why = "move running exe aside";    /* nothing moved, *self_exe untouched */
+        goto out;
+    }
+    UPD_HOOK(UPD_STEP_MOVED_ASIDE);
+
+    /* 5. the new exe under the exe's name */
+    if (!rename_in(hn, dirh, base, 0)) { *why = "move new exe in place"; goto restore; }
+    CloseHandle(hn);                        /* write access must go before the lock below */
+    hn = INVALID_HANDLE_VALUE;
+    UPD_HOOK(UPD_STEP_NEW_IN_PLACE);
+
+    /* 6. the file that will be started: our file (same ID), locked against
+     * changes, one link, no reparse point, at the exe's path, same bytes */
+    lock = CreateFileW(cur, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, FILE_FLAG_OPEN_REPARSE_POINT, NULL);
+    if (lock == INVALID_HANDLE_VALUE || !GetFileInformationByHandle(lock, &fi) || !same_file(&fi, &new_fi) ||
+        fi.nNumberOfLinks != 1 || (fi.dwFileAttributes & (FILE_ATTRIBUTE_REPARSE_POINT | FILE_ATTRIBUTE_DIRECTORY)) ||
+        !final_path(lock, fp, MAX_PATH * 2) || _wcsicmp(fp, cur) != 0 || !handle_equals(lock, data[0], dlen[0])) {
+        if (lock != INVALID_HANDLE_VALUE) CloseHandle(lock);
+        *why = "new exe changed or held open after writing";
+        goto restore;
+    }
+    CloseHandle(ho);                        /* the old exe stays as <name>.<n>.old (cleanup) */
+    ho = INVALID_HANDLE_VALUE;
+    *lock_out = lock;
+    rc = 1;
+
+    /* 7. texts (licences, read-me), only now: best effort */
     for (size_t i = 0; i < UPD_NITEMS; i++) {
         if (UPD_ITEMS[i].kind != 2 || !data[i]) continue;
         MultiByteToWideChar(CP_UTF8, 0, UPD_ITEMS[i].name, -1, wname, 64);
         replace_file(dirh, real, wname, data[i], dlen[i]);
     }
-
-    /* 6. the exe: new file ready, running one moved aside, new one in place */
-    if (!wfmt(tmp, MAX_PATH, L"%ls.upd-new", base) || !wfmt(old, MAX_PATH, L"%ls.%lu.old", base, GetTickCount())) {
-        *why = "exe path";
-        goto out;
-    }
-    if ((hn = write_new(real, tmp, data[0], dlen[0])) == INVALID_HANDLE_VALUE) { *why = "write exe"; goto out; }
-    if (!GetFileInformationByHandle(*self_exe, &self_fi)) { *why = "self info"; goto out; }
-    CloseHandle(*self_exe);       /* it denies delete sharing, which the rename needs */
-    *self_exe = INVALID_HANDLE_VALUE;
-    ho = CreateFileW(cur, DELETE | SYNCHRONIZE | FILE_READ_ATTRIBUTES,
-                     FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, NULL, OPEN_EXISTING,
-                     FILE_FLAG_OPEN_REPARSE_POINT, NULL);
-    if (ho == INVALID_HANDLE_VALUE || !GetFileInformationByHandle(ho, &fi) || !same_file(&fi, &self_fi)) {
-        *why = "running exe not found in its folder";
-        goto relock;
-    }
-    if (!rename_in(ho, dirh, old, 0)) { *why = "move running exe aside"; goto relock; }
-    if (!rename_in(hn, dirh, base, 0)) {
-        rename_in(ho, dirh, base, 0);   /* put the running one back */
-        *why = "move new exe in place";
-        goto relock;
-    }
-    CloseHandle(hn);
-    hn = INVALID_HANDLE_VALUE;
-    CloseHandle(ho);
-    ho = INVALID_HANDLE_VALUE;
-
-    /* 7. the file that will be started: locked against changes, verified */
-    lock = CreateFileW(cur, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, FILE_FLAG_OPEN_REPARSE_POINT, NULL);
-    if (lock == INVALID_HANDLE_VALUE || !GetFileInformationByHandle(lock, &fi) || fi.nNumberOfLinks != 1 ||
-        (fi.dwFileAttributes & (FILE_ATTRIBUTE_REPARSE_POINT | FILE_ATTRIBUTE_DIRECTORY)) ||
-        !final_path(lock, fp, MAX_PATH * 2) || _wcsicmp(fp, cur) != 0 || !handle_equals(lock, data[0], dlen[0])) {
-        if (lock != INVALID_HANDLE_VALUE) CloseHandle(lock);
-        *why = "new exe changed after writing";
-        rc = -2;    /* the running exe is already moved aside */
-        goto out;
-    }
-    *lock_out = lock;
-    rc = 1;
     goto out;
 
-relock:
-    /* our own DELETE handle on the running exe would make the re-lock
-     * (which denies delete sharing) fail */
-    if (ho != INVALID_HANDLE_VALUE) { CloseHandle(ho); ho = INVALID_HANDLE_VALUE; }
-    *self_exe = relock_self(running_exe, &self_fi);
-    if (*self_exe == INVALID_HANDLE_VALUE) rc = -2;
+restore:
+    /* our new file goes (by its handle, wherever it is named now) and the
+     * original comes back under its name; ho then is the lock again */
+    if (hn != INVALID_HANDLE_VALUE) { discard(hn); hn = INVALID_HANDLE_VALUE; }
+    if (put_back(ho, dirh, real, base)) {
+        *self_exe = ho;
+        ho = INVALID_HANDLE_VALUE;
+    } else {
+        snprintf(why_buf, sizeof(why_buf), "%s; the running exe could not be put back", *why);
+        *why = why_buf;
+        rc = -2;
+    }
 out:
     if (hn != INVALID_HANDLE_VALUE) discard(hn);
     if (ho != INVALID_HANDLE_VALUE) CloseHandle(ho);
-    if (dirh != INVALID_HANDLE_VALUE) CloseHandle(dirh);
-    for (size_t i = 0; i < UPD_NITEMS; i++) free(data[i]);
+    CloseHandle(dirh);
+    return rc;
+}
+
+/*
+ * (a) of the update: downloads SHA256SUMS.txt and the package, checks the
+ * package's SHA-256 against it, extracts the UPD_ITEMS (data[i] malloc'ed or
+ * NULL when absent; caller frees) and checks the exe: this CPU, file version
+ * == the tag and newer than the running build. 1 ok, 0 failed (why).
+ */
+static int upd_fetch(const char *tag, unsigned char *data[], size_t dlen[], const char **why) {
+    char path[256], asset[96];
+    unsigned char *sums = NULL, *zip = NULL, want[32], got[32];
+    size_t sums_len = 0, zip_len = 0;
+    uint64_t tag_ver = 0, exe_ver;
+    int ok = 0, r;
+
+    if (!upd_tag_parse(tag, &tag_ver)) { *why = "bad tag"; return 0; }
+    snprintf(asset, sizeof(asset), "TurkishDPI-%s-" UPD_ARCH ".zip", tag);
+
+    /* checksums, then the package, checked against them */
+    snprintf(path, sizeof(path), TURKISHDPI_REPO_PATH_A "/releases/download/%s/SHA256SUMS.txt", tag);
+    if ((r = http_get(path, 64 * 1024, 30 * 1000, &sums, &sums_len)) != HG_OK) {
+        *why = r == HG_TIMEOUT ? "download SHA256SUMS.txt: took longer than 30 s"
+             : r == HG_TOO_BIG ? "download SHA256SUMS.txt: too large" : "download SHA256SUMS.txt";
+        goto out;
+    }
+    if (!upd_sums_find((const char *)sums, sums_len, asset, want)) { *why = "zip not in SHA256SUMS.txt"; goto out; }
+    snprintf(path, sizeof(path), TURKISHDPI_REPO_PATH_A "/releases/download/%s/%s", tag, asset);
+    if ((r = http_get(path, 64u * 1024 * 1024, 3 * 60 * 1000, &zip, &zip_len)) != HG_OK) {
+        *why = r == HG_TIMEOUT ? "download zip: took longer than 3 minutes"
+             : r == HG_TOO_BIG ? "download zip: too large" : "download zip";
+        goto out;
+    }
+    if (!sha256_mem(zip, zip_len, got) || memcmp(want, got, 32) != 0) { *why = "zip SHA-256 mismatch"; goto out; }
+
+    /* the files we take from it */
+    for (size_t i = 0; i < UPD_NITEMS; i++) {
+        int e = upd_zip_extract(zip, zip_len, UPD_ITEMS[i].name, &data[i], &dlen[i]);
+        if (e < 0) { *why = "broken zip"; goto out; }
+        if (e == 0 && UPD_ITEMS[i].kind == 0) { *why = "no exe in zip"; goto out; }
+    }
+    if (upd_pe_machine(data[0], dlen[0]) != UPD_MACHINE) { *why = "exe for another CPU"; goto out; }
+    /* the exe itself must be the tagged version and newer than this one: a
+     * release built from an un-bumped version.h would otherwise update every
+     * user in a loop, and an older exe under a newer tag would be a downgrade
+     * (the build number is not compared) */
+    exe_ver = upd_pe_file_version(data[0], dlen[0]);
+    if ((exe_ver & ~0xFFFFull) != tag_ver) { *why = "exe version differs from the tag"; goto out; }
+    if (tag_ver <= own_version()) { *why = "release is not newer than this version"; goto out; }
+    ok = 1;
+out:
     free(zip);
     free(sums);
+    return ok;
+}
+
+int sys_update_install(const wchar_t *tag_w, void **self_exe_p, const wchar_t *running_exe,
+                       void **lock_out, const char **why) {
+    char tag[32];
+    unsigned char *data[UPD_NITEMS];
+    size_t dlen[UPD_NITEMS];
+    HANDLE lock = INVALID_HANDLE_VALUE;
+    int rc = 0;
+
+    *lock_out = INVALID_HANDLE_VALUE;
+    *why = "";
+    memset(data, 0, sizeof(data));
+    memset(dlen, 0, sizeof(dlen));
+    if (!WideCharToMultiByte(CP_UTF8, 0, tag_w, -1, tag, sizeof(tag), NULL, NULL) || !upd_tag_ok(tag)) {
+        *why = "bad tag";
+        return 0;
+    }
+    if (upd_fetch(tag, data, dlen, why)) {
+        rc = upd_install_files((HANDLE *)self_exe_p, running_exe, data, dlen, &lock, why);
+        *lock_out = lock;
+    }
+    for (size_t i = 0; i < UPD_NITEMS; i++) free(data[i]);
     return rc;
 }
 
