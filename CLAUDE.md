@@ -502,10 +502,48 @@ BENIOKU.txt a UTF-8 BOM (done in the Package step; the repo files stay LF).
   download deadlines, own redirect handling, specific failure reasons, WinDivert
   files must match, texts replaced after the exe, exact leftover cleanup),
   build/CI (smaller exe, draft-then-publish release, tag guard, smoke job,
-  one list of unit tests) and these docs. Verification so far: unit tests on
-  x64/x86 and under ASan pass (13 tests); elevated tests (selftest x64/x86,
-  scans, updater against a real release, UI e2e): PENDING - the organizer
-  fills them in.
+  one list of unit tests) and these docs.
+  Verification: unit tests on x64/x86 and under ASan pass (13 tests).
+  Elevated, 2026-11-14, developer's machine (Windows 11, Türk Telekom line,
+  Ethernet), local llvm-mingw builds of the merged branch (the release exe is
+  built by CI):
+  - `--selftest` x64: PASS, blocked targets 3/3, average 164 ms, payment
+    pass-through excluded=3, latency with/without engine -1 ms. x86: PASS, 3/3,
+    109 ms, excluded=3, +2 ms.
+  - Engine alone (preset 0) with Chromium 156 opening discord.com, roblox.com,
+    wattpad.com, wikipedia.org, github.com: all opened; 109 ClientHellos seen;
+    the largest first-segment payload was 1412 bytes (STATS maxpay). So no
+    segment larger than one packet reached the engine: the large-segment path
+    was NOT exercised on the real line; it is covered by unit tests and an
+    independent 700,000-case invariant check only.
+  - App: paused, then payment protection switched on -> "settings changed while
+    paused: applied on resume", stayed paused, next start used the new setting;
+    a second start brought the running window forward (from the tray and from
+    minimized); a `--tray` second start stayed silent; exit hid the window first
+    ("exit: window hidden, stopping"); a copy without WinDivert64.sys made one
+    engine start, logged "driver error 2: stopping, no preset is tried or
+    recorded", showed the text naming WinDivert64.sys and left the learned
+    stats in the ini unchanged.
+  - One-click update: a build of this branch labelled 1.9.9 updated itself to
+    the published v2.0.1 in about 2 s through the new download code (manual
+    redirect, version check): exe byte-identical to the release exe, licence and
+    read-me texts installed, the moved-aside exe removed by the next start.
+  - Reviews: every package was reviewed by a second engineer-agent; the engine's
+    output for packets up to 1500 bytes was compared byte for byte with the
+    released engine in 376,236 cases (no difference except the intended cut for
+    ClientHellos without a usable name); the PE version reader agreed with
+    Windows on 7,603 real binaries; the new download code fetched the real
+    release files with a matching SHA-256.
+  - NOT verified on a real system: double-click on pause/resume (code review
+    only), the site-check interruption paths, unknown driver error codes, update
+    failure/recovery paths (covered without elevation by tests/upd_swap_test.c),
+    the download deadline on a throttled line, IPv6, other ISPs, Windows 7/8.1,
+    and the release exe built by CI (GNU ld/msvcrt): the CI "smoke" job runs it
+    for the first time.
+  - Known issue, not fixed: starting a copy that lacks the driver file while
+    "Windows açılışında başlat" is on removes the logon task (`autostart_migrate`
+    -> `sys_install_copy` fails -> task deleted by design), although the task
+    already pointed at an intact Program Files copy.
 - Size and memory of the released v2.0.1 (measured 2026-11-14, idle): exe
   2.16 MB, x64 zip about 0.57 MB; app process 16 MB working set / 7 MB private,
   engine process 3 MB / 2 MB (README quotes these; do not quote older figures).
