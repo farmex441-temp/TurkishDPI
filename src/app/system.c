@@ -16,6 +16,7 @@
 #include <aclapi.h>
 #include <sddl.h>
 #include <shlobj.h>
+#include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -230,6 +231,30 @@ int sys_set_default_owner(void) {
     return ok;
 }
 
+/*
+ * Bounded wide formatting that fails unless the whole result fits with its
+ * terminator. _snwprintf/_vsnwprintf (msvcrt and ucrt) return count without
+ * terminating when the output is exactly count characters, and -1 when it is
+ * longer; a C99-style implementation returns the full length. "n >= 0 &&
+ * n < cap" is right for all three, so a name is never silently cut short.
+ */
+static int wfmt(wchar_t *out, size_t cap, const wchar_t *fmt, ...) {
+    va_list ap;
+    int n;
+    if (!cap) return 0;
+    va_start(ap, fmt);
+    n = _vsnwprintf(out, cap, fmt, ap);
+    va_end(ap);
+    out[cap - 1] = 0;
+    if (n < 0 || (size_t)n >= cap) { out[0] = 0; return 0; }
+    return 1;
+}
+
+/* dir\name into out[cap]; 0 (and an empty out) when it does not fit. */
+static int path_join(wchar_t *out, size_t cap, const wchar_t *dir, const wchar_t *name) {
+    return wfmt(out, cap, L"%ls\\%ls", dir, name);
+}
+
 /* Real path of an open handle ("\\?\" prefix removed). */
 static int final_path(HANDLE h, wchar_t *out, DWORD cap) {
     DWORD n = GetFinalPathNameByHandleW(h, out, cap, FILE_NAME_NORMALIZED | VOLUME_NAME_DOS);
@@ -267,13 +292,18 @@ static int delete_object(const wchar_t *path, const wchar_t *root, int allow_equ
     }
     if (final_path(h, real, MAX_PATH * 2) && path_within(real, root, allow_equal)) {
         FILE_BASIC_INFO bi;
+        int cleared = 0;
         if (GetFileInformationByHandleEx(h, FileBasicInfo, &bi, sizeof(bi)) &&
             (bi.FileAttributes & FILE_ATTRIBUTE_READONLY)) {
             bi.FileAttributes &= ~(DWORD)FILE_ATTRIBUTE_READONLY;
-            SetFileInformationByHandle(h, FileBasicInfo, &bi, sizeof(bi));
+            cleared = SetFileInformationByHandle(h, FileBasicInfo, &bi, sizeof(bi)) != 0;
         }
         di.DeleteFile = TRUE;
         ok = SetFileInformationByHandle(h, FileDispositionInfo, &di, sizeof(di)) != 0;
+        if (!ok && cleared) {   /* not deleted after all: leave the file as it was */
+            bi.FileAttributes |= FILE_ATTRIBUTE_READONLY;
+            SetFileInformationByHandle(h, FileBasicInfo, &bi, sizeof(bi));
+        }
     }
     CloseHandle(h);
     return ok;
@@ -290,14 +320,12 @@ static int delete_tree_in(const wchar_t *dir, const wchar_t *root, int delay_ok)
     WIN32_FIND_DATAW fd;
     HANDLE f;
     int ok = 1, pending = 0;
-    if (_snwprintf(pat, MAX_PATH - 1, L"%ls\\*", dir) < 0) return 0;
-    pat[MAX_PATH - 1] = 0;
+    if (!path_join(pat, MAX_PATH, dir, L"*")) return 0;
     f = FindFirstFileW(pat, &fd);
     if (f != INVALID_HANDLE_VALUE) {
         do {
             if (!wcscmp(fd.cFileName, L".") || !wcscmp(fd.cFileName, L"..")) continue;
-            if (_snwprintf(path, MAX_PATH - 1, L"%ls\\%ls", dir, fd.cFileName) < 0) { ok = 0; continue; }
-            path[MAX_PATH - 1] = 0;
+            if (!path_join(path, MAX_PATH, dir, fd.cFileName)) { ok = 0; continue; }
             if (fd.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) {
                 ok &= delete_object(path, root, 0);         /* the link, never its target */
             } else if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
@@ -307,9 +335,8 @@ static int delete_tree_in(const wchar_t *dir, const wchar_t *root, int delay_ok)
                 if (!delay_ok) { ok = 0; continue; }
                 /* in use: rename, then delete the renamed file at reboot (a
                  * reinstall under the original name survives the reboot) */
-                _snwprintf(aside, MAX_PATH - 1, L"%ls.%lu.del", path, GetTickCount());
-                aside[MAX_PATH - 1] = 0;
-                if (MoveFileExW(path, aside, 0) && MoveFileExW(aside, NULL, MOVEFILE_DELAY_UNTIL_REBOOT))
+                if (wfmt(aside, MAX_PATH, L"%ls.%lu.del", path, GetTickCount()) &&
+                    MoveFileExW(path, aside, 0) && MoveFileExW(aside, NULL, MOVEFILE_DELAY_UNTIL_REBOOT))
                     pending = 1;
                 else
                     ok = 0;
@@ -404,10 +431,9 @@ int sys_secure_dir(const wchar_t *dir, int users_read) {
     if (!handle_owner_trusted(h)) {
         wchar_t aside[MAX_PATH];
         CloseHandle(h);
-        _snwprintf(aside, MAX_PATH - 1, L"%ls.untrusted-%lu", dir, GetTickCount());
-        aside[MAX_PATH - 1] = 0;
         /* fails while the other process holds it open without delete sharing */
-        if (!MoveFileExW(dir, aside, 0)) return 0;
+        if (!wfmt(aside, MAX_PATH, L"%ls.untrusted-%lu", dir, GetTickCount()) || !MoveFileExW(dir, aside, 0))
+            return 0;
         if (!CreateDirectoryW(dir, NULL)) return 0;
         if (!open_dir_checked(dir, &h, NULL)) return 0;
         if (!handle_owner_trusted(h)) { CloseHandle(h); return 0; }
@@ -433,15 +459,13 @@ int sys_secure_dir(const wchar_t *dir, int users_read) {
         PACL empty = NULL;
         BYTE acl_buf[64];
         if (InitializeAcl((PACL)acl_buf, sizeof(acl_buf), ACL_REVISION)) empty = (PACL)acl_buf;
-        _snwprintf(pat, MAX_PATH - 1, L"%ls\\*", root);
-        pat[MAX_PATH - 1] = 0;
+        if (!path_join(pat, MAX_PATH, root, L"*")) return 0;
         f = FindFirstFileW(pat, &fd);
         if (f != INVALID_HANDLE_VALUE) {
             do {
                 int t;
                 if (!wcscmp(fd.cFileName, L".") || !wcscmp(fd.cFileName, L"..")) continue;
-                _snwprintf(path, MAX_PATH - 1, L"%ls\\%ls", root, fd.cFileName);
-                path[MAX_PATH - 1] = 0;
+                if (!path_join(path, MAX_PATH, root, fd.cFileName)) { ok = 0; continue; }
                 if (fd.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) {
                     if (!delete_object(path, root, 0)) ok = 0;
                     continue;
@@ -480,8 +504,7 @@ int sys_install_dir(wchar_t *out, size_t cap) {
     wchar_t *pf = NULL;
     int ok = 0;
     if (SUCCEEDED(SHGetKnownFolderPath(&FOLDERID_ProgramFiles, 0, NULL, &pf))) {
-        ok = _snwprintf(out, cap, L"%ls\\TurkishDPI", pf) > 0;
-        out[cap - 1] = 0;
+        ok = path_join(out, cap, pf, L"TurkishDPI");
         CoTaskMemFree(pf);
     }
     return ok;
@@ -514,8 +537,7 @@ static int copy_from_handle(HANDLE src, const wchar_t *dst) {
     int ok = 1;
     zero.QuadPart = 0;
     if (!SetFilePointerEx(src, zero, NULL, FILE_BEGIN)) return 0;
-    _snwprintf(tmp, MAX_PATH, L"%ls.new", dst);
-    tmp[MAX_PATH - 1] = 0;
+    if (!wfmt(tmp, MAX_PATH, L"%ls.new", dst)) return 0;
     out = CreateFileW(tmp, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
     if (out == INVALID_HANDLE_VALUE) return 0;
     while (ok) {
@@ -611,8 +633,7 @@ int sys_install_copy(HANDLE self_exe, const wchar_t *running_exe, wchar_t *insta
     if (!GetFullPathNameW(running_exe, MAX_PATH, src_dir, NULL)) return 0;
     if (!(slash = wcsrchr(src_dir, L'\\'))) return 0;
     *slash = 0;
-    if (_snwprintf(installed_exe, cap, L"%ls\\TurkishDPI.exe", dst_dir) < 0) return 0;
-    installed_exe[cap - 1] = 0;
+    if (!path_join(installed_exe, cap, dst_dir, L"TurkishDPI.exe")) return 0;
     if (!_wcsicmp(src_dir, dst_dir)) return 1;        /* already running from there */
     if (!sys_secure_dir(dst_dir, 1)) return 0;         /* admin-owned, runnable by users */
     /* That copy may have been updated in place (one-click update while the
@@ -626,8 +647,8 @@ int sys_install_copy(HANDLE self_exe, const wchar_t *running_exe, wchar_t *insta
         BY_HANDLE_FILE_INFORMATION fi;
         /* only drivers whose hash is pinned in this build are ever installed */
         if (is_driver && !windivert_file_pinned(FILES[i].name)) continue;
-        _snwprintf(src, MAX_PATH, L"%ls\\%ls", src_dir, FILES[i].name);  src[MAX_PATH - 1] = 0;
-        _snwprintf(dst, MAX_PATH, L"%ls\\%ls", dst_dir, FILES[i].name);  dst[MAX_PATH - 1] = 0;
+        if (!path_join(src, MAX_PATH, src_dir, FILES[i].name) || !path_join(dst, MAX_PATH, dst_dir, FILES[i].name))
+            return 0;
         h = CreateFileW(src, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING,
                         FILE_FLAG_OPEN_REPARSE_POINT, NULL);
         if (h == INVALID_HANDLE_VALUE) {
@@ -653,8 +674,7 @@ int sys_install_copy(HANDLE self_exe, const wchar_t *running_exe, wchar_t *insta
         if (!ok) return 0;
     }
     /* the exe last: a task only ever points at a complete set of files */
-    _snwprintf(dst, MAX_PATH, L"%ls\\TurkishDPI.exe", dst_dir);  dst[MAX_PATH - 1] = 0;
-    return have_driver && install_one(self_exe, dst);
+    return have_driver && path_join(dst, MAX_PATH, dst_dir, L"TurkishDPI.exe") && install_one(self_exe, dst);
 }
 
 /* Deletes one of our own (admin-only) folders: only an admin-owned folder,
@@ -873,8 +893,7 @@ static int file_equals(const wchar_t *real, const wchar_t *name, const unsigned 
     BY_HANDLE_FILE_INFORMATION fi;
     HANDLE h;
     int same;
-    if (_snwprintf(path, MAX_PATH - 1, L"%ls\\%ls", real, name) < 0) return 0;
-    path[MAX_PATH - 1] = 0;
+    if (!path_join(path, MAX_PATH, real, name)) return 0;
     h = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, FILE_FLAG_OPEN_REPARSE_POINT, NULL);
     if (h == INVALID_HANDLE_VALUE) return 0;
     same = GetFileInformationByHandle(h, &fi) && !(fi.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) &&
@@ -897,8 +916,7 @@ static HANDLE write_new(const wchar_t *real, const wchar_t *name, const unsigned
     wchar_t path[MAX_PATH], fp[MAX_PATH * 2];
     size_t pos = 0;
     HANDLE h;
-    if (_snwprintf(path, MAX_PATH - 1, L"%ls\\%ls", real, name) < 0) return INVALID_HANDLE_VALUE;
-    path[MAX_PATH - 1] = 0;
+    if (!path_join(path, MAX_PATH, real, name)) return INVALID_HANDLE_VALUE;
     if (!delete_object(path, real, 0)) return INVALID_HANDLE_VALUE;
     h = CreateFileW(path, GENERIC_READ | GENERIC_WRITE | DELETE, 0, NULL, CREATE_NEW,
                     FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OPEN_REPARSE_POINT, NULL);
@@ -919,8 +937,7 @@ static int replace_file(HANDLE dirh, const wchar_t *real, const wchar_t *name,
     wchar_t tmp[MAX_PATH];
     HANDLE h;
     if (file_equals(real, name, data, len)) return 1;
-    if (_snwprintf(tmp, MAX_PATH - 1, L"%ls.upd-new", name) < 0) return 0;
-    tmp[MAX_PATH - 1] = 0;
+    if (!wfmt(tmp, MAX_PATH, L"%ls.upd-new", name)) return 0;
     if ((h = write_new(real, tmp, data, len)) == INVALID_HANDLE_VALUE) return 0;
     if (!rename_in(h, dirh, name, 1)) { discard(h); return 0; }
     CloseHandle(h);
@@ -1016,16 +1033,14 @@ int sys_update_install(const wchar_t *tag_w, void **self_exe_p, const wchar_t *r
         goto out;
     }
     wcscpy(base, slash + 1);
-    if (_snwprintf(cur, MAX_PATH - 1, L"%ls\\%ls", real, base) < 0) { *why = "exe path"; goto out; }
-    cur[MAX_PATH - 1] = 0;
+    if (!path_join(cur, MAX_PATH, real, base)) { *why = "exe path"; goto out; }
 
     /* 4. WinDivert must stay as it is: the running build pins these files */
     for (size_t i = 0; i < UPD_NITEMS; i++) {
         wchar_t p[MAX_PATH];
         if (UPD_ITEMS[i].kind != 1 || !data[i]) continue;
         MultiByteToWideChar(CP_UTF8, 0, UPD_ITEMS[i].name, -1, wname, 64);
-        _snwprintf(p, MAX_PATH - 1, L"%ls\\%ls", real, wname);
-        p[MAX_PATH - 1] = 0;
+        if (!path_join(p, MAX_PATH, real, wname)) { *why = "exe path"; goto out; }
         if (GetFileAttributesW(p) != INVALID_FILE_ATTRIBUTES && !file_equals(real, wname, data[i], dlen[i])) {
             *why = "new WinDivert files (manual update needed)";
             rc = -1;
@@ -1041,10 +1056,10 @@ int sys_update_install(const wchar_t *tag_w, void **self_exe_p, const wchar_t *r
     }
 
     /* 6. the exe: new file ready, running one moved aside, new one in place */
-    _snwprintf(tmp, MAX_PATH - 1, L"%ls.upd-new", base);
-    tmp[MAX_PATH - 1] = 0;
-    _snwprintf(old, MAX_PATH - 1, L"%ls.%lu.old", base, GetTickCount());
-    old[MAX_PATH - 1] = 0;
+    if (!wfmt(tmp, MAX_PATH, L"%ls.upd-new", base) || !wfmt(old, MAX_PATH, L"%ls.%lu.old", base, GetTickCount())) {
+        *why = "exe path";
+        goto out;
+    }
     if ((hn = write_new(real, tmp, data[0], dlen[0])) == INVALID_HANDLE_VALUE) { *why = "write exe"; goto out; }
     if (!GetFileInformationByHandle(*self_exe, &self_fi)) { *why = "self info"; goto out; }
     CloseHandle(*self_exe);       /* it denies delete sharing, which the rename needs */
@@ -1111,8 +1126,7 @@ void sys_update_cleanup(const wchar_t *running_exe) {
     bl = wcslen(slash + 1);
     if ((dirh = open_update_dir(running_exe, real, MAX_PATH * 2)) == INVALID_HANDLE_VALUE) return;
     for (int k = 0; k < 2; k++) {
-        if (_snwprintf(pat, MAX_PATH - 1, L"%ls\\%ls", real, pats[k]) < 0) continue;
-        pat[MAX_PATH - 1] = 0;
+        if (!path_join(pat, MAX_PATH, real, pats[k])) continue;
         f = FindFirstFileW(pat, &fd);
         if (f == INVALID_HANDLE_VALUE) continue;
         do {
@@ -1125,8 +1139,7 @@ void sys_update_cleanup(const wchar_t *running_exe) {
             else          /* "<name>.upd-new" */
                 ours = n > 8 && !_wcsicmp(fd.cFileName + n - 8, L".upd-new");
             if (!ours) continue;
-            if (_snwprintf(path, MAX_PATH - 1, L"%ls\\%ls", real, fd.cFileName) < 0) continue;
-            path[MAX_PATH - 1] = 0;
+            if (!path_join(path, MAX_PATH, real, fd.cFileName)) continue;
             delete_object(path, real, 0);
         } while (FindNextFileW(f, &fd));
         FindClose(f);
