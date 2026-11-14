@@ -94,12 +94,19 @@ int dns_is_dns_packet(const char *data, unsigned int len, int outgoing) {
     return (m[2] & 0x80) != 0;                                     /* answer */
 }
 
-static int bad_v4(const unsigned char *a) {
+/* RFC 1918 and link-local IPv4: what a LAN or VPN resolver may answer with. */
+static int lan_v4(const unsigned char *a) {
+    return a[0] == 10 || (a[0] == 192 && a[1] == 168) ||
+           (a[0] == 172 && a[1] >= 16 && a[1] <= 31) || (a[0] == 169 && a[1] == 254);
+}
+
+/* An address no public answer should carry. lan_ok: the answer comes from a
+ * resolver that is itself local (see resolver_is_local), so LAN addresses are
+ * legitimate; 0/8, loopback, multicast and block-list addresses never are. */
+static int bad_v4(const unsigned char *a, int lan_ok) {
     uint32_t v;
-    if (a[0] == 0 || a[0] == 127 || a[0] == 10 || a[0] >= 224) return 1;
-    if (a[0] == 192 && a[1] == 168) return 1;
-    if (a[0] == 172 && a[1] >= 16 && a[1] <= 31) return 1;
-    if (a[0] == 169 && a[1] == 254) return 1;
+    if (a[0] == 0 || a[0] == 127 || a[0] >= 224) return 1;
+    if (!lan_ok && lan_v4(a)) return 1;
     memcpy(&v, a, 4);
     for (int i = 0; i < n_block_v4; i++)
         if (block_v4[i] == v) return 1;
@@ -115,7 +122,31 @@ static int bad_v6(const unsigned char *a) {
     return 0;
 }
 
-int dns_answer_is_forged(const char *data, unsigned int len) {
+/* A resolver on the LAN, a VPN or this machine: RFC 1918, 169.254/16, 127/8;
+ * IPv6 ULA fc00::/7, link-local fe80::/10, ::1. Such a resolver answers local
+ * names (router pages, NAS, printers, intranet) with LAN addresses. CGNAT
+ * 100.64/10 is deliberately not local: there it is usually the carrier's own
+ * (censoring) resolver.
+ * Residual risk: a home router forwards its ISP's answers, so a censor that
+ * answered with an RFC 1918 / 169.254 address would now be accepted unless
+ * that address is on the block list (built-in, --dns-block-ip, learned per
+ * network by the app). Turkish block pages are public addresses. */
+static int resolver_is_local(const uint32_t ip[4], int v6) {
+    unsigned char a[16];
+    memcpy(a, ip, v6 ? 16 : 4);
+    if (!v6)
+        return lan_v4(a) || a[0] == 127;
+    if ((a[0] & 0xFE) == 0xFC) return 1;                          /* fc00::/7 */
+    if (a[0] == 0xFE && (a[1] & 0xC0) == 0x80) return 1;          /* fe80::/10 */
+    {
+        static const unsigned char zero[15];
+        return !memcmp(a, zero, 15) && a[15] == 1;                /* ::1 */
+    }
+}
+
+/* lan_ok: see bad_v4. IPv6 ULA/link-local answers were never forged, so
+ * AAAA records need no such switch. */
+static int answer_forged(const char *data, unsigned int len, int lan_ok) {
     const unsigned char *m = (const unsigned char *)data;
     unsigned qd, an;
     int off = 12;
@@ -136,11 +167,15 @@ int dns_answer_is_forged(const char *data, unsigned int len) {
         rdlen = rd16(m + off + 8);
         off += 10;
         if ((unsigned)off + rdlen > len) return 1;
-        if (type == 1 && rdlen == 4 && bad_v4(m + off)) return 1;
+        if (type == 1 && rdlen == 4 && bad_v4(m + off, lan_ok)) return 1;
         if (type == 28 && rdlen == 16 && bad_v6(m + off)) return 1;
         off += (int)rdlen;
     }
     return 0;
+}
+
+int dns_answer_is_forged(const char *data, unsigned int len) {
+    return answer_forged(data, len, 0);
 }
 
 /* ---------- the question table ---------- */
@@ -235,11 +270,9 @@ int dns_handle_incoming_hybrid(const uint32_t local_ip[4], uint16_t local_port,
                                const char *data, unsigned int len,
                                conntrack_info_t *ci, uint8_t is_ipv6) {
     dns_entry *e;
-    int forged;
     if (!dns_is_dns_packet(data, len, 0)) return DNS_IN_NOT_OURS;
     e = find(local_ip, local_port, (uint16_t)rd16((const unsigned char *)data), is_ipv6, now_ms());
     if (!e) return DNS_IN_NOT_OURS;
-    forged = dns_answer_is_forged(data, len);
     if (from_clean(remote_ip, remote_port, is_ipv6)) {
         /* The clean resolver's first answer always reaches the program, also
          * NXDOMAIN or a private address: a name that does not exist (or a LAN
@@ -252,12 +285,18 @@ int dns_handle_incoming_hybrid(const uint32_t local_ip[4], uint16_t local_port,
         return DNS_IN_REWRITE;
     }
     if (remote_port == e->server_port && addr_eq(remote_ip, e->server_ip, is_ipv6)) {
-        if (e->answered || forged) return DNS_IN_DROP;   /* the clean answer follows */
+        /* The resolver the question went to. When that address (taken from
+         * the question, which this machine sent) is itself local - router,
+         * VPN, local filter - LAN addresses in its answer are legitimate:
+         * local names must keep resolving. Error codes, block-list addresses,
+         * 0/8, loopback and multicast stay forged for every resolver. */
+        if (e->answered || answer_forged(data, len, resolver_is_local(e->server_ip, e->is_ipv6)))
+            return DNS_IN_DROP;                           /* the clean answer follows */
         e->answered = 1;
         return DNS_IN_PASS;
     }
     /* someone else: never trusted, never ends the race */
-    return forged ? DNS_IN_DROP : DNS_IN_PASS_OTHER;
+    return dns_answer_is_forged(data, len) ? DNS_IN_DROP : DNS_IN_PASS_OTHER;
 }
 
 int dns_answer_matches(const uint32_t local_ip[4], uint16_t local_port,
