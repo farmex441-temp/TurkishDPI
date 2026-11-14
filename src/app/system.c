@@ -767,22 +767,36 @@ static int url_allowed(const wchar_t *url) {
 }
 
 /* GET https://github.com<path> (redirects followed, final host checked);
- * at most cap bytes into a malloc'ed buffer. */
-static int http_get(const char *path_a, size_t cap, unsigned char **out, size_t *len) {
+ * at most cap bytes into a malloc'ed buffer.
+ *
+ * total_ms bounds the whole download: it runs on the controller thread, and
+ * the per-operation WinHTTP timeouts alone let a throttled connection that
+ * sends a little every few seconds block the controller for hours. Each read
+ * waits at most the time that is left (and at most 30 s), and the deadline
+ * is checked after every step, so the overrun is at most one connect/send
+ * timeout. Returns HG_OK, HG_FAIL, HG_TIMEOUT or HG_TOO_BIG. */
+enum { HG_OK = 1, HG_FAIL = 0, HG_TIMEOUT = -1, HG_TOO_BIG = -2 };
+
+static int http_get(const char *path_a, size_t cap, DWORD total_ms, unsigned char **out, size_t *len) {
     wchar_t path[512], url[4096];
     DWORD status = 0, sz = sizeof(status), usz = sizeof(url);
     HINTERNET s, c = NULL, r = NULL;
     unsigned char *buf = NULL;
     size_t n = 0, have = 0;
-    int ok = 0;
+    const size_t limit = cap + 1;   /* room for the read that returns 0 after exactly cap bytes */
+    const ULONGLONG deadline = GetTickCount64() + total_ms;
+    int rc = HG_FAIL;
     *out = NULL;
     *len = 0;
-    if (!MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, path_a, -1, path, 512)) return 0;
+    if (!MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, path_a, -1, path, 512)) return HG_FAIL;
     s = WinHttpOpen(L"TurkishDPI/" TURKISHDPI_VERSION_W, WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
                     WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
-    if (!s) return 0;
+    if (!s) return HG_FAIL;
     sysdll_winhttp_tls(s);
-    WinHttpSetTimeouts(s, 10000, 15000, 30000, 30000);
+    {
+        int rt = total_ms < 30000 ? (int)total_ms : 30000;
+        WinHttpSetTimeouts(s, 10000, 15000, rt, rt);
+    }
     c = WinHttpConnect(s, L"github.com", INTERNET_DEFAULT_HTTPS_PORT, 0);
     if (c) r = WinHttpOpenRequest(c, L"GET", path, NULL, WINHTTP_NO_REFERER,
                                   WINHTTP_DEFAULT_ACCEPT_TYPES, WINHTTP_FLAG_SECURE);
@@ -791,31 +805,42 @@ static int http_get(const char *path_a, size_t cap, unsigned char **out, size_t 
         WinHttpQueryHeaders(r, WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
                             WINHTTP_HEADER_NAME_BY_INDEX, &status, &sz, WINHTTP_NO_HEADER_INDEX) &&
         status == 200 && WinHttpQueryOption(r, WINHTTP_OPTION_URL, url, &usz) && url_allowed(url)) {
-        ok = 1;
+        rc = HG_OK;
         for (;;) {
-            DWORD got = 0;
+            DWORD got = 0, left;
+            ULONGLONG now = GetTickCount64();
+            if (now >= deadline) { rc = HG_TIMEOUT; break; }
+            left = (DWORD)(deadline - now);
+            if (left > 30000) left = 30000;
+            WinHttpSetOption(r, WINHTTP_OPTION_RECEIVE_TIMEOUT, &left, sizeof(left));
             if (n == have) {
                 size_t nc = have ? have * 2 : 256 * 1024;
                 unsigned char *nb;
-                if (have >= cap) { ok = 0; break; }   /* larger than any real package */
-                if (nc > cap) nc = cap;
+                if (have >= limit) { rc = HG_TOO_BIG; break; }   /* larger than any real package */
+                if (nc > limit) nc = limit;
                 nb = (unsigned char *)realloc(buf, nc);
-                if (!nb) { ok = 0; break; }
+                if (!nb) { rc = HG_FAIL; break; }
                 buf = nb;
                 have = nc;
             }
-            if (!WinHttpReadData(r, buf + n, (DWORD)(have - n), &got)) { ok = 0; break; }
+            if (!WinHttpReadData(r, buf + n, (DWORD)(have - n), &got)) {
+                rc = GetTickCount64() >= deadline ? HG_TIMEOUT : HG_FAIL;
+                break;
+            }
             if (!got) break;
             n += got;
         }
+        if (rc == HG_OK && n > cap) rc = HG_TOO_BIG;
+    } else if (GetTickCount64() >= deadline) {
+        rc = HG_TIMEOUT;
     }
     if (r) WinHttpCloseHandle(r);
     if (c) WinHttpCloseHandle(c);
     WinHttpCloseHandle(s);
-    if (!ok) { free(buf); return 0; }
+    if (rc != HG_OK) { free(buf); return rc; }
     *out = buf;
     *len = n;
-    return 1;
+    return HG_OK;
 }
 
 /* The folder the exe runs from, opened without following a link; its real
@@ -982,7 +1007,7 @@ int sys_update_install(const wchar_t *tag_w, void **self_exe_p, const wchar_t *r
     const wchar_t *slash;
     BY_HANDLE_FILE_INFORMATION self_fi, fi;
     HANDLE dirh = INVALID_HANDLE_VALUE, hn = INVALID_HANDLE_VALUE, ho = INVALID_HANDLE_VALUE, lock;
-    int rc = 0;
+    int rc = 0, r;
 
     *lock_out = INVALID_HANDLE_VALUE;
     *why = "";
@@ -996,10 +1021,18 @@ int sys_update_install(const wchar_t *tag_w, void **self_exe_p, const wchar_t *r
 
     /* 1. checksums, then the package, checked against them */
     snprintf(path, sizeof(path), TURKISHDPI_REPO_PATH_A "/releases/download/%s/SHA256SUMS.txt", tag);
-    if (!http_get(path, 64 * 1024, &sums, &sums_len)) { *why = "download SHA256SUMS.txt"; goto out; }
+    if ((r = http_get(path, 64 * 1024, 30 * 1000, &sums, &sums_len)) != HG_OK) {
+        *why = r == HG_TIMEOUT ? "download SHA256SUMS.txt: took longer than 30 s"
+             : r == HG_TOO_BIG ? "download SHA256SUMS.txt: too large" : "download SHA256SUMS.txt";
+        goto out;
+    }
     if (!upd_sums_find((const char *)sums, sums_len, asset, want)) { *why = "zip not in SHA256SUMS.txt"; goto out; }
     snprintf(path, sizeof(path), TURKISHDPI_REPO_PATH_A "/releases/download/%s/%s", tag, asset);
-    if (!http_get(path, 64u * 1024 * 1024, &zip, &zip_len)) { *why = "download zip"; goto out; }
+    if ((r = http_get(path, 64u * 1024 * 1024, 3 * 60 * 1000, &zip, &zip_len)) != HG_OK) {
+        *why = r == HG_TIMEOUT ? "download zip: took longer than 3 minutes"
+             : r == HG_TOO_BIG ? "download zip: too large" : "download zip";
+        goto out;
+    }
     if (!sha256_mem(zip, zip_len, got) || memcmp(want, got, 32) != 0) { *why = "zip SHA-256 mismatch"; goto out; }
 
     /* 2. the files we take from it */
