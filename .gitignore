@@ -4,3 +4,12 @@ build/
 *.zip
 third_party/WinDivert/x64/
 third_party/WinDivert/x86/
+# WinDivert's signed driver and DLL must never be committed (they ship in the
+# release zip, built by CI from the checksum-pinned archive)
+*.dll
+*.sys
+# files of an extracted release zip lying in the repo root
+/BENIOKU.txt
+/WinDivert-LICENSE.txt
+.worktrees/
+.claude/worktrees/
