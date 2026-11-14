@@ -1071,10 +1071,16 @@ int sys_update_install(const wchar_t *tag_w, void **self_exe_p, const wchar_t *r
     /* 4. WinDivert must stay as it is: the running build pins these files */
     for (size_t i = 0; i < UPD_NITEMS; i++) {
         wchar_t p[MAX_PATH];
-        if (UPD_ITEMS[i].kind != 1 || !data[i]) continue;
+        DWORD attr;
+        if (UPD_ITEMS[i].kind != 1) continue;
         MultiByteToWideChar(CP_UTF8, 0, UPD_ITEMS[i].name, -1, wname, 64);
         if (!path_join(p, MAX_PATH, real, wname)) { *why = "exe path"; goto out; }
-        if (GetFileAttributesW(p) != INVALID_FILE_ATTRIBUTES && !file_equals(real, wname, data[i], dlen[i])) {
+        attr = GetFileAttributesW(p);
+        if (attr == INVALID_FILE_ATTRIBUTES &&
+            (GetLastError() == ERROR_FILE_NOT_FOUND || GetLastError() == ERROR_PATH_NOT_FOUND))
+            continue;   /* not used here: not installed either */
+        /* present (or not readable): the zip must hold exactly these bytes */
+        if (!data[i] || !file_equals(real, wname, data[i], dlen[i])) {
             *why = "new WinDivert files (manual update needed)";
             rc = -1;
             goto out;
