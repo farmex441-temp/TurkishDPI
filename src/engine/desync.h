@@ -10,7 +10,10 @@
  * gives exactly the packets the engine sent before 2.0.2 (as measured on real
  * lines). A larger one - handed over before segmentation offload - is sent in
  * pieces of at most TCPDPI_PIECE_MAX payload bytes, with a decoy of the first
- * TCPDPI_PIECE_MAX bytes (see tcpdpi.h).
+ * TCPDPI_PIECE_MAX bytes (see tcpdpi.h). Before 2.0.2 such packets were not
+ * passed untouched either: up to TCPDPI_SEG_MAX bytes they were desynced into
+ * pieces larger than a 1500-byte MTU (DF copied); only above that was the
+ * original sent unmodified.
  */
 #ifndef TURKISHDPI_DESYNC_H
 #define TURKISHDPI_DESYNC_H

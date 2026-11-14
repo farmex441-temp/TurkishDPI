@@ -46,7 +46,9 @@ uint16_t tcpdpi_bad_csum(uint16_t good) {
 
 /* Write IPv4 header checksum and TCP checksum into a complete IPv4+TCP segment
  * buffer `pkt` of length `len`. ihl = IPv4 header length in bytes. If bad != 0
- * the TCP checksum is inverted so the destination drops the segment. */
+ * the TCP checksum is inverted so the destination drops the segment
+ * (TurkishDPI: a correct 0x0000 becomes 0x5a5a instead, since its inverse
+ * 0xffff would be the same one's-complement value - tcpdpi_bad_csum). */
 static void fill_checksums4(uint8_t *pkt, int len, int ihl, int bad) {
   /* IPv4 header checksum. */
   pkt[10] = 0; pkt[11] = 0;
