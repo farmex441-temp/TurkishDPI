@@ -8,6 +8,10 @@
  * filter but dies before the server (low TTL, bad TCP checksum, the name
  * scrambled), then the real request cut so that no segment carries the whole
  * name. Resets the filter forges against such a connection are dropped.
+ * What is sent is composed by desync.c: a captured packet that fits one
+ * wire packet gives exactly what was measured on real lines; a larger one
+ * (WinDivert sees segments before NIC segmentation offload) is sent in pieces
+ * of at most TCPDPI_PIECE_MAX payload bytes.
  * Payment and bank connections are never touched (exclude.c); DNS goes to a
  * clean resolver as well (dns.c, the hybrid race).
  *
@@ -49,6 +53,8 @@
 #include "core/raw_desync.h"
 #include "dns.h"
 #include "exclude.h"
+#include "policy.h"
+#include "desync.h"
 #include "engine.h"
 #include "version.h"
 
@@ -70,17 +76,21 @@ static uint16_t ipid = 0x1000;              /* IP id of our crafted IPv4 segment
 static udp_flow_table flows;
 
 /* ---------- counters for the app ---------- */
-static struct { volatile LONG packets, https, http, excluded, dns; } stats;
+/* maxpay: the largest TCP payload of an outbound ClientHello segment seen
+ * (larger than one MSS means the stack hands segments over before NIC
+ * segmentation offload). It is appended at the END of the STATS line: the
+ * app's sscanf reads the first five fields and ignores what follows. */
+static struct { volatile LONG packets, https, http, excluded, dns, maxpay; } stats;
 
 static DWORD WINAPI stats_reporter(LPVOID unused) {
-    LONG last[5] = { -1, -1, -1, -1, -1 };
+    LONG last[6] = { -1, -1, -1, -1, -1, -1 };
     (void)unused;
     for (;;) {
-        LONG now[5] = { stats.packets, stats.https, stats.http, stats.excluded, stats.dns };
+        LONG now[6] = { stats.packets, stats.https, stats.http, stats.excluded, stats.dns, stats.maxpay };
         if (memcmp(now, last, sizeof(now))) {
             memcpy(last, now, sizeof(now));
-            printf("STATS packets=%ld https=%ld http=%ld excluded=%ld dns=%ld\n",
-                   now[0], now[1], now[2], now[3], now[4]);
+            printf("STATS packets=%ld https=%ld http=%ld excluded=%ld dns=%ld maxpay=%ld\n",
+                   now[0], now[1], now[2], now[3], now[4], now[5]);
             fflush(stdout);
         }
         Sleep(2000);
@@ -114,32 +124,34 @@ static void send_crafted(const uint8_t *seg, int len, const WINDIVERT_ADDRESS *b
     WinDivertSend(wd, seg, (UINT)len, NULL, &a);
 }
 
-/* The decoy's payload: the request with another (or a scrambled) name. */
-static int decoy_payload(uint8_t *out, int cap, const uint8_t *pay, int plen,
-                         const proto_info *pi, int iphl, int tcphl) {
-    int n = proto_decoy_rename(out, cap, pay, plen, pi->kind == PROTO_TLS, pi->host_off, pi->host_len,
-                               decoy_room(plen, iphl, tcphl));
-    if (n > 0) return n;
-    if (plen > cap) return 0;
-    memcpy(out, pay, (size_t)plen);
-    if (pi->host_off >= 0 && pi->host_off + pi->host_len <= plen) {
-        for (int i = pi->host_off; i < pi->host_off + pi->host_len; i++) out[i] ^= 0x5a;
-    } else {
-        for (int i = plen / 3; i < plen; i++) out[i] ^= 0x5a;
-    }
-    return plen;
+/* What is sent for one first request is composed by desync.c (pure, unit
+ * tested); the loop is single-threaded, so one output buffer serves. */
+static desync_cfg dcfg;
+static desync_out dout;
+
+static void send_out(const WINDIVERT_ADDRESS *addr, int v6) {
+    for (int i = 0; i < dout.n; i++) send_crafted(dout.pkt[i], dout.len[i], addr, v6);
 }
 
-/* Where the real request is cut: a fixed early byte (--split-pos: the
- * filter then sees a piece too short to classify, and a piece without a TLS
- * record header), or - by default - inside the site name (Shroudly). */
-static int cut_points(const uint8_t *pay, int plen, const proto_info *pi, int cuts[2]) {
-    if (split_pos > 0) {
-        if (plen < 2) return 0;
-        cuts[0] = split_pos < plen ? split_pos : plen - 1;
-        return 1;
-    }
-    return tcpdpi_split_points(pay, plen, pi->host_off, pi->host_len, cuts);
+/* A first request larger than one wire packet (segmentation offload) gets a
+ * plain log line - the first one and then each new maximum at least 25 %
+ * larger, at most LARGE_NOTES per run. Worded so that none of the app's
+ * protocol prefixes ("TurkishDPI engine", "Filter activated", "Error
+ * opening filter:", "STATS ") can match it. */
+#define LARGE_NOTES 6
+static void note_large(int plen, int v6, const desync_out *o, int excluded) {
+    static int notes, last;
+    if (plen <= last + last / 4 || notes >= LARGE_NOTES) return;
+    last = plen;
+    notes++;
+    if (excluded)
+        printf("Large first segment: %d bytes (IPv%d), left untouched (payment protection)\n", plen, v6 ? 6 : 4);
+    else if (o->n > 0 && o->replaced)
+        printf("Large first segment: %d bytes (IPv%d), sent as %d pieces%s\n", plen, v6 ? 6 : 4,
+               desync_real_count(o), o->n > desync_real_count(o) ? " after a decoy" : "");
+    else
+        printf("Large first segment: %d bytes (IPv%d), passed unchanged%s\n", plen, v6 ? 6 : 4,
+               o->n > 0 ? " after a decoy" : "");
 }
 
 /* ================= IPv4 (adapted from Shroudly raw_windows.c) ============= */
@@ -151,85 +163,24 @@ static int decoy_ttl4(uint32_t daddr) {
     return cfg.fake_ttl;
 }
 
-static void send_fake4(const uint8_t *pkt, int len, int ihl, int tcphl, int poff,
-                       const proto_info *pi, int ttl, const WINDIVERT_ADDRESS *addr) {
-    uint8_t pay[1600], out[1700];
-    int plen = len - poff, dlen, n;
-    if (plen <= 0 || plen > 1500) return;
-    dlen = decoy_payload(pay, (int)sizeof(pay), pkt + poff, plen, pi, ihl, tcphl);
-    if (dlen <= 0) return;
-    n = tcpdpi_build_segment4(out, sizeof(out), pkt, ihl, pkt + ihl, tcphl, ipid++,
-                              rd32be(pkt + ihl + 4), ttl > 0 ? ttl : cfg.fake_ttl, pay, dlen, 1);
-    if (n > 0) send_crafted(out, n, addr, 0);
-}
-
-static int send_cut4(const uint8_t *pkt, int ihl, int tcphl, int poff, int plen,
-                     const proto_info *pi, int disorder, const WINDIVERT_ADDRESS *addr) {
-    int cuts[2], nc = cut_points(pkt + poff, plen, pi, cuts);
-    tcpdpi_seg segs[3];
-    int ns = 0;
-    if (nc > 0 && tcpdpi_build_multisplit4(segs, &ns, pkt, ihl, pkt + ihl, tcphl, ipid,
-                                           rd32be(pkt + ihl + 4), pkt[8] ? pkt[8] : 64,
-                                           pkt + poff, plen, cuts, nc, disorder)) {
-        ipid = (uint16_t)(ipid + ns);
-        for (int i = 0; i < ns; i++) send_crafted(segs[i].data, segs[i].len, addr, 0);
-        return 1;
-    }
-    return 0;
+struct grow_ctx { uint32_t sa, da; uint16_t sp, dp; uint32_t at; };
+static int grow4(void *v) {
+    const struct grow_ctx *g = (const struct grow_ctx *)v;
+    return tcpdpi_xlate_begin(g->sa, g->da, g->sp, g->dp, g->at, TCPDPI_TLSREC_GROWTH, now_ms());
 }
 
 /* 1 when the original was replaced by what was sent. */
 static int desync4(const uint8_t *pkt, int len, int ihl, int tcphl, int poff,
                    const proto_info *pi, int decoy, const WINDIVERT_ADDRESS *addr) {
-    int plen = len - poff;
-    uint32_t daddr = rd32be(pkt + 16), seq = rd32be(pkt + ihl + 4);
-    int otl = pkt[8] ? pkt[8] : 64;
-    int faked = cfg.desync_mode == RAW_DESYNC_FAKEDSPLIT || cfg.desync_mode == RAW_DESYNC_FAKEDDISORDER;
-
-    if (cfg.tlsrec && pi->kind == PROTO_TLS && pi->host_off >= 1) {
-        int cuts[2], nc = tcpdpi_split_points(pkt + poff, plen, pi->host_off, pi->host_len, cuts);
-        int cut = nc >= 2 ? cuts[1] : (nc == 1 ? cuts[0] : 0);
-        tcpdpi_seg segs[2];
-        int ns = 0;
-        int ok = cut > 5 && tcpdpi_build_tlsrec_pair(segs, &ns, pkt, ihl, pkt + ihl, tcphl,
-                                                     ipid, seq, otl, pkt + poff, plen, cut);
-        if (ok && tcpdpi_xlate_begin(rd32be(pkt + 12), daddr, rd16be(pkt + ihl), rd16be(pkt + ihl + 2),
-                                     seq + (uint32_t)plen, TCPDPI_TLSREC_GROWTH, now_ms())) {
-            ipid = (uint16_t)(ipid + 2);
-            if (decoy) send_fake4(pkt, len, ihl, tcphl, poff, pi, decoy_ttl4(daddr), addr);
-            for (int i = 0; i < ns; i++) send_crafted(segs[i].data, segs[i].len, addr, 0);
-            return 1;
-        }
-    }
-    if (!decoy) {
-        if (cfg.split == RAW_SPLIT_OFF && !faked) return 0;
-        return send_cut4(pkt, ihl, tcphl, poff, plen, pi,
-                         cfg.split == RAW_SPLIT_DISORDER || cfg.desync_mode == RAW_DESYNC_FAKEDDISORDER, addr);
-    }
-    if (faked) {
-        int split = split_pos > 0 ? (split_pos < plen ? split_pos : plen - 1)
-                  : (pi->host_off > 0 && pi->host_off < plen) ? pi->host_off : (plen > 2 ? 2 : 1);
-        tcpdpi_seg segs[3];
-        int ns = 0;
-        if (tcpdpi_build_fakedsplit4(segs, &ns, pkt, ihl, pkt + ihl, tcphl, ipid, seq, otl,
-                                     pkt + poff, plen, split, decoy_ttl4(daddr), cfg.fake_pattern,
-                                     cfg.desync_mode == RAW_DESYNC_FAKEDDISORDER)) {
-            ipid = (uint16_t)(ipid + 3);
-            for (int i = 0; i < ns; i++) send_crafted(segs[i].data, segs[i].len, addr, 0);
-            return 1;
-        }
-        return 0;
-    }
-    send_fake4(pkt, len, ihl, tcphl, poff, pi, decoy_ttl4(daddr), addr);
-    if (cfg.seqovl > 0 && plen > 0) {
-        uint8_t out[1700];
-        int n = tcpdpi_build_seqovl4(out, sizeof(out), pkt, ihl, pkt + ihl, tcphl, ipid, seq, otl,
-                                     pkt + poff, plen, cfg.seqovl, cfg.seqovl_pattern);
-        if (n > 0) { ipid++; send_crafted(out, n, addr, 0); return 1; }
-    }
-    if (cfg.split != RAW_SPLIT_OFF)
-        return send_cut4(pkt, ihl, tcphl, poff, plen, pi, cfg.split == RAW_SPLIT_DISORDER, addr);
-    return 0;
+    struct grow_ctx g;
+    uint32_t daddr = rd32be(pkt + 16);
+    g.sa = rd32be(pkt + 12); g.da = daddr;
+    g.sp = rd16be(pkt + ihl); g.dp = rd16be(pkt + ihl + 2);
+    g.at = rd32be(pkt + ihl + 4) + (uint32_t)(len - poff);
+    desync_compose4(&dout, &dcfg, pkt, len, ihl, tcphl, pi, decoy, decoy ? decoy_ttl4(daddr) : cfg.fake_ttl,
+                    &ipid, grow4, &g);
+    send_out(addr, 0);
+    return dout.replaced;
 }
 
 static void send_udp_decoys4(const uint8_t *pkt, int ihl, int plen, const WINDIVERT_ADDRESS *addr) {
@@ -255,25 +206,10 @@ static void send_udp_decoys4(const uint8_t *pkt, int ihl, int plen, const WINDIV
 }
 
 /* ================= IPv6 (TurkishDPI) ================= */
-/* An IPv6 TCP segment like the captured one, with another sequence number,
- * hop limit and payload. Checksums computed by WinDivert; a decoy's TCP
- * checksum is then spoiled on purpose. Only packets without extension
- * headers come here (next header 6 at the fixed header). */
-static int build6(uint8_t *out, int cap, const uint8_t *pkt, int tcphl, uint32_t seq, int hop,
-                  const uint8_t *pay, int plen, int bad, const WINDIVERT_ADDRESS *addr) {
-    WINDIVERT_ADDRESS a = *addr;
-    int n = 40 + tcphl + plen;
-    if (plen < 0 || n > cap) return 0;
-    memcpy(out, pkt, (size_t)(40 + tcphl));
-    if (plen) memcpy(out + 40 + tcphl, pay, (size_t)plen);
-    out[4] = (uint8_t)((tcphl + plen) >> 8);
-    out[5] = (uint8_t)(tcphl + plen);
-    out[7] = (uint8_t)hop;
-    wr32be(out + 40 + 4, seq);
-    WinDivertHelperCalcChecksums(out, (UINT)n, &a, 0);
-    if (bad) out[40 + 16] ^= 0x5a;
-    return n;
-}
+/* IPv6 TCP segments like the captured one, with another sequence number,
+ * hop limit and payload, are built by tcpdpi_build_segment6/_piece6 (the TCP
+ * checksum computed there; a decoy's is spoiled on purpose). Only packets
+ * without extension headers come here (next header 6 at the fixed header). */
 
 /* The hop table is keyed by 32 bits: an IPv6 address goes in hashed. A
  * collision with another address only gives a decoy that one's distance. */
@@ -293,38 +229,9 @@ static int decoy_ttl6(const uint8_t daddr[16]) {
 
 static int desync6(const uint8_t *pkt, int len, int tcphl, const proto_info *pi, int decoy,
                    const WINDIVERT_ADDRESS *addr) {
-    const int poff = 40 + tcphl;
-    const uint8_t *pay = pkt + poff;
-    int plen = len - poff, hop = pkt[7] ? pkt[7] : 64;
-    uint32_t seq = rd32be(pkt + 40 + 4);
-    uint8_t out[1800];
-    int cuts[2], nc, n;
-    int disorder = cfg.split == RAW_SPLIT_DISORDER || cfg.desync_mode == RAW_DESYNC_FAKEDDISORDER;
-    int cut = cfg.split != RAW_SPLIT_OFF || cfg.desync_mode != RAW_DESYNC_FAKE;
-
-    if (plen <= 0 || plen > 1600) return 0;
-    if (decoy) {
-        uint8_t fake[1700];
-        int dlen = decoy_payload(fake, (int)sizeof(fake), pay, plen, pi, 40, tcphl);
-        if (dlen > 0 && (n = build6(out, (int)sizeof(out), pkt, tcphl, seq, decoy_ttl6(pkt + 24), fake, dlen, 1, addr)) > 0)
-            send_crafted(out, n, addr, 1);
-    }
-    if (!cut) return 0;
-    nc = cut_points(pay, plen, pi, cuts);
-    if (nc <= 0) return 0;
-    {
-        int from[3], to[3], ns = 0, start = 0;
-        for (int i = 0; i < nc; i++) { from[ns] = start; to[ns] = cuts[i]; start = cuts[i]; ns++; }
-        from[ns] = start; to[ns] = plen; ns++;
-        for (int k = 0; k < ns; k++) {
-            int i = disorder ? ns - 1 - k : k;
-            n = build6(out, (int)sizeof(out), pkt, tcphl, seq + (uint32_t)from[i], hop,
-                       pay + from[i], to[i] - from[i], 0, addr);
-            if (n <= 0) return k > 0;        /* nothing sent yet: the original goes on */
-            send_crafted(out, n, addr, 1);
-        }
-    }
-    return 1;
+    desync_compose6(&dout, &dcfg, pkt, len, tcphl, pi, decoy, decoy ? decoy_ttl6(pkt + 24) : cfg.fake_ttl);
+    send_out(addr, 1);
+    return dout.replaced;
 }
 
 /* ================= DNS ================= */
@@ -393,63 +300,41 @@ static int dns_inbound(uint8_t *pkt, UINT len, int v6, int l4, WINDIVERT_ADDRESS
 }
 
 /* ================= the filter ================= */
-static void build_filter(char *f, size_t cap, int alert_watch) {
-    char udp[1024] = "";
-    int o;
-    /* outbound web: the first request (TLS handshake records, HTTP), and the
-     * client's own TLS alerts (a decoy that upset the server); with the TLS
-     * record split, every IPv4 443 segment (their sequence numbers move) */
-    if (cfg.tlsrec)
-        o = snprintf(f, cap, "(outbound and !loopback and tcp and ("
-                     "(ip and tcp.DstPort == 443) or "
-                     "(tcp.DstPort == 443 and tcp.PayloadLength >= 6 and tcp.Payload[1] == 3 and "
-                     "(tcp.Payload[0] == 22 or tcp.Payload[0] == 21)) or "
-                     "(tcp.DstPort == 80 and tcp.PayloadLength > 0)))");
-    else
-        o = snprintf(f, cap, "(outbound and !loopback and tcp and ("
-                     "(tcp.DstPort == 443 and tcp.PayloadLength >= 6 and tcp.Payload[1] == 3 and "
-                     "(tcp.Payload[0] == 22 or tcp.Payload[0] == 21)) or "
-                     "(tcp.DstPort == 80 and tcp.PayloadLength > 0)))");
-    /* QUIC Initials (both families) and Discord voice (IPv4) */
-    if (cfg.quic_block && udp_windivert_clause(udp, sizeof(udp), 1, 0, UDP_PREFILTER_PAYLOAD) > 0)
-        o += snprintf(f + o, cap - o, " or (outbound and !loopback and udp and %s)", udp);
-    if (cfg.udp_fake && udp_windivert_clause(udp, sizeof(udp), 0, 1, UDP_PREFILTER_PAYLOAD) > 0)
-        o += snprintf(f + o, cap - o, " or (outbound and !loopback and ip and udp and %s)", udp);
-    /* DNS: the system's questions, and the answers to them */
-    if (dns4 || dns6 || exclude_enabled()) {
-        o += snprintf(f + o, cap - o, " or (outbound and !loopback and udp and udp.DstPort == 53)");
-        if (dns_hybrid_enabled() || (!dns4 && !dns6))
-            o += snprintf(f + o, cap - o, " or (inbound and !loopback and udp and udp.SrcPort == 53)");
-        if (dns4)
-            o += snprintf(f + o, cap - o, " or (inbound and !loopback and udp and ip.SrcAddr == %s and udp.SrcPort == %u)",
-                          dns4_text, (unsigned)ntohs(dns4_port));
-        if (dns6)
-            o += snprintf(f + o, cap - o, " or (inbound and !loopback and udp and ipv6.SrcAddr == %s and udp.SrcPort == %u)",
-                          dns6_text, (unsigned)ntohs(dns6_port));
-    }
-    /* inbound: forged resets, SYN-ACKs (hop distance), TLS alerts, and the
-     * acknowledgements of a connection whose record was split */
-    {
-        char sub[256] = "";
-        int so = 0;
-        if (cfg.tlsrec) so += snprintf(sub + so, sizeof(sub) - so, "(ip and tcp.SrcPort == 443)");
-        if (cfg.drop_rst) so += snprintf(sub + so, sizeof(sub) - so, "%stcp.Rst", so ? " or " : "");
-        if (cfg.autottl) so += snprintf(sub + so, sizeof(sub) - so, "%s(tcp.Syn and tcp.Ack)", so ? " or " : "");
-        if (alert_watch)
-            so += snprintf(sub + so, sizeof(sub) - so,
-                           "%s(tcp.SrcPort == 443 and tcp.PayloadLength >= 7 and tcp.Payload[0] == 21 and tcp.Payload[1] == 3)",
-                           so ? " or " : "");
-        if (sub[0])
-            snprintf(f + o, cap - o, " or (inbound and !loopback and tcp and (tcp.SrcPort == 443 or tcp.SrcPort == 80) and (%s))", sub);
-    }
+/* The filter text (policy_build_filter, unit tested); -1 when it does not
+ * fit the buffer - the engine then refuses to start. */
+static int build_filter(char *f, size_t cap, int alert_watch) {
+    policy_filter_opts o;
+    memset(&o, 0, sizeof(o));
+    o.tlsrec = cfg.tlsrec;
+    o.quic_block = cfg.quic_block;
+    o.udp_fake = cfg.udp_fake;
+    o.drop_rst = cfg.drop_rst;
+    o.autottl = cfg.autottl;
+    o.alert_watch = alert_watch;
+    o.dns4 = dns4;
+    o.dns6 = dns6;
+    o.dns_hybrid = dns_hybrid_enabled();
+    o.exclude = exclude_enabled();
+    o.dns4_addr = dns4_text;
+    o.dns6_addr = dns6_text;
+    o.dns4_port = ntohs(dns4_port);
+    o.dns6_port = ntohs(dns6_port);
+    return policy_build_filter(f, cap, &o);
 }
 
 /* ================= the loop ================= */
+/* Payment protection (policy_excluded): the name in the segment decides;
+ * the addresses learned for payment domains only when there is no name or
+ * the name is an ECH public name (cloudflare-ech.com). */
 static int excluded_conn(const uint8_t *pay, const proto_info *pi, const uint8_t *daddr, int v6) {
-    if (!exclude_enabled()) return 0;
-    if (exclude_check_ip(daddr, v6)) return 1;
-    return pi->host_off >= 0 && pi->host_len > 0 &&
-           exclude_check_hostname((const char *)pay + pi->host_off, (size_t)pi->host_len);
+    int named = pi->host_off >= 0 && pi->host_len > 0;
+    return policy_excluded(exclude_enabled(), named ? (const char *)pay + pi->host_off : NULL,
+                           named ? (size_t)pi->host_len : 0, daddr, v6,
+                           exclude_check_hostname, exclude_check_ip);
+}
+
+static void note_maxpay(const proto_info *pi, int plen) {
+    if (pi->kind == PROTO_TLS && plen > stats.maxpay) InterlockedExchange(&stats.maxpay, plen);
 }
 
 static void count_kind(const proto_info *pi) {
@@ -520,9 +405,11 @@ static int run_loop(void) {
                     proto_info pi;
                     if (dport == 443) rawscope_decoy_hurt_out(pkt + 24, 16, dport, sport, seq, pkt + poff, plen, now);
                     proto_inspect(pkt + poff, (size_t)plen, &pi);
+                    note_maxpay(&pi, plen);
                     if (pi.kind != PROTO_UNKNOWN && !rawscope_local6(pkt + 24)) {
                         if (excluded_conn(pkt + poff, &pi, pkt + 24, 1)) {
                             InterlockedIncrement(&stats.excluded);
+                            if (len > TCPDPI_WIRE_MAX && pi.kind == PROTO_TLS) note_large(plen, 1, &dout, 1);
                         } else {
                             int decoy = !no_decoy && !rawscope_nodecoy(pkt + 24, 16, now);
                             rawscope_touch(pkt + 24, 16, now);
@@ -531,6 +418,7 @@ static int run_loop(void) {
                                                     rawscope_tls_next_seq(seq, pkt + poff, plen), now);
                             count_kind(&pi);
                             handled = desync6(pkt, (int)len, tcphl, &pi, decoy, &addr);
+                            if (len > TCPDPI_WIRE_MAX && pi.kind == PROTO_TLS) note_large(plen, 1, &dout, 0);
                         }
                     }
                 }
@@ -626,9 +514,11 @@ static int run_loop(void) {
                     proto_info pi;
                     if (dport == 443) rawscope_decoy_hurt_out(pkt + 16, 4, dport, sport, seq, pkt + poff, plen, now);
                     proto_inspect(pkt + poff, (size_t)plen, &pi);
+                    note_maxpay(&pi, plen);
                     if (pi.kind != PROTO_UNKNOWN && !rawscope_local4(pkt + 16)) {
                         if (excluded_conn(pkt + poff, &pi, pkt + 16, 0)) {
                             InterlockedIncrement(&stats.excluded);
+                            if (len > TCPDPI_WIRE_MAX && pi.kind == PROTO_TLS) note_large(plen, 0, &dout, 1);
                         } else {
                             int decoy = !no_decoy && !rawscope_nodecoy(pkt + 16, 4, now);
                             rawscope_touch(pkt + 16, 4, now);
@@ -637,6 +527,7 @@ static int run_loop(void) {
                                                     rawscope_tls_next_seq(seq, pkt + poff, plen), now);
                             count_kind(&pi);
                             handled = desync4(pkt, (int)len, ihl, tcphl, poff, &pi, decoy, &addr);
+                            if (len > TCPDPI_WIRE_MAX && pi.kind == PROTO_TLS) note_large(plen, 0, &dout, 0);
                         }
                     }
                 }
@@ -678,9 +569,10 @@ static int parse_port(const char *s, uint16_t *out) {
 }
 
 int engine_main(int argc, char *argv[]) {
-    char filter[4096];
-    int payment = 1, dns_hybrid = 0, alert_watch;
+    char filter[POLICY_FILTER_CAP];
+    int payment = 1, dns_hybrid = 0, alert_watch, nxfiles = 0;
     const char *bad = NULL;
+    const char **xfiles = (const char **)calloc((size_t)(argc > 0 ? argc : 1), sizeof(*xfiles));
     WSADATA w;
 
     WSAStartup(MAKEWORD(2, 2), &w);
@@ -733,19 +625,40 @@ int engine_main(int argc, char *argv[]) {
         else if (!strcmp(a, "--dnsv6-port")) { NEED(); if (!parse_port(v, &dns6_port)) bad = a; }
         else if (!strcmp(a, "--dns-hybrid")) dns_hybrid = 1;
         else if (!strcmp(a, "--dns-block-ip")) { NEED(); if (!dns_add_block_ip(v)) bad = a; }
-        else if (!strcmp(a, "--exclude")) { NEED(); if (exclude_load_list(v) < 0) bad = a; }
+        else if (!strcmp(a, "--exclude")) { NEED(); if (xfiles) xfiles[nxfiles++] = v; else bad = a; }
         else if (!strcmp(a, "--no-payment-exclude")) payment = 0;
-        else if (!strcmp(a, "-h") || !strcmp(a, "--help")) { usage(); return 0; }
+        else if (!strcmp(a, "-h") || !strcmp(a, "--help")) { usage(); free(xfiles); return 0; }
         else bad = a;
 #undef NEED
     }
     if (bad) {
         printf("Unknown or invalid option: %s\n", bad);
         usage();
+        free(xfiles);
         return 2;
     }
     if (cfg.fake_repeats <= 0 || cfg.fake_repeats > 64) cfg.fake_repeats = 6;
+    /* the user's lists after the built-in one: until it is loaded, room is
+     * reserved for it; without payment protection it is never loaded and the
+     * user's lists may use the whole set */
     if (payment) exclude_load_builtin();
+    else exclude_skip_builtin();
+    for (int i = 0; i < nxfiles; i++) {
+        if (exclude_load_list(xfiles[i]) < 0) {
+            printf("Unknown or invalid option: --exclude %s\n", xfiles[i]);
+            usage();
+            free(xfiles);
+            return 2;
+        }
+    }
+    free(xfiles);
+    dcfg.split = cfg.split;
+    dcfg.desync_mode = cfg.desync_mode;
+    dcfg.split_pos = split_pos;
+    dcfg.seqovl = cfg.seqovl;
+    dcfg.seqovl_pattern = cfg.seqovl_pattern;
+    dcfg.fake_pattern = cfg.fake_pattern;
+    dcfg.tlsrec = cfg.tlsrec;
     if (dns_hybrid && (dns4 || dns6)) dns_set_hybrid(1);
     dns_set_clean(dns4_addr, dns4_port, dns6_addr, dns6_port);
     udp_flow_init(&flows);
@@ -767,7 +680,11 @@ int engine_main(int argc, char *argv[]) {
     /* A filter the driver refuses (87) is retried without the TLS-alert
      * watch; any other error is the driver's or the files' and is final. */
     for (alert_watch = 1; alert_watch >= 0; alert_watch--) {
-        build_filter(filter, sizeof(filter), alert_watch);
+        if (build_filter(filter, sizeof(filter), alert_watch) < 0) {
+            printf("Engine filter does not fit its %u-byte buffer: not started\n", (unsigned)sizeof(filter));
+            printf("Error opening filter: %lu\n", (unsigned long)ERROR_BUFFER_OVERFLOW);
+            return 1;
+        }
         wd = WinDivertOpen(filter, WINDIVERT_LAYER_NETWORK, 0, 0);
         if (wd != INVALID_HANDLE_VALUE || GetLastError() != ERROR_INVALID_PARAMETER) break;
     }
