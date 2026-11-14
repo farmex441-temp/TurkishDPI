@@ -4,6 +4,7 @@
 #include <stdarg.h>
 #include <stdio.h>
 #include <string.h>
+#include <ctype.h>
 #include "policy.h"
 #include "core/udpdpi.h"
 
@@ -79,12 +80,29 @@ int policy_build_filter(char *f, size_t cap, const policy_filter_opts *o) {
     return t.over ? -1 : (int)t.len;
 }
 
-int policy_excluded(int enabled, const char *name, size_t name_len, int ech, const void *daddr, int v6,
-                    policy_name_fn name_listed, policy_ip_fn ip_learned) {
-    if (!enabled) return 0;
-    if (name && name_len > 0) {
-        if (name_listed && name_listed(name, name_len)) return 1;
-        if (ech == 0) return 0;              /* the name is the site's own: it alone decides */
+/* ECH public ("outer") names: the visible server name of a connection that
+ * uses real Encrypted Client Hello. Cloudflare uses one for all its zones;
+ * it is the only widely deployed one. */
+static const char *const ech_public_names[] = { "cloudflare-ech.com" };
+
+int policy_ech_public_name(const char *name, size_t len) {
+    if (!name) return 0;
+    if (len > 0 && name[len - 1] == '.') len--;          /* a fully qualified "name." */
+    for (size_t i = 0; i < sizeof(ech_public_names) / sizeof(ech_public_names[0]); i++) {
+        const char *e = ech_public_names[i];
+        size_t k = 0;
+        if (strlen(e) != len) continue;
+        while (k < len && tolower((unsigned char)name[k]) == e[k]) k++;
+        if (k == len) return 1;
     }
+    return 0;
+}
+
+int policy_excluded(int enabled, const char *name, size_t name_len, const void *daddr, int v6,
+                    policy_name_fn name_listed, policy_ip_fn ip_learned) {
+    int named = name && name_len > 0;
+    if (!enabled) return 0;
+    if (named && name_listed && name_listed(name, name_len)) return 1;
+    if (named && !policy_ech_public_name(name, name_len)) return 0;   /* the site's own name decides */
     return ip_learned && daddr ? ip_learned(daddr, v6) != 0 : 0;
 }

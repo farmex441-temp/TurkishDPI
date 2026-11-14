@@ -323,14 +323,14 @@ static int build_filter(char *f, size_t cap, int alert_watch) {
 }
 
 /* ================= the loop ================= */
-/* Payment protection (policy_excluded): the name in the segment decides
- * unless the ClientHello carries (or may carry) Encrypted Client Hello; the
- * addresses learned for payment domains when there is no name or with ECH. */
+/* Payment protection (policy_excluded): the name in the segment decides;
+ * the addresses learned for payment domains only when there is no name or
+ * the name is an ECH public name (cloudflare-ech.com). */
 static int excluded_conn(const uint8_t *pay, const proto_info *pi, const uint8_t *daddr, int v6) {
     int named = pi->host_off >= 0 && pi->host_len > 0;
     return policy_excluded(exclude_enabled(), named ? (const char *)pay + pi->host_off : NULL,
-                           named ? (size_t)pi->host_len : 0, pi->kind == PROTO_TLS ? pi->ech : PROTO_ECH_NO,
-                           daddr, v6, exclude_check_hostname, exclude_check_ip);
+                           named ? (size_t)pi->host_len : 0, daddr, v6,
+                           exclude_check_hostname, exclude_check_ip);
 }
 
 static void note_maxpay(const proto_info *pi, int plen) {

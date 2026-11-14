@@ -114,66 +114,6 @@ static void test_large_hello_name_later(void) {
   CHECK(pi.kind == PROTO_TLS && pi.host_off == -1 && pi.host_len == 0 && pi.tls_record_total == p);
 }
 
-/* TurkishDPI: Encrypted Client Hello (extension 0xfe0d) is reported: seen,
- * not present (every extension seen), or unknown (the extensions run past the
- * segment before it). The name is found as before either way. */
-static int make_ch_ech(uint8_t *b, const char *host, int ech_where /* 0 none, 1 before SNI, 2 after a big ext */) {
-  int hl = (int)strlen(host), p = 0;
-  b[p++] = 0x16; b[p++] = 3; b[p++] = 1; p += 2;
-  int hs = p; b[p++] = 1; p += 3;
-  b[p++] = 3; b[p++] = 3; for (int i = 0; i < 32; i++) b[p++] = (uint8_t)i;
-  b[p++] = 0;
-  b[p++] = 0; b[p++] = 2; b[p++] = 0x13; b[p++] = 0x01;
-  b[p++] = 1; b[p++] = 0;
-  int ext = p; p += 2;
-  if (ech_where == 1) { b[p++] = 0xfe; b[p++] = 0x0d; b[p++] = 0; b[p++] = 8; memset(b + p, 0x11, 8); p += 8; }
-  b[p++] = 0; b[p++] = 0; b[p++] = 0; b[p++] = (uint8_t)(hl + 5); b[p++] = 0; b[p++] = (uint8_t)(hl + 3);
-  b[p++] = 0; b[p++] = 0; b[p++] = (uint8_t)hl; memcpy(b + p, host, (size_t)hl); p += hl;
-  b[p++] = 0x00; b[p++] = 0x33; b[p++] = 0x06; b[p++] = 0xa4; memset(b + p, 0x5c, 0x6a4); p += 0x6a4; /* key_share 1700 */
-  if (ech_where == 2) { b[p++] = 0xfe; b[p++] = 0x0d; b[p++] = 0; b[p++] = 8; memset(b + p, 0x11, 8); p += 8; }
-  b[ext] = (uint8_t)((p - ext - 2) >> 8); b[ext + 1] = (uint8_t)(p - ext - 2);
-  int hlen = p - hs - 4; b[hs + 1] = (uint8_t)(hlen >> 16); b[hs + 2] = (uint8_t)(hlen >> 8); b[hs + 3] = (uint8_t)hlen;
-  b[3] = (uint8_t)((p - 5) >> 8); b[4] = (uint8_t)(p - 5);
-  return p;
-}
-
-static void test_ech(void) {
-  static uint8_t b[2048];
-  proto_info pi;
-  const char *pub = "cloudflare-ech.com";
-  /* no ECH, whole hello: NO */
-  int n = make_ch_ech(b, pub, 0);
-  proto_inspect(b, (size_t)n, &pi);
-  CHECK(pi.kind == PROTO_TLS && pi.ech == PROTO_ECH_NO && strcmp(pi.host, pub) == 0);
-  /* ... truncated inside the key share: UNKNOWN, the name still found */
-  proto_inspect(b, 1460, &pi);
-  CHECK(pi.kind == PROTO_TLS && pi.ech == PROTO_ECH_UNKNOWN && strcmp(pi.host, pub) == 0);
-  /* ECH before the server name: YES, also truncated after it */
-  n = make_ch_ech(b, pub, 1);
-  proto_inspect(b, (size_t)n, &pi);
-  CHECK(pi.ech == PROTO_ECH_YES && strcmp(pi.host, pub) == 0);
-  proto_inspect(b, 1460, &pi);
-  CHECK(pi.ech == PROTO_ECH_YES && strcmp(pi.host, pub) == 0);
-  /* ... truncated before it: UNKNOWN */
-  proto_inspect(b, 58, &pi);
-  CHECK(pi.kind == PROTO_TLS && pi.ech == PROTO_ECH_UNKNOWN && pi.host_off == -1);
-  /* ECH last, after the big key share: YES whole, UNKNOWN in the first segment */
-  n = make_ch_ech(b, pub, 2);
-  proto_inspect(b, (size_t)n, &pi);
-  CHECK(pi.ech == PROTO_ECH_YES && strcmp(pi.host, pub) == 0);
-  proto_inspect(b, 1460, &pi);
-  CHECK(pi.ech == PROTO_ECH_UNKNOWN && strcmp(pi.host, pub) == 0);
-  /* every truncation: never reads past the buffer, never claims NO early */
-  for (int cut = 6; cut < n; cut++) {
-    proto_inspect(b, (size_t)cut, &pi);
-    CHECK(pi.ech != PROTO_ECH_NO);
-  }
-  /* HTTP: NO */
-  const char *req = "GET / HTTP/1.1\r\nHost: a.example\r\n\r\n";
-  proto_inspect((const uint8_t *)req, strlen(req), &pi);
-  CHECK(pi.kind == PROTO_HTTP && pi.ech == PROTO_ECH_NO);
-}
-
 /* A ClientHello as browsers send one: a 32-byte session id, a GREASE
  * extension and supported_versions before the server name, padding after. */
 static int make_ch2(uint8_t *b, const char *host) {
@@ -334,7 +274,6 @@ int main(void) {
   test_http_port_strip();
   test_truncated_tls();
   test_large_hello_name_later();
-  test_ech();
   test_decoy_names();
   if (fails == 0) { printf("ALL TESTS PASSED\n"); return 0; }
   printf("%d TEST(S) FAILED\n", fails);

@@ -31,20 +31,23 @@ typedef struct {
  * string that must not be used). Never writes past cap. */
 int policy_build_filter(char *f, size_t cap, const policy_filter_opts *o);
 
-/* Whether a connection is left alone by payment protection.
- *  - no host name in the segment: the addresses learned from DNS answers for
- *    payment domains decide;
- *  - a name, and the ClientHello carries no Encrypted Client Hello
- *    (ech == 0, also for HTTP): the NAME alone decides, so a shared
- *    CDN/anycast address learned for a bank cannot exclude an unrelated
- *    blocked site that names itself;
- *  - a name, and ECH present (ech > 0) or not known (ech < 0, the
- *    extensions run past the segment): the visible name may be a shared
- *    public one (cloudflare-ech.com), so the name OR the learned address
- *    excludes. */
+/* Whether a connection is left alone by payment protection:
+ *   the visible name is on the payment list, OR
+ *   the destination address was learned (from DNS answers) for a payment name
+ *   AND (the segment carries no name OR the name is a known ECH public name).
+ * A learned address alone never excludes a connection that names another
+ * site: such an address is often a shared CDN/anycast one. With real
+ * Encrypted Client Hello the visible name is the provider's shared public
+ * ("outer") name, not the site's, so only the address can tell that this is
+ * the payment site; with GREASE ECH (sent by Chrome and Firefox in every
+ * ClientHello) the visible name is the real site's and decides - so the
+ * extension's presence is not a signal, only the outer name is. */
 typedef int (*policy_name_fn)(const char *name, size_t len);
 typedef int (*policy_ip_fn)(const void *addr, int is_ipv6);
-int policy_excluded(int enabled, const char *name, size_t name_len, int ech, const void *daddr, int v6,
+int policy_excluded(int enabled, const char *name, size_t name_len, const void *daddr, int v6,
                     policy_name_fn name_listed, policy_ip_fn ip_learned);
+
+/* 1 when name[0,len) is a known ECH public name (exact, case-insensitive). */
+int policy_ech_public_name(const char *name, size_t len);
 
 #endif

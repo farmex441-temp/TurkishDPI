@@ -8,11 +8,6 @@
 
 typedef enum { PROTO_UNKNOWN = 0, PROTO_TLS = 1, PROTO_HTTP = 2 } proto_kind;
 
-#define PROTO_ECH_NO       0
-#define PROTO_ECH_YES      1
-#define PROTO_ECH_UNKNOWN (-1)
-#define PROTO_EXT_ECH     0xfe0d
-
 typedef struct {
   proto_kind kind;
   /* TLS: absolute offset/length of the SNI hostname inside the buffer.
@@ -23,13 +18,6 @@ typedef struct {
   int http_hdr_off;
   /* TLS only: total length of the first TLS record (5 + record length). */
   int tls_record_total;
-  /* TurkishDPI, TLS only: the encrypted_client_hello extension (0xfe0d):
-   * PROTO_ECH_NO when every extension was seen and none was ECH,
-   * PROTO_ECH_YES when it was seen, PROTO_ECH_UNKNOWN when the extensions
-   * run past this segment (or are malformed) before one was seen. 0 (NO)
-   * for HTTP. With ECH the visible name is a shared public one (e.g.
-   * cloudflare-ech.com), not the site's. */
-  int ech;
   char host[256];
 } proto_info;
 

@@ -11,7 +11,6 @@
  */
 #include "policy.h"
 #include "udpdpi.h"
-#include "proto.h"     /* PROTO_ECH_* only */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -134,38 +133,35 @@ static void test_exclusion(void) {
     const unsigned char other[4] = { 93, 184, 216, 34 };
     /* learned address + another site's name: the name decides - not excluded */
     CHECK(old_excluded("blocked.example", 15, LEARNED, 0) == 1);            /* the defect */
-    CHECK(policy_excluded(1, "blocked.example", 15, PROTO_ECH_NO, LEARNED, 0, name_listed, ip_learned) == 0);
+    CHECK(policy_excluded(1, "blocked.example", 15, LEARNED, 0, name_listed, ip_learned) == 0);
     /* learned address, no name in the segment: excluded */
-    CHECK(policy_excluded(1, NULL, 0, PROTO_ECH_NO, LEARNED, 0, name_listed, ip_learned) == 1);
-    CHECK(policy_excluded(1, "x", 0, PROTO_ECH_NO, LEARNED, 0, name_listed, ip_learned) == 1);
+    CHECK(policy_excluded(1, NULL, 0, LEARNED, 0, name_listed, ip_learned) == 1);
+    CHECK(policy_excluded(1, "x", 0, LEARNED, 0, name_listed, ip_learned) == 1);
     /* a payment name: excluded, whatever the address */
-    CHECK(policy_excluded(1, "secure.bank.tr", 14, PROTO_ECH_NO, other, 0, name_listed, ip_learned) == 1);
-    CHECK(policy_excluded(1, "secure.bank.tr", 14, PROTO_ECH_NO, LEARNED, 0, name_listed, ip_learned) == 1);
+    CHECK(policy_excluded(1, "secure.bank.tr", 14, other, 0, name_listed, ip_learned) == 1);
+    CHECK(policy_excluded(1, "secure.bank.tr", 14, LEARNED, 0, name_listed, ip_learned) == 1);
     /* neither */
-    CHECK(policy_excluded(1, NULL, 0, PROTO_ECH_NO, other, 0, name_listed, ip_learned) == 0);
-    CHECK(policy_excluded(1, "blocked.example", 15, PROTO_ECH_NO, other, 0, name_listed, ip_learned) == 0);
+    CHECK(policy_excluded(1, NULL, 0, other, 0, name_listed, ip_learned) == 0);
+    CHECK(policy_excluded(1, "blocked.example", 15, other, 0, name_listed, ip_learned) == 0);
     /* protection off: never */
-    CHECK(policy_excluded(0, "secure.bank.tr", 14, PROTO_ECH_NO, LEARNED, 0, name_listed, ip_learned) == 0);
-    CHECK(policy_excluded(0, NULL, 0, PROTO_ECH_NO, LEARNED, 0, name_listed, ip_learned) == 0);
+    CHECK(policy_excluded(0, "secure.bank.tr", 14, LEARNED, 0, name_listed, ip_learned) == 0);
+    CHECK(policy_excluded(0, NULL, 0, LEARNED, 0, name_listed, ip_learned) == 0);
 
-    /* Encrypted Client Hello: the visible name is a shared public one, so
-     * the name OR the learned address excludes - also when it is not known
-     * whether the hello carries ECH (its extensions run past the segment) */
-    for (int ech = PROTO_ECH_UNKNOWN; ech <= PROTO_ECH_YES; ech += 2) {
-        /* learned address + public name: excluded */
-        CHECK(policy_excluded(1, "cloudflare-ech.com", 18, ech, LEARNED, 0, name_listed, ip_learned) == 1);
-        /* other address + public name: not excluded */
-        CHECK(policy_excluded(1, "cloudflare-ech.com", 18, ech, other, 0, name_listed, ip_learned) == 0);
-        /* payment name, any address: excluded */
-        CHECK(policy_excluded(1, "secure.bank.tr", 14, ech, other, 0, name_listed, ip_learned) == 1);
-        CHECK(policy_excluded(1, "secure.bank.tr", 14, ech, LEARNED, 0, name_listed, ip_learned) == 1);
-        /* no name: the address */
-        CHECK(policy_excluded(1, NULL, 0, ech, LEARNED, 0, name_listed, ip_learned) == 1);
-        CHECK(policy_excluded(1, NULL, 0, ech, other, 0, name_listed, ip_learned) == 0);
-        CHECK(policy_excluded(0, "cloudflare-ech.com", 18, ech, LEARNED, 0, name_listed, ip_learned) == 0);
-    }
-    /* without ECH the same public name on the learned address is NOT excluded */
-    CHECK(policy_excluded(1, "cloudflare-ech.com", 18, PROTO_ECH_NO, LEARNED, 0, name_listed, ip_learned) == 0);
+    /* ECH public ("outer") name: only the address tells the site. GREASE
+     * ECH (0xfe0d in every Chrome/Firefox hello) is not an input: the
+     * visible name is the real site's and decides, as above. */
+    CHECK(policy_excluded(1, "cloudflare-ech.com", 18, LEARNED, 0, name_listed, ip_learned) == 1);
+    CHECK(policy_excluded(1, "Cloudflare-ECH.com", 18, LEARNED, 0, name_listed, ip_learned) == 1);
+    CHECK(policy_excluded(1, "cloudflare-ech.com.", 19, LEARNED, 0, name_listed, ip_learned) == 1);
+    CHECK(policy_excluded(1, "cloudflare-ech.com", 18, other, 0, name_listed, ip_learned) == 0);
+    CHECK(policy_excluded(1, "notcloudflare-ech.com", 21, LEARNED, 0, name_listed, ip_learned) == 0);
+    CHECK(policy_excluded(1, "cloudflare-ech.com.evil.net", 27, LEARNED, 0, name_listed, ip_learned) == 0);
+    CHECK(policy_excluded(1, "cloudflare-ech.co", 17, LEARNED, 0, name_listed, ip_learned) == 0);
+    CHECK(policy_excluded(1, "cloudflare-ech.coma", 19, LEARNED, 0, name_listed, ip_learned) == 0);
+    CHECK(policy_excluded(0, "cloudflare-ech.com", 18, LEARNED, 0, name_listed, ip_learned) == 0);
+    /* the length counts, not a terminator: a longer buffer, a shorter name */
+    CHECK(policy_excluded(1, "cloudflare-ech.comXYZ", 18, LEARNED, 0, name_listed, ip_learned) == 1);
+    CHECK(policy_ech_public_name("cloudflare-ech.com", 18) == 1 && policy_ech_public_name(NULL, 0) == 0);
 }
 
 int main(void) {

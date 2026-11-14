@@ -489,7 +489,7 @@ static void test_nameless(void) {
   uint16_t id = 1;
   /* move the name out of reach: proto_inspect sees the server name as
    * running past the segment */
-  pi.kind = PROTO_TLS; pi.host_off = -1; pi.host_len = 0; pi.ech = PROTO_ECH_UNKNOWN; pi.host[0] = 0;
+  pi.kind = PROTO_TLS; pi.host_off = -1; pi.host_len = 0; pi.host[0] = 0;
   CHECK(desync_compose4(&out, &modes[5].c, pkt, len, 20, 20, &pi, 1, 3, &id, grow_cb, NULL) == 1);
   CHECK(out.n == 3 && out.fake[0] && out.len[1] - 40 == 2 && out.len[2] - 40 == 1458);   /* decoy, [0,2), [2,1460) */
   CHECK(desync_compose4(&out, &modes[4].c, pkt, len, 20, 20, &pi, 1, 3, &id, grow_cb, NULL) == 1);
