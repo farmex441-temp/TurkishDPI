@@ -92,11 +92,13 @@ foreach ($w in 'x64', 'x86') {
     # every UI preview scenario (+ the other two pages for one of them)
     $shotDir = Join-Path $Shots $w
     New-Item -ItemType Directory -Force $shotDir | Out-Null
-    $jobs = @()
-    foreach ($s in $scenarios) { $jobs += , @($s, 'status') }
-    $jobs += , @('active', 'details'), @('active', 'settings')
+    $jobs = New-Object System.Collections.Generic.List[object]
+    foreach ($s in $scenarios) { $jobs.Add([pscustomobject]@{ Scenario = $s; Page = 'status' }) }
+    $jobs.Add([pscustomobject]@{ Scenario = 'active'; Page = 'details' })
+    $jobs.Add([pscustomobject]@{ Scenario = 'active'; Page = 'settings' })
     foreach ($j in $jobs) {
-        $s = $j[0]; $page = $j[1]
+        $s = $j.Scenario; $page = $j.Page
+        if (-not $s -or -not $page) { Fail "${w}: internal error, empty scenario/page in the job list"; continue }
         $name = if ($page -eq 'status') { $s } else { "$s-$page" }
         $bmp = Join-Path $shotDir "$name.bmp"
         $code = Invoke-Timed $exe @('--ui-preview', $s, '--page', $page, '--shot', "`"$bmp`"") 60 $null
