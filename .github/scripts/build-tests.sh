@@ -17,6 +17,10 @@
 #   Example (a test that needs a define and its own list of Windows libs):
 #     upd_swap_test|tests/upd_swap_test.c src/app/updpkg.c|-DUPD_TEST -Isrc/app -Isrc/engine -Itests|-ladvapi32 -lshell32 -lole32 -luuid -lws2_32
 #
+# Every test in the table is tried even after a compile error (one CI run shows
+# all of them); the script then exits 1. <outdir>/EXPECTED lists the selected
+# names, one per line, so a runner can check that none is missing.
+#
 # Environment:
 #   WARN_FLAGS  warning policy (the workflow sets it; default below = the exe's)
 #   TEST_ONLY   space separated exe names: build only those (the Linux
@@ -55,7 +59,9 @@ desync_test|tests/desync_test.c src/engine/desync.c src/engine/core/tcpdpi.c src
 "
 
 mkdir -p "$OUT"
+: > "$OUT/EXPECTED"   # names of the tests that must exist here; callers run exactly these
 built=0
+failed=""
 while IFS='|' read -r name srcs flags libs; do
   [ -n "$name" ] || continue
   if [ -n "$ONLY" ]; then
@@ -64,12 +70,22 @@ while IFS='|' read -r name srcs flags libs; do
   if [ -z "${libs+x}" ] || [ -z "$libs" ]; then libs="$DEFLIBS"; fi
   [ "$libs" = "-" ] && libs=""
   echo "== $name"
+  echo "$name" >> "$OUT/EXPECTED"
+  # Keep going after a compile error so one CI run shows every failing test.
   # word splitting of the source, flag and library lists is intended
   # shellcheck disable=SC2086
-  "$CC" -O2 $WARN $flags "$@" $srcs $libs -o "$OUT/$name$EXT"
-  built=$((built + 1))
+  if "$CC" -O2 $WARN $flags "$@" $srcs $libs -o "$OUT/$name$EXT"; then
+    built=$((built + 1))
+  else
+    echo "::error::$name failed to compile"
+    failed="$failed $name"
+  fi
 done <<< "$TESTS"
 echo "built $built test(s) into $OUT"
+if [ -n "$failed" ]; then
+  echo "::error::failed to compile:$failed"
+  exit 1
+fi
 if [ -n "$ONLY" ]; then
   for n in $ONLY; do
     case "$TESTS" in *"
