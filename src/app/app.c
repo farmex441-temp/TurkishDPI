@@ -1841,10 +1841,14 @@ void app_update_done(int how) {
     stop_controller(5000);
     engine_stop();
     if (how != 1 || g_update_lock == INVALID_HANDLE_VALUE) {
-        log_line("update: stopped, the program must be started again by hand");
-        MessageBoxW(NULL, L"Güncelleme yarıda kaldı. TurkishDPI kapatılıyor.\n\n"
-                          L"TurkishDPI.exe'yi yeniden açın; açılmazsa son sürümü GitHub'dan indirin.",
+        /* The running exe was moved aside: the file now at its name may not
+         * be the verified one, so do not tell the user to open it again. */
+        log_line("update: stopped, opening the releases page for a manual download");
+        MessageBoxW(NULL, L"Güncelleme tamamlanamadı. TurkishDPI kapatılıyor.\n\n"
+                          L"Son sürümü GitHub'daki sürümler sayfasından indirin. "
+                          L"Tamam'a basınca sayfa açılır.",
                     L"TurkishDPI", MB_ICONERROR);
+        app_open_url(TURKISHDPI_RELEASES_URL);
         ExitProcess(1);
     }
     if (g_mutex) { ReleaseMutex(g_mutex); CloseHandle(g_mutex); g_mutex = NULL; }
