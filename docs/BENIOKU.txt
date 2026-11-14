@@ -7,9 +7,10 @@ KULLANIM
    kendisi bulur. Hiçbir şey yapmanıza gerek yoktur. Her ağı ayrı
    öğrenir; bir dahaki sefere doğru yöntemi ilk denemede seçer.
    Pencereyi kapatınca saatin yanındaki simgede çalışmaya devam eder.
-3) Açılmayan bir site olursa "Bir site açılmıyor mu?" düğmesine basın,
-   adresini yazıp "Kontrol et" deyin. Uygulama engelin türünü söyler ve
-   DPI ile aşılabiliyorsa o siteyi açan yöntemi kendisi arar.
+3) Açılmayan bir site olursa "Ayrıntılar" sayfasındaki "Site kontrolü"
+   kutusuna adresini yazıp "Kontrol et" düğmesine basın. Uygulama engelin
+   türünü söyler ve DPI ile aşılabiliyorsa o siteyi açan yöntemi kendisi
+   arar.
 4) Banka ve ödeme sitelerinin (3D Secure dahil) trafiğine dokunulmaz
    ("Ödeme koruması", varsayılan olarak açık).
 5) Pencerenin sayfaları:
@@ -17,25 +18,106 @@ KULLANIM
    - Ayrıntılar : Kullanılan yöntem ve DNS, test siteleri, site kontrolü,
                   "Değiştir" (yöntemi elle seçmek) ve "Yeniden tara"
    - Ayarlar    : Otomatik yöntem seçimi, Windows açılışında başlat,
-                  Ödeme koruması, Günlüğü aç, Kaldır ve temizle
+                  Ödeme koruması, Günlüğü aç, Gelişmiş ayarlar,
+                  Antivirüs yardımı, Kaldır ve temizle…
    Klavye (Tab, Boşluk, Enter) ve ekran okuyucularla (Ekran Okuyucusu,
    NVDA) kullanılabilir.
 6) Yeni sürüm çıkınca pencerenin üstünde "Yeni sürüm hazır" yazar.
    "Güncelle" düğmesine basın: TurkishDPI yeni sürümü GitHub'dan indirir,
    doğrular, kendini aynı klasörde değiştirir ve yeniden açılır. Ayarlarınız
-   korunur. Güncelleme olmazsa düğme indirme sayfasını açar.
+   korunur. Güncelleme yapılamazsa düğme sürüm sayfasını açar (aşağıda
+   "GÜNCELLEME OLMAZSA").
+7) TurkishDPI zaten çalışırken TurkishDPI.exe'yi yeniden başlatırsanız
+   çalışan pencere öne gelir.
 
 ÖNEMLİ
 - WinDivert.dll ve WinDivert64.sys dosyaları TurkishDPI.exe ile aynı
   klasörde durmalıdır (zip'in tamamını aynı klasöre çıkarın).
 - "Windows açılışında başlat" programı C:\Program Files\TurkishDPI
-  klasörüne kopyalar ve oradan çalıştırır.
+  klasörüne kopyalar ve oradan çalıştırır (32 bit sürüm 64 bit Windows'ta:
+  C:\Program Files (x86)\TurkishDPI).
 - Bazı antivirüsler WinDivert sürücüsünü "RiskTool/WinDivert" olarak
-  işaretler; bu bir yanlış alarmdır (GoodbyeDPI ve zapret için de aynı).
-  Gerekirse yalnızca C:\Program Files\TurkishDPI klasörünü istisnalara
-  ekleyin. Kaspersky kullanıyorsanız sürücüyü engelleyebilir.
-- Eski GoodbyeDPI hizmeti kuruluysa TurkishDPI bunu fark eder ve
+  işaretler; WinDivert kullanan her araçta aynı yanlış alarm görülür.
+  Gerekirse yalnızca C:\Program Files\TurkishDPI klasörünü (32 bit sürüm
+  64 bit Windows'ta: Program Files (x86)) istisnalara ekleyin.
+  Kaspersky kullanıyorsanız sürücüyü engelleyebilir.
+  Ayarlar sayfasındaki "Antivirüs yardımı" adım adım anlatır.
+- Çalışan bir GoodbyeDPI/zapret hizmeti varsa TurkishDPI bunu fark eder ve
   kaldırmayı önerir.
+
+İNDİRMEYİ DOĞRULAMA
+  cd /d "%USERPROFILE%\Downloads"
+  certutil -hashfile TurkishDPI-vX.Y.Z-x64.zip SHA256
+  (İlk satır zip'in bulunduğu klasöre geçer.) Çıkan değeri Release
+  sayfasındaki SHA256SUMS.txt ile karşılaştırın; aynı olmalıdır (Windows
+  7/8 bayt çiftleri arasına boşluk koyar, boşlukları yok sayın). Farklıysa
+  zip'i yeniden indirin.
+
+SÜRÜCÜ HATALARI (kod günlükteki "err=" değeridir)
+  Pencerede "Sürücü başlatılamadı" yazar ve altında bir açıklama görünür;
+  kod günlükte ("Error opening filter: <kod>", "... err=<kod>") yazar.
+  Sürücü hatasında program başka yöntem denemez.
+  2, 126  WinDivert64.sys (32 bit Windows'ta WinDivert32.sys) /
+          WinDivert.dll yok: zip'in tamamını exe ile aynı klasöre
+          çıkarın; dosya oradaysa antivirüs karantinasına bakın.
+  193     WinDivert.dll bu Windows'a uymuyor: x64/x86 zip'ini doğru seçin.
+  5       Yönetici izni gerekiyor: yönetici olarak çalıştırın.
+  50      ARM işlemcili Windows desteklenmiyor.
+  577     Sürücü imzası doğrulanamadı: Windows güncellemelerini yükleyin.
+  654     Başka sürümde bir WinDivert sürücüsü yüklü (eski GoodbyeDPI/zapret
+          olabilir): onları kapatıp bilgisayarı yeniden başlatın.
+  1006    WinDivert dosyaları beklenenler değil: resmi zip'i yeniden
+          indirin.
+  1275    Sürücü bir güvenlik yazılımı (ör. Kaspersky) tarafından engellendi.
+  1753    Base Filtering Engine (BFE) hizmeti kapalı: Hizmetler'den açın.
+  1920    WinDivert dosyalarına erişilemiyor: antivirüs engellemiş ya da
+          başka bir program kullanıyor olabilir.
+  Başka bir kodda pencere "WinDivert sürücüsü açılamadı (hata <kod>)"
+  der; başka bir WinDivert aracını (GoodbyeDPI, zapret) kapatıp yeniden
+  deneyin.
+
+GÜNCELLEME OLMAZSA
+  Güncelleme, indirilen exe'nin sürümü etiketle aynı ve çalışandan yeni
+  değilse ya da yanındaki WinDivert dosyaları zip'tekilerden farklıysa
+  yapılmaz. Olağan durum: pencerede "Güncelleme yapılamadı" yazar, program
+  çalışmaya devam eder (lisans ve BENIOKU metinleri değişmez).
+  "Sayfa →" düğmesiyle sürüm sayfasını açın, yeni zip'i indirin,
+  TurkishDPI'ı kapatın (simge > Çıkış) ve zip'teki dosyaları eski klasöre
+  kopyalayıp eskilerin üzerine yazın. Nedenini günlükteki "update: failed"
+  satırı gösterir.
+  Nadir durum: eski exe geri konamazsa "Güncelleme tamamlanamadı.
+  TurkishDPI kapatılıyor." çıkar, Tamam'a basınca sürümler sayfası açılır
+  ve program kapanır; son sürümü oradan indirin.
+
+ELLE KALDIRMA
+  En kolay yol Ayarlar > "Kaldır ve temizle…" düğmesidir. Program
+  açılmıyorsa, yönetici olarak açtığınız KOMUT İSTEMİ'nde (cmd; PowerShell
+  değil - Windows 11'de Terminal PowerShell açarsa önce "cmd" yazın):
+    taskkill /F /T /IM TurkishDPI.exe
+    taskkill /F /T /IM TurkishDPI.exe
+    schtasks /Delete /F /TN "TurkishDPI"
+    sc.exe stop WinDivert
+    sc.exe delete WinDivert
+    sc.exe stop WinDivert14
+    sc.exe delete WinDivert14
+    sc.exe stop TurkishDPI
+    sc.exe delete TurkishDPI
+    rmdir /S /Q "%ProgramData%\TurkishDPI"
+    rmdir /S /Q "%ProgramFiles%\TurkishDPI"
+    rmdir /S /Q "%ProgramFiles(x86)%\TurkishDPI"
+  (taskkill iki kez: uygulama ile motor aynı adı taşır. Olmayan hizmet
+  için "hizmet yok" hatası normaldir. Sondaki satır 32 bit sürümü 64 bit
+  Windows'ta kullandıysanız gerekir.) İndirdiğiniz exe ve zip
+  dosyalarını kendiniz silebilirsiniz.
+
+KENDİ KENDİNE TEST VE GÜNLÜK
+  "TurkishDPI.exe --selftest" komutu (yönetici izni ister; TurkishDPI
+  zaten çalışıyorsa çalışmaz) profilleri tarar, ödeme sitelerinin
+  dokunulmadan geçtiğini doğrular, gecikmeyi ölçer, sonucu günlüğe yazıp
+  kapanır. Son "SELFTEST" satırı PASS ya da CHECK olur (ödeme koruması
+  kapalıysa hep CHECK).
+  Günlük: C:\ProgramData\TurkishDPI\TurkishDPI.log
+  (Ayarlar > "Günlüğü aç"; 1 MB'ı geçince eskisi TurkishDPI.log.old olur.)
 
 UYUMLULUK
 - Windows 7 SP1, 8.1, 10 ve 11 (64 ve 32 bit). Windows 7'de sürücü imzası
@@ -47,4 +129,14 @@ SINIRLAR
 - IP adresinden engellenen siteler VPN olmadan açılamaz; site kontrolü
   bunu söyler.
 
+LİSANS
+- TurkishDPI: Apache-2.0 (LICENSE, NOTICE). Motor çekirdeği Shroudly'den
+  (MIT, THIRD_PARTY_LICENSES.txt).
+- WinDivert: LGPL v3 (WinDivert-LICENSE.txt), kaynak:
+  https://github.com/basil00/WinDivert. Sürüm exe'leri yalnızca derleme
+  anında sabitlenen özete uyan WinDivert dosyalarını yükler; değiştirilmiş bir
+  WinDivert için TurkishDPI'ı "make WINDIVERT=<klasör>" ile yeniden
+  derleyin (ayrıntı: GitHub sayfasındaki README).
+
 Ayarlar ve günlük: C:\ProgramData\TurkishDPI\
+Ayrıntılı belge: https://github.com/farmex441-temp/TurkishDPI

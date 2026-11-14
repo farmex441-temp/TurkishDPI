@@ -83,7 +83,9 @@ int  tcpdpi_hops_get(uint32_t ip_be, uint64_t now_ms); /* 0 if absent/expired */
  * header template (the captured packet's IP and TCP headers) plus new fields,
  * and fills in the IPv4 total length, the IP ID, the IPv4 header checksum and
  * the TCP checksum. With bad_tcp_csum != 0 the TCP checksum is deliberately
- * inverted so the destination drops the segment (a decoy the DPI still ingests
+ * inverted (TurkishDPI: except that a correct value of 0x0000 becomes 0x5a5a,
+ * since its inverse 0xffff would be the same one's-complement value - see
+ * tcpdpi_bad_csum) so the destination drops the segment (a decoy the DPI still ingests
  * but the server never accepts). ihl and tcphl are the header lengths in bytes.
  * Return the segment length, or 0 on any error (bad lengths, capacity) — never
  * a partially written buffer. */
@@ -151,7 +153,11 @@ int tcpdpi_split_points(const uint8_t *payload, int plen, int host_off, int host
  * number of its first byte. reverse == 0: in order; reverse != 0: last first
  * (the receiver puts them back in order; a filter that does not, never sees the
  * name). Fills segs[] and *nsegs in the order to send. Returns 1, or 0 on any
- * error (the caller sends the payload whole). */
+ * error (the caller sends the payload whole).
+ * TurkishDPI: this, tcpdpi_build_fakedsplit4, tcpdpi_build_tlsrec4 and
+ * tcpdpi_build_tlsrec_pair are no longer used by the engine (it sends the
+ * plans below); they are kept as the reference implementations the unit tests
+ * compare the plans against, and give exactly their original output. */
 int tcpdpi_build_multisplit4(tcpdpi_seg segs[3], int *nsegs,
                              const uint8_t *ip_tmpl, int ihl,
                              const uint8_t *tcp_tmpl, int tcphl,
@@ -203,6 +209,119 @@ int tcpdpi_build_tlsrec_pair(tcpdpi_seg segs[2], int *nsegs,
 
 /* The extra bytes tcpdpi_build_tlsrec4 adds (one TLS record header). */
 #define TCPDPI_TLSREC_GROWTH 5
+
+/* ───────── TurkishDPI: payloads of any size, cut into bounded pieces ─────────
+ * WinDivert sees outbound TCP before the NIC's segmentation offload, so one
+ * captured segment can hold far more than one MSS (a ClientHello with a
+ * post-quantum key share is ~1.8 KB; a sender may hand over up to 64 KB).
+ *
+ * The caller chooses the largest payload of one crafted piece (piece_max):
+ *  - a captured packet that fits one wire packet (IP total length <=
+ *    TCPDPI_WIRE_MAX) keeps the original limit, TCPDPI_SEG_MAX minus its
+ *    headers - so everything such a packet produces is byte-identical to the
+ *    original builders (as measured on real lines);
+ *  - a larger one (segmentation offload) is cut into pieces of at most
+ *    TCPDPI_PIECE_MAX bytes. (The original code handled these differently:
+ *    up to TCPDPI_SEG_MAX bytes it still desynced them but built pieces
+ *    larger than a 1500-byte MTU, DF copied - e.g. 20 + 32 + 1460 = 1512
+ *    bytes; above TCPDPI_SEG_MAX it sent the original unmodified.) That
+ *    fits a PPPoE link (1492) with any IPv4
+ *    headers (60 + 60 + 1200 = 1320), and the IPv6 minimum MTU (1280) while
+ *    the TCP header is at most 40 bytes (40 + 40 + 1200 = 1280; the usual 20
+ *    or 32). It never depends on the path MTU.
+ * tcpdpi_piece_limit() makes this choice.
+ *
+ * A plan is a list of pieces in the order they are to be sent. Each piece is a
+ * byte range [off, off+len) of the payload (sent at seq + off), a flag for a
+ * decoy (junk, decoy TTL, bad checksum) and `id`, the offset added to the
+ * first IP id (so all ids of one plan are distinct). The real pieces of a plan
+ * cover every payload byte exactly once and are contiguous in sequence. */
+#define TCPDPI_SEG_MAX    1600  /* largest crafted IPv4/IPv6 packet (bytes) */
+#define TCPDPI_WIRE_MAX   1500  /* a captured packet up to this: one wire packet */
+#define TCPDPI_PIECE_MAX  1200  /* payload bytes per piece of a larger one */
+#define TCPDPI_PIECES_MAX 64    /* enough for 65535 + growth bytes, 2 cuts, a decoy */
+#define TCPDPI_FALLBACK_CUT 2   /* the cut when a ClientHello's name is not in it */
+
+typedef struct {
+  int off;   /* first payload byte */
+  int len;   /* bytes, 1..piece_max */
+  int fake;  /* 1: decoy piece (pattern bytes, decoy TTL, bad TCP checksum) */
+  int id;    /* added to the first IP id */
+} tcpdpi_piece;
+
+/* piece_max for a captured packet of total length pkt_len with hdr_len
+ * bytes of IP + TCP headers (see above). */
+static inline int tcpdpi_piece_limit(int pkt_len, int hdr_len) {
+  return pkt_len <= TCPDPI_WIRE_MAX ? TCPDPI_SEG_MAX - hdr_len : TCPDPI_PIECE_MAX;
+}
+
+/* A decoy's TCP checksum from the correct one: never a value that verifies. */
+uint16_t tcpdpi_bad_csum(uint16_t good);
+
+/* The real payload [0, plen) cut at cuts[0..ncuts) (ascending, each in
+ * (0, plen), ncuts 0..4), every region between two cuts further divided into
+ * runs of piece_max bytes from its start (so every cut stays a piece
+ * boundary). reverse == 0: sent in sequence order; reverse != 0: in strictly
+ * descending sequence order - the last bytes first, the piece holding byte 0
+ * last (zapret's multidisorder; with one piece per region, exactly the old
+ * 2- and 3-segment orders). Piece ids follow sequence order, as the old
+ * builder numbered its segments. Returns the number of pieces, or 0 on an
+ * invalid cut or when more than `cap` pieces would be needed. */
+int tcpdpi_plan_split(tcpdpi_piece *out, int cap, int plen, const int *cuts, int ncuts, int reverse,
+                      int piece_max);
+
+/* fakedsplit / fakeddisorder for any size: the real payload split at `split`
+ * (1 <= split < plen) into A = [0,split) and B = [split,plen), each cut into
+ * runs as above, with one decoy piece at the boundary that shadows the first
+ * piece_max bytes of the part sent after it:
+ *   disorder == 0: A (in order), decoy@split, B (in order)
+ *   disorder != 0: B (descending), decoy@0, A (descending)
+ * Piece ids follow the send order (as tcpdpi_build_fakedsplit4 numbers them).
+ * Returns the number of pieces, 0 on error. */
+int tcpdpi_plan_fakedsplit(tcpdpi_piece *out, int cap, int plen, int split, int disorder, int piece_max);
+
+/* One piece of a plan as a complete IPv4 + TCP segment: payload data[off,
+ * off+len) at seq + off with `ttl` and a good checksum, or - for a decoy
+ * piece - `len` bytes of `pattern` with `fake_ttl` and a bad TCP checksum. IP
+ * id = ip_id + piece->id. Returns the segment length, 0 on error. */
+int tcpdpi_build_piece4(uint8_t *dst, size_t dstcap,
+                        const uint8_t *ip_tmpl, int ihl,
+                        const uint8_t *tcp_tmpl, int tcphl,
+                        uint16_t ip_id, uint32_t seq, int ttl, int fake_ttl, uint8_t pattern,
+                        const uint8_t *data, const tcpdpi_piece *piece);
+
+/* IPv6 (fixed header only, next header TCP): a copy of the 40-byte header
+ * ip6_tmpl and the TCP header with payload[0,seg_len) at `seq`, hop limit
+ * `hop`, the payload length set and the TCP checksum computed (inverted when
+ * bad_tcp_csum != 0, except that a correct 0x0000 becomes 0x5a5a since 0xffff
+ * would be equivalent: tcpdpi_bad_csum). Returns the packet length, 0 on error. */
+int tcpdpi_build_segment6(uint8_t *dst, size_t dstcap,
+                          const uint8_t *ip6_tmpl, const uint8_t *tcp_tmpl, int tcphl,
+                          uint32_t seq, int hop, const uint8_t *payload, int seg_len,
+                          int bad_tcp_csum);
+
+/* tcpdpi_build_piece4 for IPv6 (no IP id). */
+int tcpdpi_build_piece6(uint8_t *dst, size_t dstcap,
+                        const uint8_t *ip6_tmpl, const uint8_t *tcp_tmpl, int tcphl,
+                        uint32_t seq, int hop, int fake_hop, uint8_t pattern,
+                        const uint8_t *data, const tcpdpi_piece *piece);
+
+/* Where the real request is cut (the engine's choice, pure):
+ *   split_pos > 0: after byte split_pos (or plen-1 when shorter);
+ *   else inside the name (tcpdpi_split_points);
+ *   else, for a TLS ClientHello where no cut inside the name is possible -
+ *   the name is not in this segment (it lies in a later one, as with a large
+ *   post-quantum ClientHello) or it is too short to cut (a 1-byte name) -
+ *   after byte TCPDPI_FALLBACK_CUT, the cut preset 0 uses, instead of no cut.
+ * Fills cuts[] (ascending) and returns how many (0: send the payload whole). */
+int tcpdpi_choose_cuts(const uint8_t *payload, int plen, int is_tls, int host_off, int host_len,
+                       int split_pos, int cuts[2]);
+
+/* The two-record payload of tcpdpi_build_tlsrec4 written to dst (capacity
+ * cap, which bounds the result: any size up to cap, not only one packet).
+ * Returns its length (real_len + TCPDPI_TLSREC_GROWTH) and *rec1_len, where
+ * record 2 begins; 0 on any error. */
+int tcpdpi_tlsrec_form(uint8_t *dst, int cap, const uint8_t *real, int real_len, int cut, int *rec1_len);
 
 /* Recompute the IPv4 and TCP checksums of a complete IPv4+TCP segment in place
  * (good checksums), after its sequence or acknowledgement number was changed by

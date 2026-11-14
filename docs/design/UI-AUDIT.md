@@ -1,3 +1,5 @@
+> **TARİHSEL BELGE – sürüm 1.1.0 koduna göre yazılmış taslak.** Bu belge, v1.2.0'daki arayüz yenilemesinin taslağıdır ve v1.1.0 koduna göre yazılmıştır (440×734 px tek sayfa); bugünkü pencere 400×520 px ve üç sayfalıdır (Durum / Ayrıntılar / Ayarlar). Motor 2.0'dan beri TurkishDPI'ın kendi motorudur (Shroudly çekirdeği). Güncel durum için [CLAUDE.md](../../CLAUDE.md) ve [README.md](../../README.md) dosyalarına bakın.
+
 # TurkishDPI – Arayüz denetimi (UI-AUDIT)
 
 Kaynak: `src/app/ui.c` (main @ 55b6244), `src/app/app.h`, `src/app/app.c`

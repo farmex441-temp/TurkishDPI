@@ -16,6 +16,7 @@
 #include <aclapi.h>
 #include <sddl.h>
 #include <shlobj.h>
+#include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -130,13 +131,16 @@ int sys_proxy_repair(void) {
 }
 
 /* ---------- updates ---------- */
+/* This build's version packed like a Windows file version (build 0). */
+static unsigned long long own_version(void) {
+    return (unsigned long long)TURKISHDPI_VER_MAJOR << 48 | (unsigned long long)TURKISHDPI_VER_MINOR << 32 |
+           (unsigned long long)TURKISHDPI_VER_PATCH << 16;
+}
+
+/* 1 if tag is a strict "vX.Y.Z" (upd_tag_parse) newer than this build. */
 static int version_newer(const char *tag) {
-    int a = 0, b = 0, c = 0;
-    if (*tag == 'v' || *tag == 'V') tag++;
-    if (sscanf(tag, "%d.%d.%d", &a, &b, &c) < 2) return 0;
-    if (a != TURKISHDPI_VER_MAJOR) return a > TURKISHDPI_VER_MAJOR;
-    if (b != TURKISHDPI_VER_MINOR) return b > TURKISHDPI_VER_MINOR;
-    return c > TURKISHDPI_VER_PATCH;
+    uint64_t v;
+    return upd_tag_parse(tag, &v) && v > own_version();
 }
 
 int sys_check_update(wchar_t *tag_out, size_t cap) {
@@ -227,6 +231,30 @@ int sys_set_default_owner(void) {
     return ok;
 }
 
+/*
+ * Bounded wide formatting that fails unless the whole result fits with its
+ * terminator. _snwprintf/_vsnwprintf (msvcrt and ucrt) return count without
+ * terminating when the output is exactly count characters, and -1 when it is
+ * longer; a C99-style implementation returns the full length. "n >= 0 &&
+ * n < cap" is right for all three, so a name is never silently cut short.
+ */
+static int wfmt(wchar_t *out, size_t cap, const wchar_t *fmt, ...) {
+    va_list ap;
+    int n;
+    if (!cap) return 0;
+    va_start(ap, fmt);
+    n = _vsnwprintf(out, cap, fmt, ap);
+    va_end(ap);
+    out[cap - 1] = 0;
+    if (n < 0 || (size_t)n >= cap) { out[0] = 0; return 0; }
+    return 1;
+}
+
+/* dir\name into out[cap]; 0 (and an empty out) when it does not fit. */
+static int path_join(wchar_t *out, size_t cap, const wchar_t *dir, const wchar_t *name) {
+    return wfmt(out, cap, L"%ls\\%ls", dir, name);
+}
+
 /* Real path of an open handle ("\\?\" prefix removed). */
 static int final_path(HANDLE h, wchar_t *out, DWORD cap) {
     DWORD n = GetFinalPathNameByHandleW(h, out, cap, FILE_NAME_NORMALIZED | VOLUME_NAME_DOS);
@@ -264,13 +292,18 @@ static int delete_object(const wchar_t *path, const wchar_t *root, int allow_equ
     }
     if (final_path(h, real, MAX_PATH * 2) && path_within(real, root, allow_equal)) {
         FILE_BASIC_INFO bi;
+        int cleared = 0;
         if (GetFileInformationByHandleEx(h, FileBasicInfo, &bi, sizeof(bi)) &&
             (bi.FileAttributes & FILE_ATTRIBUTE_READONLY)) {
             bi.FileAttributes &= ~(DWORD)FILE_ATTRIBUTE_READONLY;
-            SetFileInformationByHandle(h, FileBasicInfo, &bi, sizeof(bi));
+            cleared = SetFileInformationByHandle(h, FileBasicInfo, &bi, sizeof(bi)) != 0;
         }
         di.DeleteFile = TRUE;
         ok = SetFileInformationByHandle(h, FileDispositionInfo, &di, sizeof(di)) != 0;
+        if (!ok && cleared) {   /* not deleted after all: leave the file as it was */
+            bi.FileAttributes |= FILE_ATTRIBUTE_READONLY;
+            SetFileInformationByHandle(h, FileBasicInfo, &bi, sizeof(bi));
+        }
     }
     CloseHandle(h);
     return ok;
@@ -287,14 +320,12 @@ static int delete_tree_in(const wchar_t *dir, const wchar_t *root, int delay_ok)
     WIN32_FIND_DATAW fd;
     HANDLE f;
     int ok = 1, pending = 0;
-    if (_snwprintf(pat, MAX_PATH - 1, L"%ls\\*", dir) < 0) return 0;
-    pat[MAX_PATH - 1] = 0;
+    if (!path_join(pat, MAX_PATH, dir, L"*")) return 0;
     f = FindFirstFileW(pat, &fd);
     if (f != INVALID_HANDLE_VALUE) {
         do {
             if (!wcscmp(fd.cFileName, L".") || !wcscmp(fd.cFileName, L"..")) continue;
-            if (_snwprintf(path, MAX_PATH - 1, L"%ls\\%ls", dir, fd.cFileName) < 0) { ok = 0; continue; }
-            path[MAX_PATH - 1] = 0;
+            if (!path_join(path, MAX_PATH, dir, fd.cFileName)) { ok = 0; continue; }
             if (fd.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) {
                 ok &= delete_object(path, root, 0);         /* the link, never its target */
             } else if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
@@ -304,9 +335,8 @@ static int delete_tree_in(const wchar_t *dir, const wchar_t *root, int delay_ok)
                 if (!delay_ok) { ok = 0; continue; }
                 /* in use: rename, then delete the renamed file at reboot (a
                  * reinstall under the original name survives the reboot) */
-                _snwprintf(aside, MAX_PATH - 1, L"%ls.%lu.del", path, GetTickCount());
-                aside[MAX_PATH - 1] = 0;
-                if (MoveFileExW(path, aside, 0) && MoveFileExW(aside, NULL, MOVEFILE_DELAY_UNTIL_REBOOT))
+                if (wfmt(aside, MAX_PATH, L"%ls.%lu.del", path, GetTickCount()) &&
+                    MoveFileExW(path, aside, 0) && MoveFileExW(aside, NULL, MOVEFILE_DELAY_UNTIL_REBOOT))
                     pending = 1;
                 else
                     ok = 0;
@@ -401,10 +431,9 @@ int sys_secure_dir(const wchar_t *dir, int users_read) {
     if (!handle_owner_trusted(h)) {
         wchar_t aside[MAX_PATH];
         CloseHandle(h);
-        _snwprintf(aside, MAX_PATH - 1, L"%ls.untrusted-%lu", dir, GetTickCount());
-        aside[MAX_PATH - 1] = 0;
         /* fails while the other process holds it open without delete sharing */
-        if (!MoveFileExW(dir, aside, 0)) return 0;
+        if (!wfmt(aside, MAX_PATH, L"%ls.untrusted-%lu", dir, GetTickCount()) || !MoveFileExW(dir, aside, 0))
+            return 0;
         if (!CreateDirectoryW(dir, NULL)) return 0;
         if (!open_dir_checked(dir, &h, NULL)) return 0;
         if (!handle_owner_trusted(h)) { CloseHandle(h); return 0; }
@@ -430,15 +459,13 @@ int sys_secure_dir(const wchar_t *dir, int users_read) {
         PACL empty = NULL;
         BYTE acl_buf[64];
         if (InitializeAcl((PACL)acl_buf, sizeof(acl_buf), ACL_REVISION)) empty = (PACL)acl_buf;
-        _snwprintf(pat, MAX_PATH - 1, L"%ls\\*", root);
-        pat[MAX_PATH - 1] = 0;
+        if (!path_join(pat, MAX_PATH, root, L"*")) return 0;
         f = FindFirstFileW(pat, &fd);
         if (f != INVALID_HANDLE_VALUE) {
             do {
                 int t;
                 if (!wcscmp(fd.cFileName, L".") || !wcscmp(fd.cFileName, L"..")) continue;
-                _snwprintf(path, MAX_PATH - 1, L"%ls\\%ls", root, fd.cFileName);
-                path[MAX_PATH - 1] = 0;
+                if (!path_join(path, MAX_PATH, root, fd.cFileName)) { ok = 0; continue; }
                 if (fd.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) {
                     if (!delete_object(path, root, 0)) ok = 0;
                     continue;
@@ -477,8 +504,7 @@ int sys_install_dir(wchar_t *out, size_t cap) {
     wchar_t *pf = NULL;
     int ok = 0;
     if (SUCCEEDED(SHGetKnownFolderPath(&FOLDERID_ProgramFiles, 0, NULL, &pf))) {
-        ok = _snwprintf(out, cap, L"%ls\\TurkishDPI", pf) > 0;
-        out[cap - 1] = 0;
+        ok = path_join(out, cap, pf, L"TurkishDPI");
         CoTaskMemFree(pf);
     }
     return ok;
@@ -511,8 +537,7 @@ static int copy_from_handle(HANDLE src, const wchar_t *dst) {
     int ok = 1;
     zero.QuadPart = 0;
     if (!SetFilePointerEx(src, zero, NULL, FILE_BEGIN)) return 0;
-    _snwprintf(tmp, MAX_PATH, L"%ls.new", dst);
-    tmp[MAX_PATH - 1] = 0;
+    if (!wfmt(tmp, MAX_PATH, L"%ls.new", dst)) return 0;
     out = CreateFileW(tmp, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
     if (out == INVALID_HANDLE_VALUE) return 0;
     while (ok) {
@@ -565,11 +590,6 @@ static unsigned long long file_version(const wchar_t *path) {
     return ver;
 }
 
-static unsigned long long own_version(void) {
-    return (unsigned long long)TURKISHDPI_VER_MAJOR << 48 | (unsigned long long)TURKISHDPI_VER_MINOR << 32 |
-           (unsigned long long)TURKISHDPI_VER_PATCH << 16;
-}
-
 /* src/engine/windivert_dyn.c */
 int windivert_file_pinned(const wchar_t *name);
 int windivert_handle_ok(HANDLE f, const wchar_t *name);
@@ -613,8 +633,7 @@ int sys_install_copy(HANDLE self_exe, const wchar_t *running_exe, wchar_t *insta
     if (!GetFullPathNameW(running_exe, MAX_PATH, src_dir, NULL)) return 0;
     if (!(slash = wcsrchr(src_dir, L'\\'))) return 0;
     *slash = 0;
-    if (_snwprintf(installed_exe, cap, L"%ls\\TurkishDPI.exe", dst_dir) < 0) return 0;
-    installed_exe[cap - 1] = 0;
+    if (!path_join(installed_exe, cap, dst_dir, L"TurkishDPI.exe")) return 0;
     if (!_wcsicmp(src_dir, dst_dir)) return 1;        /* already running from there */
     if (!sys_secure_dir(dst_dir, 1)) return 0;         /* admin-owned, runnable by users */
     /* That copy may have been updated in place (one-click update while the
@@ -628,8 +647,8 @@ int sys_install_copy(HANDLE self_exe, const wchar_t *running_exe, wchar_t *insta
         BY_HANDLE_FILE_INFORMATION fi;
         /* only drivers whose hash is pinned in this build are ever installed */
         if (is_driver && !windivert_file_pinned(FILES[i].name)) continue;
-        _snwprintf(src, MAX_PATH, L"%ls\\%ls", src_dir, FILES[i].name);  src[MAX_PATH - 1] = 0;
-        _snwprintf(dst, MAX_PATH, L"%ls\\%ls", dst_dir, FILES[i].name);  dst[MAX_PATH - 1] = 0;
+        if (!path_join(src, MAX_PATH, src_dir, FILES[i].name) || !path_join(dst, MAX_PATH, dst_dir, FILES[i].name))
+            return 0;
         h = CreateFileW(src, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING,
                         FILE_FLAG_OPEN_REPARSE_POINT, NULL);
         if (h == INVALID_HANDLE_VALUE) {
@@ -655,8 +674,7 @@ int sys_install_copy(HANDLE self_exe, const wchar_t *running_exe, wchar_t *insta
         if (!ok) return 0;
     }
     /* the exe last: a task only ever points at a complete set of files */
-    _snwprintf(dst, MAX_PATH, L"%ls\\TurkishDPI.exe", dst_dir);  dst[MAX_PATH - 1] = 0;
-    return have_driver && install_one(self_exe, dst);
+    return have_driver && path_join(dst, MAX_PATH, dst_dir, L"TurkishDPI.exe") && install_one(self_exe, dst);
 }
 
 /* Deletes one of our own (admin-only) folders: only an admin-owned folder,
@@ -748,56 +766,216 @@ static int url_allowed(const wchar_t *url) {
     return n > sl && !_wcsnicmp(end - sl, sfx, sl);
 }
 
-/* GET https://github.com<path> (redirects followed, final host checked);
- * at most cap bytes into a malloc'ed buffer. */
-static int http_get(const char *path_a, size_t cap, unsigned char **out, size_t *len) {
-    wchar_t path[512], url[4096];
-    DWORD status = 0, sz = sizeof(status), usz = sizeof(url);
+/*
+ * GET https://github.com<path>, following up to 3 redirects by hand (each
+ * target checked with url_allowed before we connect to it); at most cap
+ * bytes into a malloc'ed buffer.
+ *
+ * total_ms bounds the download: it runs on the controller thread, and
+ * WinHTTP's own per-phase timeouts (and its automatic redirects, which start
+ * a whole new resolve/connect/send/receive inside ReceiveResponse) would let
+ * a slow or throttled network block the controller for minutes or hours.
+ * So redirects are followed here, the deadline is checked before every
+ * blocking call (no call starts after it), and every timeout that call can
+ * use is set to min(time left, its maximum), never 0 (WinHTTP's "infinite"):
+ *   WinHttpSendRequest        resolve <= 10 s, connect <= 15 s (once per
+ *                             address the name resolves to), send <= 30 s;
+ *                             the TLS handshake inside it uses the send and
+ *                             receive timeouts (<= 30 s each) per network
+ *                             operation - it is NOT known to be bounded as a
+ *                             whole (not measured), only per receive/send
+ *   WinHttpReceiveResponse    <= 30 s (receive timeout and
+ *                             WINHTTP_OPTION_RECEIVE_RESPONSE_TIMEOUT, default
+ *                             90 s; that option may be unsupported on old
+ *                             systems, then the receive timeout still holds)
+ *   WinHttpQueryDataAvailable waits for the next data: <= one receive
+ *                             timeout (<= 30 s)
+ *   WinHttpReadData           asks only for what QueryDataAvailable reported,
+ *                             which is already buffered: returns at once. (A
+ *                             large ReadData would keep receiving until its
+ *                             buffer is full - the receive timeout applies to
+ *                             each internal receive, not to the call - so a
+ *                             drip-fed body could hold one call for minutes.)
+ * True worst case: the deadline plus one call started just before it -
+ * SendRequest: 10 + 15 s (+15 s per extra address) + its send/handshake
+ * operations (each <= 30 s, their number not bounded by us); the others
+ * <= 30 s. The calls without network I/O (WinHttpOpen/Connect/OpenRequest,
+ * QueryHeaders/QueryOption/SetOption) are not bounded separately.
+ * Returns HG_OK, HG_FAIL, HG_TIMEOUT or HG_TOO_BIG; *detail is a short
+ * English reason for every failure ("HTTP 404", "error 12175", "redirect
+ * refused", "too many redirects", "took longer than 30 seconds", "too
+ * large") - never a URL (the signed redirect URL must not be logged).
+ */
+enum { HG_OK = 1, HG_FAIL = 0, HG_TIMEOUT = -1, HG_TOO_BIG = -2 };
+#ifndef WINHTTP_OPTION_RECEIVE_RESPONSE_TIMEOUT
+#define WINHTTP_OPTION_RECEIVE_RESPONSE_TIMEOUT 7
+#endif
+
+/* ms until deadline (0 = passed), never more than 0x7FFFFFFF */
+static DWORD ms_left(ULONGLONG deadline) {
+    ULONGLONG now = GetTickCount64();
+    if (now >= deadline) return 0;
+    return deadline - now > 0x7FFFFFFFull ? 0x7FFFFFFFu : (DWORD)(deadline - now);
+}
+
+/* min(left, max), at least 1: a WinHTTP timeout of 0 means "infinite" */
+static int capped(DWORD left, int max) {
+    int v = left < (DWORD)max ? (int)left : max;
+    return v < 1 ? 1 : v;
+}
+
+/* Caps every timeout of request r to the time left. */
+static void hop_timeouts(HINTERNET r, DWORD left) {
+    DWORD rr = (DWORD)capped(left, 30000);
+    WinHttpSetTimeouts(r, capped(left, 10000), capped(left, 15000), capped(left, 30000), capped(left, 30000));
+    /* header phase (default 90 s); may be unsupported on old systems: the
+     * receive timeout above still applies, so a failure is ignored */
+    WinHttpSetOption(r, WINHTTP_OPTION_RECEIVE_RESPONSE_TIMEOUT, &rr, sizeof(rr));
+}
+
+static int http_get(const char *path_a, size_t cap, DWORD total_ms, unsigned char **out, size_t *len,
+                    const char **detail) {
+    static char det[64];   /* controller thread only */
+    wchar_t url[4096], host[256];
     HINTERNET s, c = NULL, r = NULL;
     unsigned char *buf = NULL;
     size_t n = 0, have = 0;
-    int ok = 0;
+    const size_t limit = cap + 1;   /* room to see that a body is longer than cap */
+    const ULONGLONG deadline = GetTickCount64() + total_ms;
+    DWORD err = 0;                  /* GetLastError() of the failing call */
+    int rc = HG_FAIL, hop;
     *out = NULL;
     *len = 0;
-    if (!MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, path_a, -1, path, 512)) return 0;
+    *detail = "failed";
+    {   /* the path is UTF-8 in our own code */
+        wchar_t p[1024];
+        if (!MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, path_a, -1, p, 1024) ||
+            !wfmt(url, 4096, L"https://github.com%ls", p)) {
+            *detail = "bad path";
+            return HG_FAIL;
+        }
+    }
     s = WinHttpOpen(L"TurkishDPI/" TURKISHDPI_VERSION_W, WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
                     WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
-    if (!s) return 0;
+    if (!s) {
+        snprintf(det, sizeof(det), "error %lu", (unsigned long)GetLastError());
+        *detail = det;
+        return HG_FAIL;
+    }
     sysdll_winhttp_tls(s);
-    WinHttpSetTimeouts(s, 10000, 15000, 30000, 30000);
-    c = WinHttpConnect(s, L"github.com", INTERNET_DEFAULT_HTTPS_PORT, 0);
-    if (c) r = WinHttpOpenRequest(c, L"GET", path, NULL, WINHTTP_NO_REFERER,
-                                  WINHTTP_DEFAULT_ACCEPT_TYPES, WINHTTP_FLAG_SECURE);
-    if (r && WinHttpSendRequest(r, WINHTTP_NO_ADDITIONAL_HEADERS, 0, WINHTTP_NO_REQUEST_DATA, 0, 0, 0) &&
-        WinHttpReceiveResponse(r, NULL) &&
-        WinHttpQueryHeaders(r, WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
-                            WINHTTP_HEADER_NAME_BY_INDEX, &status, &sz, WINHTTP_NO_HEADER_INDEX) &&
-        status == 200 && WinHttpQueryOption(r, WINHTTP_OPTION_URL, url, &usz) && url_allowed(url)) {
-        ok = 1;
+
+    for (hop = 0;; hop++) {
+        DWORD status = 0, sz = sizeof(status), left, nofollow = WINHTTP_DISABLE_REDIRECTS;
+        const wchar_t *h, *path;
+        size_t hl;
+        if (hop == 4) { *detail = "too many redirects"; break; }
+        if (!url_allowed(url)) { *detail = "redirect refused"; break; }   /* hop 0 is always allowed */
+        h = url + 8;
+        path = wcschr(h, L'/');                               /* url_allowed: present, no port */
+        hl = (size_t)(path - h);
+        if (hl >= sizeof(host) / sizeof(host[0])) { *detail = "redirect refused"; break; }
+        memcpy(host, h, hl * sizeof(wchar_t));
+        host[hl] = 0;
+        if ((left = ms_left(deadline)) == 0) { rc = HG_TIMEOUT; break; }
+        if (!(c = WinHttpConnect(s, host, INTERNET_DEFAULT_HTTPS_PORT, 0)) ||
+            !(r = WinHttpOpenRequest(c, L"GET", path, NULL, WINHTTP_NO_REFERER,
+                                     WINHTTP_DEFAULT_ACCEPT_TYPES, WINHTTP_FLAG_SECURE)) ||
+            !WinHttpSetOption(r, WINHTTP_OPTION_DISABLE_FEATURE, &nofollow, sizeof(nofollow))) {
+            err = GetLastError();
+            break;
+        }
+        hop_timeouts(r, left);
+        if (!WinHttpSendRequest(r, WINHTTP_NO_ADDITIONAL_HEADERS, 0, WINHTTP_NO_REQUEST_DATA, 0, 0, 0)) {
+            err = GetLastError();
+            if (!ms_left(deadline)) rc = HG_TIMEOUT;
+            break;
+        }
+        if ((left = ms_left(deadline)) == 0) { rc = HG_TIMEOUT; break; }
+        hop_timeouts(r, left);
+        if (!WinHttpReceiveResponse(r, NULL)) {
+            err = GetLastError();
+            if (!ms_left(deadline)) rc = HG_TIMEOUT;
+            break;
+        }
+        if (!WinHttpQueryHeaders(r, WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
+                                 WINHTTP_HEADER_NAME_BY_INDEX, &status, &sz, WINHTTP_NO_HEADER_INDEX)) {
+            err = GetLastError();
+            break;
+        }
+        if (status == 301 || status == 302 || status == 303 || status == 307 || status == 308) {
+            DWORD lsz = sizeof(url) - sizeof(wchar_t);
+            /* absolute https URL expected; a relative, over-long or missing
+             * Location is refused (url_allowed on the next round) */
+            if (!WinHttpQueryHeaders(r, WINHTTP_QUERY_LOCATION, WINHTTP_HEADER_NAME_BY_INDEX, url, &lsz,
+                                     WINHTTP_NO_HEADER_INDEX)) {
+                *detail = "redirect refused";
+                break;
+            }
+            url[lsz / sizeof(wchar_t) < 4095 ? lsz / sizeof(wchar_t) : 4095] = 0;
+            WinHttpCloseHandle(r);
+            r = NULL;
+            WinHttpCloseHandle(c);
+            c = NULL;
+            continue;
+        }
+        if (status != 200) {
+            snprintf(det, sizeof(det), "HTTP %lu", (unsigned long)status);
+            *detail = det;
+            break;
+        }
+        rc = HG_OK;
         for (;;) {
-            DWORD got = 0;
+            DWORD got = 0, avail = 0, rt, want;
+            if ((left = ms_left(deadline)) == 0) { rc = HG_TIMEOUT; break; }
+            rt = (DWORD)capped(left, 30000);
+            WinHttpSetOption(r, WINHTTP_OPTION_RECEIVE_TIMEOUT, &rt, sizeof(rt));
+            /* waits for the next data, at most one receive timeout */
+            if (!WinHttpQueryDataAvailable(r, &avail)) {
+                err = GetLastError();
+                rc = ms_left(deadline) ? HG_FAIL : HG_TIMEOUT;
+                break;
+            }
+            if (!avail) break;                               /* end of the body */
             if (n == have) {
                 size_t nc = have ? have * 2 : 256 * 1024;
                 unsigned char *nb;
-                if (have >= cap) { ok = 0; break; }   /* larger than any real package */
-                if (nc > cap) nc = cap;
+                if (have >= limit) { rc = HG_TOO_BIG; break; }   /* more than cap bytes */
+                if (nc > limit) nc = limit;
                 nb = (unsigned char *)realloc(buf, nc);
-                if (!nb) { ok = 0; break; }
+                if (!nb) { *detail = "out of memory"; rc = HG_FAIL; break; }
                 buf = nb;
                 have = nc;
             }
-            if (!WinHttpReadData(r, buf + n, (DWORD)(have - n), &got)) { ok = 0; break; }
+            /* only what is buffered already: this returns at once */
+            want = have - n < avail ? (DWORD)(have - n) : avail;
+            if (!WinHttpReadData(r, buf + n, want, &got)) {
+                err = GetLastError();
+                rc = ms_left(deadline) ? HG_FAIL : HG_TIMEOUT;
+                break;
+            }
             if (!got) break;
             n += got;
         }
+        if (rc == HG_OK && n > cap) rc = HG_TOO_BIG;
+        break;
     }
     if (r) WinHttpCloseHandle(r);
     if (c) WinHttpCloseHandle(c);
     WinHttpCloseHandle(s);
-    if (!ok) { free(buf); return 0; }
+    if (rc == HG_TIMEOUT) {
+        snprintf(det, sizeof(det), "took longer than %lu seconds", (unsigned long)(total_ms / 1000));
+        *detail = det;
+    } else if (rc == HG_TOO_BIG) {
+        *detail = "too large";
+    } else if (rc == HG_FAIL && err) {
+        snprintf(det, sizeof(det), "error %lu", (unsigned long)err);
+        *detail = det;
+    }
+    if (rc != HG_OK) { free(buf); return rc; }
+    *detail = "";
     *out = buf;
     *len = n;
-    return 1;
+    return HG_OK;
 }
 
 /* The folder the exe runs from, opened without following a link; its real
@@ -809,6 +987,15 @@ static HANDLE open_update_dir(const wchar_t *running_exe, wchar_t *real, DWORD c
     if (!GetFullPathNameW(running_exe, MAX_PATH, dir, NULL) || !(slash = wcsrchr(dir, L'\\')))
         return INVALID_HANDLE_VALUE;
     *slash = 0;
+    /* Full sharing on purpose. Paths built from real stay valid because NTFS
+     * refuses to rename a folder (or any folder above it) while a handle to
+     * something inside it is open - and our own lock on the running exe is
+     * always open during an update. Denying delete sharing here would add
+     * nothing and would only make this open fail whenever another process
+     * holds the folder with DELETE access. That NTFS rule was verified on
+     * NTFS only (not on FAT/exFAT or network shares); everywhere the code
+     * relies on its own later checks instead - final paths, path_within and
+     * file IDs on the handles it acts on. */
     h = CreateFileW(dir, FILE_LIST_DIRECTORY | FILE_TRAVERSE | FILE_READ_ATTRIBUTES | SYNCHRONIZE,
                     FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, NULL, OPEN_EXISTING,
                     FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT, NULL);
@@ -832,16 +1019,20 @@ typedef struct { union { LONG Status; PVOID Pointer; } u; ULONG_PTR Information;
 typedef LONG (NTAPI *nt_set_info_t)(HANDLE, upd_iosb_t *, PVOID, ULONG, int);
 #define UPD_FILE_RENAME_INFORMATION 10
 
-static int rename_in(HANDLE f, HANDLE dirh, const wchar_t *name, int replace) {
+/* Returns the NTSTATUS (>= 0 success; STATUS_ACCESS_DENIED when f lacks
+ * DELETE access, STATUS_OBJECT_NAME_COLLISION when the name is taken and
+ * replace is 0). */
+static LONG rename_in_st(HANDLE f, HANDLE dirh, const wchar_t *name, int replace) {
     union { FILE_RENAME_INFO ri; BYTE b[sizeof(FILE_RENAME_INFO) + MAX_PATH * sizeof(wchar_t)]; } u;
     static nt_set_info_t set_info;
     upd_iosb_t io;
     size_t n = wcslen(name);
-    if (n == 0 || n >= MAX_PATH || wcschr(name, L'\\') || wcschr(name, L'/') || wcschr(name, L':')) return 0;
+    if (n == 0 || n >= MAX_PATH || wcschr(name, L'\\') || wcschr(name, L'/') || wcschr(name, L':'))
+        return (LONG)0xC0000033L;   /* STATUS_OBJECT_NAME_INVALID */
     if (!set_info) {
         HMODULE nt = GetModuleHandleW(L"ntdll.dll");
         set_info = nt ? (nt_set_info_t)(void *)GetProcAddress(nt, "NtSetInformationFile") : NULL;
-        if (!set_info) return 0;
+        if (!set_info) return (LONG)0xC0000002L;   /* STATUS_NOT_IMPLEMENTED */
     }
     ZeroMemory(&u, sizeof(u));
     u.ri.ReplaceIfExists = replace ? TRUE : FALSE;
@@ -849,7 +1040,11 @@ static int rename_in(HANDLE f, HANDLE dirh, const wchar_t *name, int replace) {
     u.ri.FileNameLength = (DWORD)(n * sizeof(wchar_t));
     memcpy(u.ri.FileName, name, n * sizeof(wchar_t));
     return set_info(f, &io, &u.ri, (ULONG)(sizeof(FILE_RENAME_INFO) + n * sizeof(wchar_t)),
-                    UPD_FILE_RENAME_INFORMATION) >= 0;
+                    UPD_FILE_RENAME_INFORMATION);
+}
+
+static int rename_in(HANDLE f, HANDLE dirh, const wchar_t *name, int replace) {
+    return rename_in_st(f, dirh, name, replace) >= 0;
 }
 
 /* 1 if the open file holds exactly data[0..len) (read from the start). */
@@ -875,8 +1070,7 @@ static int file_equals(const wchar_t *real, const wchar_t *name, const unsigned 
     BY_HANDLE_FILE_INFORMATION fi;
     HANDLE h;
     int same;
-    if (_snwprintf(path, MAX_PATH - 1, L"%ls\\%ls", real, name) < 0) return 0;
-    path[MAX_PATH - 1] = 0;
+    if (!path_join(path, MAX_PATH, real, name)) return 0;
     h = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, FILE_FLAG_OPEN_REPARSE_POINT, NULL);
     if (h == INVALID_HANDLE_VALUE) return 0;
     same = GetFileInformationByHandle(h, &fi) && !(fi.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) &&
@@ -899,8 +1093,7 @@ static HANDLE write_new(const wchar_t *real, const wchar_t *name, const unsigned
     wchar_t path[MAX_PATH], fp[MAX_PATH * 2];
     size_t pos = 0;
     HANDLE h;
-    if (_snwprintf(path, MAX_PATH - 1, L"%ls\\%ls", real, name) < 0) return INVALID_HANDLE_VALUE;
-    path[MAX_PATH - 1] = 0;
+    if (!path_join(path, MAX_PATH, real, name)) return INVALID_HANDLE_VALUE;
     if (!delete_object(path, real, 0)) return INVALID_HANDLE_VALUE;
     h = CreateFileW(path, GENERIC_READ | GENERIC_WRITE | DELETE, 0, NULL, CREATE_NEW,
                     FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OPEN_REPARSE_POINT, NULL);
@@ -921,8 +1114,7 @@ static int replace_file(HANDLE dirh, const wchar_t *real, const wchar_t *name,
     wchar_t tmp[MAX_PATH];
     HANDLE h;
     if (file_equals(real, name, data, len)) return 1;
-    if (_snwprintf(tmp, MAX_PATH - 1, L"%ls.upd-new", name) < 0) return 0;
-    tmp[MAX_PATH - 1] = 0;
+    if (!wfmt(tmp, MAX_PATH, L"%ls.upd-new", name)) return 0;
     if ((h = write_new(real, tmp, data, len)) == INVALID_HANDLE_VALUE) return 0;
     if (!rename_in(h, dirh, name, 1)) { discard(h); return 0; }
     CloseHandle(h);
@@ -942,31 +1134,328 @@ static int same_file(const BY_HANDLE_FILE_INFORMATION *a, const BY_HANDLE_FILE_I
            a->nFileIndexLow == b->nFileIndexLow;
 }
 
-/* Re-opens the running exe like lock_self_exe (read, no write/delete
- * sharing) and checks it is the same file as before. */
-static HANDLE relock_self(const wchar_t *running_exe, const BY_HANDLE_FILE_INFORMATION *was) {
-    BY_HANDLE_FILE_INFORMATION fi;
-    HANDLE h = CreateFileW(running_exe, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, 0, NULL);
-    if (h == INVALID_HANDLE_VALUE) return h;
-    if (!GetFileInformationByHandle(h, &fi) || !same_file(&fi, was)) {
-        CloseHandle(h);
-        return INVALID_HANDLE_VALUE;
+/* Opens the running exe by path for the move: read + delete access, sharing
+ * only reads (nobody else may write, rename or delete it while we hold it),
+ * no link followed, and it must be the file we had locked. A scanner may
+ * hold the file for a moment, so a few short retries. */
+static HANDLE open_original(const wchar_t *path, const BY_HANDLE_FILE_INFORMATION *was) {
+    for (int i = 0; i < 20; i++) {
+        BY_HANDLE_FILE_INFORMATION fi;
+        HANDLE h = CreateFileW(path, GENERIC_READ | DELETE | SYNCHRONIZE | FILE_READ_ATTRIBUTES, FILE_SHARE_READ,
+                               NULL, OPEN_EXISTING, FILE_FLAG_OPEN_REPARSE_POINT, NULL);
+        if (h != INVALID_HANDLE_VALUE) {
+            if (GetFileInformationByHandle(h, &fi) && same_file(&fi, was)) return h;
+            CloseHandle(h);
+            return INVALID_HANDLE_VALUE;          /* another file under that name */
+        }
+        if (GetLastError() != ERROR_SHARING_VIOLATION) return INVALID_HANDLE_VALUE;
+        Sleep(50);
     }
-    return h;
+    return INVALID_HANDLE_VALUE;
+}
+
+/* Re-opens the running exe like lock_self_exe (read, no write/delete
+ * sharing) and checks it is the same file as before; a few short retries. */
+static HANDLE relock_self(const wchar_t *running_exe, const BY_HANDLE_FILE_INFORMATION *was) {
+    for (int i = 0; i < 20; i++) {
+        BY_HANDLE_FILE_INFORMATION fi;
+        HANDLE h = CreateFileW(running_exe, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, 0, NULL);
+        if (h != INVALID_HANDLE_VALUE) {
+            if (GetFileInformationByHandle(h, &fi) && same_file(&fi, was)) return h;
+            CloseHandle(h);
+            return INVALID_HANDLE_VALUE;
+        }
+        if (GetLastError() != ERROR_SHARING_VIOLATION) return INVALID_HANDLE_VALUE;
+        Sleep(50);
+    }
+    return INVALID_HANDLE_VALUE;
+}
+
+/* Renames the open file f to a free "<base>.<number>.old" in dirh (the name
+ * sys_update_cleanup removes at the next start). Returns the NTSTATUS of the
+ * last attempt (>= 0 on success). */
+static LONG rename_aside(HANDLE f, HANDLE dirh, const wchar_t *base) {
+    LONG st = (LONG)0xC0000033L;   /* STATUS_OBJECT_NAME_INVALID */
+    DWORD t = GetTickCount();
+    for (DWORD k = 0; k < 8; k++) {
+        wchar_t name[MAX_PATH];
+        if (!wfmt(name, MAX_PATH, L"%ls.%lu.old", base, (unsigned long)(t + k))) return st;
+        st = rename_in_st(f, dirh, name, 0);
+        if (st >= 0 || st != (LONG)0xC0000035L) return st;   /* only a name collision is worth another try */
+    }
+    return st;
+}
+
+/*
+ * Puts the original exe (open handle ho) back under its name, whatever sits
+ * there now: a plain file that nobody holds open is replaced by the rename
+ * itself; anything else (a file held open with delete sharing, a link, a
+ * directory) is opened without following links, checked to be in the
+ * folder, and renamed aside first. Fails only when the name cannot be freed
+ * (held open without delete sharing, or a directory with open files).
+ * A squatter DIRECTORY moved aside to "<name>.<n>.old" stays there for good:
+ * sys_update_cleanup skips directories (no recursive deletes in a folder
+ * that may be Downloads).
+ */
+static int put_back(HANDLE ho, HANDLE dirh, const wchar_t *real, const wchar_t *base) {
+    wchar_t path[MAX_PATH], fp[MAX_PATH * 2];
+    if (!path_join(path, MAX_PATH, real, base)) return 0;
+    for (int attempt = 0; attempt < 4; attempt++) {
+        HANDLE h;
+        int moved = 0;
+        if (rename_in(ho, dirh, base, 1)) return 1;
+        h = open_entry(path, DELETE | FILE_READ_ATTRIBUTES);
+        if (h == INVALID_HANDLE_VALUE) {
+            DWORD e = GetLastError();
+            if (e == ERROR_FILE_NOT_FOUND || e == ERROR_PATH_NOT_FOUND) continue;   /* gone meanwhile */
+            return 0;
+        }
+        /* exactly real\base: the entry itself, in this folder */
+        if (final_path(h, fp, MAX_PATH * 2) && !_wcsicmp(fp, path)) moved = rename_aside(h, dirh, base) >= 0;
+        CloseHandle(h);
+        if (!moved) return 0;
+    }
+    return 0;
+}
+
+#ifdef UPD_TEST
+/* tests/upd_swap_test.c: plays the other process at these points */
+enum { UPD_STEP_UNLOCKED = 1, UPD_STEP_MOVED_ASIDE, UPD_STEP_NEW_IN_PLACE };
+void upd_test_hook(int step, const wchar_t *real, const wchar_t *base);
+#define UPD_HOOK(step) upd_test_hook((step), real, base)
+#else
+#define UPD_HOOK(step) ((void)0)
+#endif
+
+/*
+ * (b) of the update: installs the checked package files (data/dlen as in
+ * UPD_ITEMS, data[0] = the exe) into the folder the running exe is in.
+ * self_exe: the running exe's lock (read, no write/delete sharing). app.c's
+ * lock_self_exe opens it read-only - and must stay that way: a freshly
+ * updated process locks its exe while the old one still holds the update
+ * lock - so it is closed and re-opened with DELETE access for the move. The
+ * handle handed back after a failed update already has DELETE access; such
+ * a handle is used for the move directly.
+ *
+ * Invariant: from the moment the running exe is moved aside until the end,
+ * a handle to it (ho, sharing only reads) stays open, so it cannot be
+ * changed, replaced or held by anyone else, and every failure puts it back
+ * under its name - replacing or moving away whatever sits there - and keeps
+ * ho as the new lock. Results 1, 0 and -1 leave either the old exe or the
+ * verified new exe (locked in *lock_out) under the exe's name, no temp file,
+ * and no handle of ours open besides that lock. Only -2 differs, and no
+ * handle is handed back: either another process holds the name without
+ * delete sharing - whatever file sits there is NOT verified (it is never
+ * started by us) and the old exe stays as <name>.<n>.old - or the running
+ * exe could not be re-opened/re-locked after the read-only lock was closed,
+ * so for a moment it was unlocked and may have been moved anywhere. Texts are only replaced
+ * after the exe step succeeded, so a failed update never mixes versions.
+ * Returns as sys_update_install.
+ */
+static int upd_install_files(HANDLE *self_exe, const wchar_t *running_exe, unsigned char *const data[],
+                             const size_t dlen[], HANDLE *lock_out, const char **why) {
+    static char why_buf[160];
+    wchar_t real[MAX_PATH * 2], base[MAX_PATH], tmp[MAX_PATH], cur[MAX_PATH], wname[64], fp[MAX_PATH * 2];
+    const wchar_t *slash;
+    BY_HANDLE_FILE_INFORMATION self_fi, new_fi, fi;
+    HANDLE dirh, hn = INVALID_HANDLE_VALUE, ho = INVALID_HANDLE_VALUE, lock;
+    LONG st;
+    int rc = 0;
+
+    *lock_out = INVALID_HANDLE_VALUE;
+    *why = "";
+    base[0] = 0;
+
+    /* 1. where we run from: the folder (it cannot be renamed while our lock
+     * on the exe inside it is open, see open_update_dir), and the exe's real (long) name in it taken from its locked handle - the start
+     * path may use 8.3 names */
+    if ((dirh = open_update_dir(running_exe, real, MAX_PATH * 2)) == INVALID_HANDLE_VALUE) {
+        *why = "open folder";
+        return 0;
+    }
+    if (!final_path(*self_exe, fp, MAX_PATH * 2) || !path_within(fp, real, 0) ||
+        !(slash = wcsrchr(fp, L'\\')) || slash != fp + wcslen(real) || wcslen(slash + 1) + 24 >= MAX_PATH) {
+        *why = "exe path";
+        goto out;
+    }
+    wcscpy(base, slash + 1);
+    if (!path_join(cur, MAX_PATH, real, base) || !wfmt(tmp, MAX_PATH, L"%ls.upd-new", base)) {
+        *why = "exe path";
+        goto out;
+    }
+
+    /* 2. WinDivert must stay as it is: the running build pins these files.
+     * Every one the folder has must be in the zip with the same bytes. */
+    for (size_t i = 0; i < UPD_NITEMS; i++) {
+        wchar_t p[MAX_PATH];
+        DWORD attr;
+        if (UPD_ITEMS[i].kind != 1) continue;
+        MultiByteToWideChar(CP_UTF8, 0, UPD_ITEMS[i].name, -1, wname, 64);
+        if (!path_join(p, MAX_PATH, real, wname)) { *why = "exe path"; goto out; }
+        attr = GetFileAttributesW(p);
+        if (attr == INVALID_FILE_ATTRIBUTES &&
+            (GetLastError() == ERROR_FILE_NOT_FOUND || GetLastError() == ERROR_PATH_NOT_FOUND))
+            continue;   /* not used here: not installed either */
+        /* present (or not readable): the zip must hold exactly these bytes */
+        if (!data[i] || !file_equals(real, wname, data[i], dlen[i])) {
+            *why = "new WinDivert files (manual update needed)";
+            rc = -1;
+            goto out;
+        }
+    }
+
+    /* 3. the new exe, written under a temporary name (no sharing) */
+    if ((hn = write_new(real, tmp, data[0], dlen[0])) == INVALID_HANDLE_VALUE ||
+        !GetFileInformationByHandle(hn, &new_fi)) {
+        *why = "write exe";
+        goto out;
+    }
+    if (!GetFileInformationByHandle(*self_exe, &self_fi)) { *why = "self info"; goto out; }
+
+    /* 4. the running exe moved aside; ho stays open until the end */
+    st = rename_aside(*self_exe, dirh, base);
+    if (st >= 0) {
+        ho = *self_exe;                     /* DELETE access (handed back by a failed
+                                             * update): no unlocked moment at all */
+        *self_exe = INVALID_HANDLE_VALUE;
+    } else if (st == (LONG)0xC0000022L) {   /* STATUS_ACCESS_DENIED: lock_self_exe's read-only lock */
+        /* it denies delete sharing, so it must go before a DELETE handle can
+         * be opened; the gap is closed again by open_original, which shares
+         * only reads */
+        CloseHandle(*self_exe);
+        *self_exe = INVALID_HANDLE_VALUE;
+        UPD_HOOK(UPD_STEP_UNLOCKED);
+        ho = open_original(cur, &self_fi);
+        if (ho == INVALID_HANDLE_VALUE) {
+            *why = "running exe busy or not found in its folder";
+            *self_exe = relock_self(running_exe, &self_fi);
+            if (*self_exe == INVALID_HANDLE_VALUE) {
+                *why = "running exe busy or replaced; it could not be locked again";
+                rc = -2;
+            }
+            goto out;
+        }
+        if (rename_aside(ho, dirh, base) < 0) {
+            *why = "move running exe aside";
+            *self_exe = ho;                 /* reads shared only: a valid lock */
+            ho = INVALID_HANDLE_VALUE;
+            goto out;
+        }
+    } else {
+        *why = "move running exe aside";    /* nothing moved, *self_exe untouched */
+        goto out;
+    }
+    UPD_HOOK(UPD_STEP_MOVED_ASIDE);
+
+    /* 5. the new exe under the exe's name */
+    if (!rename_in(hn, dirh, base, 0)) { *why = "move new exe in place"; goto restore; }
+    CloseHandle(hn);                        /* write access must go before the lock below */
+    hn = INVALID_HANDLE_VALUE;
+    UPD_HOOK(UPD_STEP_NEW_IN_PLACE);
+
+    /* 6. the file that will be started: our file (same ID), locked against
+     * changes, one link, no reparse point, at the exe's path, same bytes */
+    lock = CreateFileW(cur, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, FILE_FLAG_OPEN_REPARSE_POINT, NULL);
+    if (lock == INVALID_HANDLE_VALUE || !GetFileInformationByHandle(lock, &fi) || !same_file(&fi, &new_fi) ||
+        fi.nNumberOfLinks != 1 || (fi.dwFileAttributes & (FILE_ATTRIBUTE_REPARSE_POINT | FILE_ATTRIBUTE_DIRECTORY)) ||
+        !final_path(lock, fp, MAX_PATH * 2) || _wcsicmp(fp, cur) != 0 || !handle_equals(lock, data[0], dlen[0])) {
+        if (lock != INVALID_HANDLE_VALUE) CloseHandle(lock);
+        *why = "new exe changed or held open after writing";
+        goto restore;
+    }
+    CloseHandle(ho);                        /* the old exe stays as <name>.<n>.old (cleanup) */
+    ho = INVALID_HANDLE_VALUE;
+    *lock_out = lock;
+    rc = 1;
+
+    /* 7. texts (licences, read-me), only now: best effort */
+    for (size_t i = 0; i < UPD_NITEMS; i++) {
+        if (UPD_ITEMS[i].kind != 2 || !data[i]) continue;
+        MultiByteToWideChar(CP_UTF8, 0, UPD_ITEMS[i].name, -1, wname, 64);
+        replace_file(dirh, real, wname, data[i], dlen[i]);
+    }
+    goto out;
+
+restore:
+    /* our new file goes (by its handle, wherever it is named now) and the
+     * original comes back under its name; ho then is the lock again */
+    if (hn != INVALID_HANDLE_VALUE) { discard(hn); hn = INVALID_HANDLE_VALUE; }
+    if (put_back(ho, dirh, real, base)) {
+        *self_exe = ho;
+        ho = INVALID_HANDLE_VALUE;
+    } else {
+        snprintf(why_buf, sizeof(why_buf), "%s; the running exe could not be put back", *why);
+        *why = why_buf;
+        rc = -2;
+    }
+out:
+    if (hn != INVALID_HANDLE_VALUE) discard(hn);
+    if (ho != INVALID_HANDLE_VALUE) CloseHandle(ho);
+    CloseHandle(dirh);
+    return rc;
+}
+
+/*
+ * (a) of the update: downloads SHA256SUMS.txt and the package, checks the
+ * package's SHA-256 against it, extracts the UPD_ITEMS (data[i] malloc'ed or
+ * NULL when absent; caller frees) and checks the exe: this CPU, file version
+ * == the tag and newer than the running build. 1 ok, 0 failed (why).
+ */
+static int upd_fetch(const char *tag, unsigned char *data[], size_t dlen[], const char **why) {
+    char path[256], asset[96];
+    unsigned char *sums = NULL, *zip = NULL, want[32], got[32];
+    size_t sums_len = 0, zip_len = 0;
+    static char why_buf[96];   /* controller thread only */
+    uint64_t tag_ver = 0, exe_ver;
+    const char *detail = "";
+    int ok = 0;
+
+    if (!upd_tag_parse(tag, &tag_ver)) { *why = "bad tag"; return 0; }
+    snprintf(asset, sizeof(asset), "TurkishDPI-%s-" UPD_ARCH ".zip", tag);
+
+    /* checksums, then the package, checked against them */
+    snprintf(path, sizeof(path), TURKISHDPI_REPO_PATH_A "/releases/download/%s/SHA256SUMS.txt", tag);
+    if (http_get(path, 64 * 1024, 30 * 1000, &sums, &sums_len, &detail) != HG_OK) {
+        snprintf(why_buf, sizeof(why_buf), "download SHA256SUMS.txt: %s", detail);
+        *why = why_buf;
+        goto out;
+    }
+    if (!upd_sums_find((const char *)sums, sums_len, asset, want)) { *why = "zip not in SHA256SUMS.txt"; goto out; }
+    snprintf(path, sizeof(path), TURKISHDPI_REPO_PATH_A "/releases/download/%s/%s", tag, asset);
+    if (http_get(path, 64u * 1024 * 1024, 3 * 60 * 1000, &zip, &zip_len, &detail) != HG_OK) {
+        snprintf(why_buf, sizeof(why_buf), "download zip: %s", detail);
+        *why = why_buf;
+        goto out;
+    }
+    if (!sha256_mem(zip, zip_len, got) || memcmp(want, got, 32) != 0) { *why = "zip SHA-256 mismatch"; goto out; }
+
+    /* the files we take from it */
+    for (size_t i = 0; i < UPD_NITEMS; i++) {
+        int e = upd_zip_extract(zip, zip_len, UPD_ITEMS[i].name, &data[i], &dlen[i]);
+        if (e < 0) { *why = "broken zip"; goto out; }
+        if (e == 0 && UPD_ITEMS[i].kind == 0) { *why = "no exe in zip"; goto out; }
+    }
+    if (upd_pe_machine(data[0], dlen[0]) != UPD_MACHINE) { *why = "exe for another CPU"; goto out; }
+    /* the exe itself must be the tagged version and newer than this one: a
+     * release built from an un-bumped version.h would otherwise update every
+     * user in a loop, and an older exe under a newer tag would be a downgrade
+     * (the build number is not compared) */
+    exe_ver = upd_pe_file_version(data[0], dlen[0]);
+    if ((exe_ver & ~0xFFFFull) != tag_ver) { *why = "exe version differs from the tag"; goto out; }
+    if (tag_ver <= own_version()) { *why = "release is not newer than this version"; goto out; }
+    ok = 1;
+out:
+    free(zip);
+    free(sums);
+    return ok;
 }
 
 int sys_update_install(const wchar_t *tag_w, void **self_exe_p, const wchar_t *running_exe,
                        void **lock_out, const char **why) {
-    HANDLE *self_exe = (HANDLE *)self_exe_p;
-    char tag[32], path[256], asset[96];
-    unsigned char *sums = NULL, *zip = NULL, *data[UPD_NITEMS];
-    size_t sums_len = 0, zip_len = 0, dlen[UPD_NITEMS];
-    unsigned char want[32], got[32];
-    wchar_t real[MAX_PATH * 2], base[MAX_PATH], tmp[MAX_PATH], old[MAX_PATH], cur[MAX_PATH];
-    wchar_t wname[64], fp[MAX_PATH * 2];
-    const wchar_t *slash;
-    BY_HANDLE_FILE_INFORMATION self_fi, fi;
-    HANDLE dirh = INVALID_HANDLE_VALUE, hn = INVALID_HANDLE_VALUE, ho = INVALID_HANDLE_VALUE, lock;
+    char tag[32];
+    unsigned char *data[UPD_NITEMS];
+    size_t dlen[UPD_NITEMS];
+    HANDLE lock = INVALID_HANDLE_VALUE;
     int rc = 0;
 
     *lock_out = INVALID_HANDLE_VALUE;
@@ -977,147 +1466,65 @@ int sys_update_install(const wchar_t *tag_w, void **self_exe_p, const wchar_t *r
         *why = "bad tag";
         return 0;
     }
-    snprintf(asset, sizeof(asset), "TurkishDPI-%s-" UPD_ARCH ".zip", tag);
-
-    /* 1. checksums, then the package, checked against them */
-    snprintf(path, sizeof(path), TURKISHDPI_REPO_PATH_A "/releases/download/%s/SHA256SUMS.txt", tag);
-    if (!http_get(path, 64 * 1024, &sums, &sums_len)) { *why = "download SHA256SUMS.txt"; goto out; }
-    if (!upd_sums_find((const char *)sums, sums_len, asset, want)) { *why = "zip not in SHA256SUMS.txt"; goto out; }
-    snprintf(path, sizeof(path), TURKISHDPI_REPO_PATH_A "/releases/download/%s/%s", tag, asset);
-    if (!http_get(path, 64u * 1024 * 1024, &zip, &zip_len)) { *why = "download zip"; goto out; }
-    if (!sha256_mem(zip, zip_len, got) || memcmp(want, got, 32) != 0) { *why = "zip SHA-256 mismatch"; goto out; }
-
-    /* 2. the files we take from it */
-    for (size_t i = 0; i < UPD_NITEMS; i++) {
-        int r = upd_zip_extract(zip, zip_len, UPD_ITEMS[i].name, &data[i], &dlen[i]);
-        if (r < 0) { *why = "broken zip"; goto out; }
-        if (r == 0 && UPD_ITEMS[i].kind == 0) { *why = "no exe in zip"; goto out; }
+    if (upd_fetch(tag, data, dlen, why)) {
+        rc = upd_install_files((HANDLE *)self_exe_p, running_exe, data, dlen, &lock, why);
+        *lock_out = lock;
     }
-    if (upd_pe_machine(data[0], dlen[0]) != UPD_MACHINE) { *why = "exe for another CPU"; goto out; }
-
-    /* 3. where we run from: the folder, and the exe's real (long) name in it
-     * taken from its locked handle - the start path may use 8.3 names */
-    if ((dirh = open_update_dir(running_exe, real, MAX_PATH * 2)) == INVALID_HANDLE_VALUE) {
-        *why = "open folder";
-        goto out;
-    }
-    if (!final_path(*self_exe, fp, MAX_PATH * 2) || !path_within(fp, real, 0) ||
-        !(slash = wcsrchr(fp, L'\\')) || slash != fp + wcslen(real) || wcslen(slash + 1) + 24 >= MAX_PATH) {
-        *why = "exe path";
-        goto out;
-    }
-    wcscpy(base, slash + 1);
-    if (_snwprintf(cur, MAX_PATH - 1, L"%ls\\%ls", real, base) < 0) { *why = "exe path"; goto out; }
-    cur[MAX_PATH - 1] = 0;
-
-    /* 4. WinDivert must stay as it is: the running build pins these files */
-    for (size_t i = 0; i < UPD_NITEMS; i++) {
-        wchar_t p[MAX_PATH];
-        if (UPD_ITEMS[i].kind != 1 || !data[i]) continue;
-        MultiByteToWideChar(CP_UTF8, 0, UPD_ITEMS[i].name, -1, wname, 64);
-        _snwprintf(p, MAX_PATH - 1, L"%ls\\%ls", real, wname);
-        p[MAX_PATH - 1] = 0;
-        if (GetFileAttributesW(p) != INVALID_FILE_ATTRIBUTES && !file_equals(real, wname, data[i], dlen[i])) {
-            *why = "new WinDivert files (manual update needed)";
-            rc = -1;
-            goto out;
-        }
-    }
-
-    /* 5. texts (licences, read-me): best effort */
-    for (size_t i = 0; i < UPD_NITEMS; i++) {
-        if (UPD_ITEMS[i].kind != 2 || !data[i]) continue;
-        MultiByteToWideChar(CP_UTF8, 0, UPD_ITEMS[i].name, -1, wname, 64);
-        replace_file(dirh, real, wname, data[i], dlen[i]);
-    }
-
-    /* 6. the exe: new file ready, running one moved aside, new one in place */
-    _snwprintf(tmp, MAX_PATH - 1, L"%ls.upd-new", base);
-    tmp[MAX_PATH - 1] = 0;
-    _snwprintf(old, MAX_PATH - 1, L"%ls.%lu.old", base, GetTickCount());
-    old[MAX_PATH - 1] = 0;
-    if ((hn = write_new(real, tmp, data[0], dlen[0])) == INVALID_HANDLE_VALUE) { *why = "write exe"; goto out; }
-    if (!GetFileInformationByHandle(*self_exe, &self_fi)) { *why = "self info"; goto out; }
-    CloseHandle(*self_exe);       /* it denies delete sharing, which the rename needs */
-    *self_exe = INVALID_HANDLE_VALUE;
-    ho = CreateFileW(cur, DELETE | SYNCHRONIZE | FILE_READ_ATTRIBUTES,
-                     FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, NULL, OPEN_EXISTING,
-                     FILE_FLAG_OPEN_REPARSE_POINT, NULL);
-    if (ho == INVALID_HANDLE_VALUE || !GetFileInformationByHandle(ho, &fi) || !same_file(&fi, &self_fi)) {
-        *why = "running exe not found in its folder";
-        goto relock;
-    }
-    if (!rename_in(ho, dirh, old, 0)) { *why = "move running exe aside"; goto relock; }
-    if (!rename_in(hn, dirh, base, 0)) {
-        rename_in(ho, dirh, base, 0);   /* put the running one back */
-        *why = "move new exe in place";
-        goto relock;
-    }
-    CloseHandle(hn);
-    hn = INVALID_HANDLE_VALUE;
-    CloseHandle(ho);
-    ho = INVALID_HANDLE_VALUE;
-
-    /* 7. the file that will be started: locked against changes, verified */
-    lock = CreateFileW(cur, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, FILE_FLAG_OPEN_REPARSE_POINT, NULL);
-    if (lock == INVALID_HANDLE_VALUE || !GetFileInformationByHandle(lock, &fi) || fi.nNumberOfLinks != 1 ||
-        (fi.dwFileAttributes & (FILE_ATTRIBUTE_REPARSE_POINT | FILE_ATTRIBUTE_DIRECTORY)) ||
-        !final_path(lock, fp, MAX_PATH * 2) || _wcsicmp(fp, cur) != 0 || !handle_equals(lock, data[0], dlen[0])) {
-        if (lock != INVALID_HANDLE_VALUE) CloseHandle(lock);
-        *why = "new exe changed after writing";
-        rc = -2;    /* the running exe is already moved aside */
-        goto out;
-    }
-    *lock_out = lock;
-    rc = 1;
-    goto out;
-
-relock:
-    /* our own DELETE handle on the running exe would make the re-lock
-     * (which denies delete sharing) fail */
-    if (ho != INVALID_HANDLE_VALUE) { CloseHandle(ho); ho = INVALID_HANDLE_VALUE; }
-    *self_exe = relock_self(running_exe, &self_fi);
-    if (*self_exe == INVALID_HANDLE_VALUE) rc = -2;
-out:
-    if (hn != INVALID_HANDLE_VALUE) discard(hn);
-    if (ho != INVALID_HANDLE_VALUE) CloseHandle(ho);
-    if (dirh != INVALID_HANDLE_VALUE) CloseHandle(dirh);
     for (size_t i = 0; i < UPD_NITEMS; i++) free(data[i]);
-    free(zip);
-    free(sums);
     return rc;
 }
 
+/* 1 if w[0..n) is one of the UPD_ITEMS names (ASCII, case-insensitive). */
+static int upd_item_name(const wchar_t *w, size_t n) {
+    for (size_t i = 0; i < UPD_NITEMS; i++) {
+        const char *a = UPD_ITEMS[i].name;
+        size_t k = 0;
+        for (; k < n && a[k]; k++) {
+            wchar_t x = w[k], y = (wchar_t)(unsigned char)a[k];
+            if (x >= L'A' && x <= L'Z') x = (wchar_t)(x - L'A' + L'a');
+            if (y >= L'A' && y <= L'Z') y = (wchar_t)(y - L'A' + L'a');
+            if (x != y) break;
+        }
+        if (k == n && !a[k]) return 1;
+    }
+    return 0;
+}
+
+/*
+ * 1 if name is something an update of the exe called base leaves behind:
+ * "<base>.<digits>.old" (the previous exe, or whatever squatted the exe's
+ * name during a failed update) or "<n>.upd-new" where n is base or one of
+ * the package's file names. Nothing else: the folder may be Downloads.
+ */
+static int upd_leftover(const wchar_t *name, const wchar_t *base) {
+    size_t n = wcslen(name), bl = wcslen(base), d;
+    if (n > 8 && !_wcsicmp(name + n - 8, L".upd-new"))
+        return (n - 8 == bl && !_wcsnicmp(name, base, bl)) || upd_item_name(name, n - 8);
+    if (n < bl + 1 + 1 + 4 || _wcsnicmp(name, base, bl) || name[bl] != L'.' || _wcsicmp(name + n - 4, L".old"))
+        return 0;
+    for (d = bl + 1; d < n - 4; d++)
+        if (name[d] < L'0' || name[d] > L'9') return 0;
+    return d - (bl + 1) <= 10;   /* a DWORD tick count */
+}
+
 /* Removes what an update left in the exe's folder: the previous exe (moved
- * aside while it ran) and unfinished writes. Only our own name patterns. */
+ * aside while it ran) and unfinished writes. Only our own exact names
+ * (upd_leftover), each deleted through a handle that does not follow links.
+ * Directories are skipped, so a squatter directory that a failed update
+ * moved aside to "<name>.<n>.old" is left for the user. */
 void sys_update_cleanup(const wchar_t *running_exe) {
-    static const wchar_t *pats[] = { L"*.old", L"*.upd-new" };
     wchar_t real[MAX_PATH * 2], pat[MAX_PATH], path[MAX_PATH], longp[MAX_PATH];
     const wchar_t *slash;
     WIN32_FIND_DATAW fd;
     HANDLE dirh, f;
-    size_t bl;
     /* the long file name: the start path may use 8.3 names */
     if (!GetLongPathNameW(running_exe, longp, MAX_PATH) || !(slash = wcsrchr(longp, L'\\'))) return;
-    bl = wcslen(slash + 1);
     if ((dirh = open_update_dir(running_exe, real, MAX_PATH * 2)) == INVALID_HANDLE_VALUE) return;
-    for (int k = 0; k < 2; k++) {
-        if (_snwprintf(pat, MAX_PATH - 1, L"%ls\\%ls", real, pats[k]) < 0) continue;
-        pat[MAX_PATH - 1] = 0;
-        f = FindFirstFileW(pat, &fd);
-        if (f == INVALID_HANDLE_VALUE) continue;
+    if (path_join(pat, MAX_PATH, real, L"*") && (f = FindFirstFileW(pat, &fd)) != INVALID_HANDLE_VALUE) {
         do {
-            size_t n = wcslen(fd.cFileName);
-            int ours;
             if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
-            if (k == 0)   /* "<exe name>.<number>.old" */
-                ours = n > bl + 5 && !_wcsnicmp(fd.cFileName, slash + 1, bl) && fd.cFileName[bl] == L'.' &&
-                       !_wcsicmp(fd.cFileName + n - 4, L".old");
-            else          /* "<name>.upd-new" */
-                ours = n > 8 && !_wcsicmp(fd.cFileName + n - 8, L".upd-new");
-            if (!ours) continue;
-            if (_snwprintf(path, MAX_PATH - 1, L"%ls\\%ls", real, fd.cFileName) < 0) continue;
-            path[MAX_PATH - 1] = 0;
+            if (!upd_leftover(fd.cFileName, slash + 1)) continue;
+            if (!path_join(path, MAX_PATH, real, fd.cFileName)) continue;
             delete_object(path, real, 0);
         } while (FindNextFileW(f, &fd));
         FindClose(f);

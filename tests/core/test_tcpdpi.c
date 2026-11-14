@@ -46,7 +46,8 @@ static int mk_hdr(uint8_t *b, int sport, int dport, uint8_t flags, uint32_t seq)
 /* The one's-complement sum over a buffer is 0xffff when the checksum is right. */
 static int ip_csum_ok(const uint8_t *pkt, int ihl) {
   uint32_t s = 0; for (int i=0;i+1<ihl;i+=2) s += (uint32_t)((pkt[i]<<8)|pkt[i+1]);
-  while (s>>16) s=(s&0xffff)+(s>>16); return (s & 0xffff) == 0xffff;
+  while (s>>16) s=(s&0xffff)+(s>>16);
+  return (s & 0xffff) == 0xffff;
 }
 static int tcp_csum_ok(const uint8_t *pkt, int len, int ihl) {
   int tlen = len - ihl;
@@ -56,7 +57,8 @@ static int tcp_csum_ok(const uint8_t *pkt, int len, int ihl) {
   s += 6; s += (uint32_t)tlen;
   for (int i=0;i+1<tlen;i+=2) s += (uint32_t)((pkt[ihl+i]<<8)|pkt[ihl+i+1]);
   if (tlen & 1) s += (uint32_t)(pkt[ihl+tlen-1]<<8);
-  while (s>>16) s=(s&0xffff)+(s>>16); return (s & 0xffff) == 0xffff;
+  while (s>>16) s=(s&0xffff)+(s>>16);
+  return (s & 0xffff) == 0xffff;
 }
 
 /* ───────── injected-RST classifier ───────── */

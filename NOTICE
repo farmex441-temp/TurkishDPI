@@ -15,6 +15,13 @@ It includes software developed by:
 
 Binary releases bundle WinDivert 2.2.2 (https://reqrypt.org/windivert.html),
 distributed under the GNU LGPL v3 (WinDivert-LICENSE.txt).
+WinDivert is also available under the GNU GPL v2; its source code is at
+https://github.com/basil00/WinDivert. Release builds of TurkishDPI.exe load only
+a WinDivert.dll and driver whose SHA-256 matches the value pinned at build
+time (CI requires the pins; a local build without the WinDivert files in
+$(WINDIVERT) has none). To use a modified WinDivert, rebuild TurkishDPI
+with "make WINDIVERT=<folder>" (the pins are computed from the DLL and
+driver files in that folder, see the Makefile).
 
 Versions 1.x of TurkishDPI used a packet engine derived from GoodbyeDPI
 (ValdikSS, Apache License 2.0); since version 2.0 no GoodbyeDPI code remains.

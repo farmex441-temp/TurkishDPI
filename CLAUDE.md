@@ -69,36 +69,57 @@ src/app/            the app (controller, UI, probes, learning)
                     admin-only data folder (sys_secure_dir), protected
                     Program Files copy for autostart (sys_install_copy, never
                     replaces a newer copy), uninstall, one-click update
-                    (sys_update_install / sys_update_cleanup)
+                    (sys_update_install = upd_fetch + upd_install_files,
+                    http_get with a total deadline, sys_update_cleanup)
   updpkg.c/.h       update package reader: SHA256SUMS.txt lookup, zip (stored
-                    + own inflate, CRC-32), tag and PE checks; pure C, unit tested
+                    + own inflate, CRC-32), tag parse, PE machine and PE file
+                    version; pure C, unit tested
   presets.h         strategy presets ({DNS} placeholder) and clean DNS servers
   version.h         version + GitHub URLs
   TurkishDPI.rc, .exe.manifest, res/*.ico   resources (icons from tools/make_icons.py)
 src/engine/         the packet engine
-  engine.c/.h       command line (engine_main), WinDivert filter (build_filter),
-                    packet loop: IPv4 decoy/split/seqovl/tlsrec/RST-drop/autottl/
-                    QUIC/Discord-voice adapted from Shroudly raw_windows.c; own
-                    IPv6 split+decoy (build6/desync6, no extension headers),
-                    DNS redirection, payment exclusion, STATS reporter
-  core/             from Shroudly core/src (MIT, unchanged except a header
-                    line): proto (TLS/HTTP parse, decoy names), tcpdpi (segment
-                    builders, hop table, tlsrec seq translation), udpdpi (QUIC
-                    Initial, Discord voice), rawscope (local addresses, touched
-                    servers for RST drop, no-decoy table), raw_desync.h (config)
+  engine.c/.h       command line (engine_main), packet loop, sending what
+                    desync.c composed, RST-drop/autottl/QUIC/Discord-voice
+                    adapted from Shroudly raw_windows.c, DNS redirection,
+                    payment exclusion, STATS reporter
+  desync.c/.h       pure: composes the finished packets for one first request
+                    (decoy, cut, fakedsplit/fakeddisorder, seqovl, tlsrec,
+                    IPv4 and IPv6 without extension headers); a captured
+                    packet up to 1500 bytes gives exactly the 2.0.1 output, a
+                    larger one is sent in pieces of <= 1200 payload bytes
+  policy.c/.h       pure: the WinDivert filter text (policy_build_filter, with
+                    a fit check) and the payment-exclusion precedence
+                    (policy_excluded, ECH public names)
+  core/             from Shroudly core/src (MIT): proto (TLS/HTTP parse, decoy
+                    names), tcpdpi (segment builders, hop table, tlsrec seq
+                    translation), udpdpi (QUIC Initial, Discord voice), rawscope
+                    (local addresses, touched servers for RST drop, no-decoy
+                    table), raw_desync.h (config). Unchanged except a header
+                    line, apart from tcpdpi.c/.h: TurkishDPI added
+                    `tcpdpi_xlate_fin` and the `fins`/`dead_at` fields (retire a
+                    tlsrec translation entry after both FINs) and a high-water
+                    mark so the per-packet lookup scans only used slots (marked
+                    `TurkishDPI:` in the source)
   dns.c/.h          own DNS question table + hybrid race verdicts + forged-answer
-                    check (block IPs, bogons, error rcodes, malformed = forged)
-  exclude.c/.h      payment/bank "never touch" list (SNI + IPs learned from DNS)
+                    check (block IPs, bogons, error rcodes, malformed = forged;
+                    LAN addresses allowed from a local resolver)
+  exclude.c/.h      payment/bank "never touch" list (names + IPs learned from
+                    DNS, expiring table, list-file loader)
   windivert_dyn.c   loads WinDivert.dll at runtime from the exe's folder only;
                     ARM64 Windows is refused with error 50 (no WinDivert driver)
   syslib.h          load_system_dll / load_dll_path: System32-only loading
                     that also works on Windows 7 without KB2533623
-tests/              unit tests (no admin): core/test_{proto,tcpdpi,udpdpi,rawscope}.c
-                    (Shroudly's, strategy parts removed), exclude_test.c, dns_test.c,
+tests/              unit tests (no admin), listed in .github/scripts/build-tests.sh
+                    (13): core/test_{proto,tcpdpi,udpdpi,rawscope}.c (Shroudly's,
+                    strategy parts removed), exclude_test.c, dns_test.c,
                     diag_test.c, updpkg_test.c (+ updpkg_vectors.h from Python's
-                    zlib; `updpkg_test pkg.zip name file` checks a real zip),
-                    xlate_test.c, windivert_hash_test.c (DLL + driver pinning, uses a
-                    stand-in DLL, never the driver); manual tools:
+                    zlib; `updpkg_test pkg.zip name file` checks a real zip;
+                    `--pe-version exe X.Y.Z` is what CI runs on the release
+                    exes), xlate_test.c, upd_swap_test.c (the updater's install
+                    half against real files), pieces_test.c, policy_test.c,
+                    desync_test.c. Not in the list: windivert_hash_test.c (DLL +
+                    driver pinning, stand-in DLL, never the driver; run by its own
+                    CI step); manual tools:
                     probe_test.c (network/latency/diagnosis), hosts_test.c
                     (DNS answer + TCP+TLS per host, e.g. Discord endpoints),
                     uia_probe.c (native UI Automation dump/invoke/tray rect -
@@ -113,8 +134,13 @@ tools/uia_e2e.ps1   elevated end-to-end check of the real app: --selftest,
                     UIA tree per page, autostart toggle on/off + task check,
                     tray icon, exit through the window (needs uia_probe.exe)
 docs/design/        UI audit, design system, screens, preview plan
-.github/workflows/build.yml   CI: tests on windows-latest, build x64/x86 on
-                    Ubuntu MinGW, package zips, GitHub Release on v* tags
+.github/workflows/build.yml   CI: tests (native Windows gcc, MSVC ASan for dns +
+                    exclude, Ubuntu ASan/UBSan), build x64/x86 on Ubuntu MinGW
+                    (tag guard, import allowlist, package zips), "smoke" job
+                    (runs the cross-built tests and the shipped exes), release
+                    job on v* tags (draft, verify, publish)
+.github/scripts/    build-tests.sh (the one list of unit tests, used by every
+                    job), smoke.ps1 (zip checks + --ui-preview scenarios)
 ```
 
 Runtime data: `%ProgramData%\TurkishDPI\` (admin-owned, protected DACL):
@@ -123,36 +149,62 @@ Runtime data: `%ProgramData%\TurkishDPI\` (admin-owned, protected DACL):
 ## Key behaviours (what was built and why)
 
 - **Auto scan** (`auto_scan`): no internet -> wait; measure all clean DNS servers
-  in parallel and keep the fastest; learn the ISP's block-page IPs (engine must
-  be stopped, so at most once per 24 h per network: `bt=` in `[net_<id>]`); try
-  presets in learned order; on a new network measure up to two extra working
-  presets and keep the fastest. The running engine stays on during the
+  in parallel and keep the fastest; with hybrid DNS on, learn the ISP's
+  block-page IPs (engine must be stopped; `bt=` in `[net_<id>]` holds the
+  time: a result is reused for 24 h per network, an empty result is retried
+  after 1 h - `block_ips_stale`/`learn_block_ips_if_stale`); try
+  presets in learned order; after the first preset that opens every target,
+  try up to two more presets that were not known on this network (`extra`
+  counts every preset whose engine started after the winner, working or not;
+  a non-fatal start failure is skipped before it counts) and keep the
+  fastest (a later preset replaces the winner only if it is more than 20%
+  faster); the walk stops at a preset already known on this network, and on a
+  network with more than one learned preset a known preset that works ends it
+  at once. A driver error from the engine (any code except 87, a filter
+  syntax error) is fatal after one attempt: `engine_fatal` shows the window
+  text from `windivert_error_text` (unknown codes get a generic text that
+  contains the code), tries no other preset and records no failure for any.
+  The running engine stays on during the
   measurements and `engine_start` keeps it when the arguments are identical,
   so a re-check that ends on the same preset drops no connection.
   Watchdog every `WatchdogMinutes` (1-240) with a second strike: a failed
   check is repeated after 20 s, only a repeated failure rescans. Network
   changes are debounced (4 s quiet, 20 s max). Partial mode only rescans if
-  it gets worse. Watchdog successes count in the learning stats once an hour.
+  it gets worse. Only every 6th successful check counts in the learning
+  stats (`health_record`; one counter shared by the watchdog and the
+  post-network-change check `health_ok(1)` in the controller loop), i.e.
+  hourly only at the default 10 minutes with no network changes. A confirmed
+  watchdog failure always counts (outside partial mode); the post-network-
+  change check has no second strike, so a single failure there counts at once.
 - **One-click update** (2.0.1): the update thread finds a newer
   `releases/latest` tag (digits and dots only); the banner's "Güncelle →"
-  posts `CMD_UPDATE`; the controller (`update_install` -> `sys_update_install`)
-  downloads `SHA256SUMS.txt` and `TurkishDPI-<tag>-<x64|x86>.zip` from
-  github.com (final URL must be github.com or *.githubusercontent.com, https),
-  checks the zip's SHA-256, extracts TurkishDPI.exe (+ licence/read-me texts)
-  and refuses (-1, opens the release page) if the zip's WinDivert files differ
-  from the ones next to the exe. In the exe's own folder (often user-writable):
+  posts `CMD_UPDATE`; the controller (`update_install` -> `sys_update_install`:
+  `upd_fetch`, then `upd_install_files`) downloads `SHA256SUMS.txt` (30 s total)
+  and `TurkishDPI-<tag>-<x64|x86>.zip` (3 min total) from github.com with
+  `http_get`, which follows redirects itself (each target must be https on
+  github.com or *.githubusercontent.com, at most 3) and bounds every blocking
+  WinHTTP call by the deadline; failures carry a short reason (`why`, logged as
+  `update: failed (...)`). It checks the zip's SHA-256, extracts the exe (+
+  licence/read-me texts) and requires the exe's PE file version to equal the tag
+  and be newer than the running build (`upd_pe_file_version`, CI checks the
+  release exes with the same parser). Every WinDivert file present next to the
+  exe must be in the zip with identical bytes, otherwise -1 (opens the release
+  page). In the exe's own folder (often user-writable):
   new files are created CREATE_NEW without following links, checked inside the
   folder, and renamed relative to the folder handle with
   `NtSetInformationFile` (SetFileInformationByHandle rejects a bare name with
   error 123); the running exe (lock handle closed first) is renamed to
   `<name>.<tick>.old`, the new one put in place, re-opened read-only without
-  delete sharing and compared byte by byte. On failure the running exe is
+  delete sharing and compared byte by byte. The licence/read-me texts are
+  replaced only after the exe is in place. On failure the running exe is
   renamed back and re-locked (our DELETE handle must be closed first) and the
-  banner says "Güncelleme yapılamadı". On success the UI thread
+  banner says "Güncelleme yapılamadı"; only when it cannot be put back or locked
+  again (-2) the app shows "Güncelleme tamamlanamadı…", opens the releases page
+  and exits (the file at the exe's name is not trusted). On success the UI thread
   (`app_update_done`) stops controller + engine, releases the instance mutex,
   starts the new exe suspended, resumes it only if its image is the locked
-  file (volume + file ID), and exits. The next start (>= 2.0.1) deletes
-  `<name>.*.old` / `*.upd-new` after 20 s (`sys_update_cleanup`).
+  file (volume + file ID), and exits. The next start deletes after 20 s
+  (`sys_update_cleanup`) only `<name>.<digits>.old` and `<known file>.upd-new`.
   Not code-signed: protects against broken/altered downloads, not against a
   compromised GitHub account (say so in docs).
 - **Explained decisions**: every scan/start has a reason (`set_reason`,
@@ -170,11 +222,20 @@ Runtime data: `%ProgramData%\TurkishDPI\` (admin-owned, protected DACL):
 - **Hybrid DNS** (`--dns-hybrid`, `--dns-block-ip`): each query goes to the
   system resolver *and* the clean one; first trustworthy answer wins; forged
   answers (block pages, bogons, NXDOMAIN/SERVFAIL/REFUSED from the ISP) dropped.
-- **Narrow filter** (`build_filter`): outbound only HTTP requests (port 80 with
-  payload) and TLS records 22/21 on 443 (ClientHello, client alerts); with
-  tlsrec every IPv4 443 segment (its sequence numbers move); QUIC Initials;
-  DNS port 53 out, answers from 53 (hybrid/learning) and from the clean
-  resolver's exact IP:port; inbound RST / SYN-ACK / TLS alerts from 80/443.
+  Exception (2.0.2): an answer from the resolver the question went to may carry
+  RFC 1918 / 169.254 addresses when that resolver is itself local (RFC 1918,
+  169.254, loopback, IPv6 ULA/link-local; not carrier CGNAT 100.64/10), so
+  router/NAS/intranet names resolve; 0/8, loopback, multicast, block-list
+  addresses and error rcodes stay forged for every resolver. Residual risk: a
+  home router forwards its ISP's answers, so a censor answering with a private
+  address passes unless that address is on the block list.
+- **Narrow filter** (`build_filter`): outbound every port-80 segment that
+  carries payload (not only requests: the parser decides) and TLS records
+  22/21 on 443 (ClientHello, client alerts); with tlsrec every outbound IPv4
+  443 segment (its sequence numbers move) and, inbound, every IPv4 segment
+  from 443 (their ACKs are translated); QUIC Initials; DNS port 53 out,
+  answers from 53 (hybrid/learning) and from the clean resolver's exact
+  IP:port; inbound RST / SYN-ACK / TLS alerts from 80/443.
   Do not widen this without a reason: every diverted packet costs two
   context switches.
 - **Presets** (presets.h, measured on Türk Telekom 2026-11-08, 5 runs x 4
@@ -187,9 +248,24 @@ Runtime data: `%ProgramData%\TurkishDPI\` (admin-owned, protected DACL):
   minimum RTO); a cut after byte 1 fails; fixed-TTL 5 decoys with the
   byte-2 cut work. Learned stats use keys `e<N>` in `[net_<id>]` (1.x `p<N>`
   keys are ignored); reordering presets invalidates them.
+  Large first segments (2.0.2): when segmentation offload hands the engine one
+  segment over 1500 bytes (e.g. a ~1.8 KB ClientHello), it is sent in pieces of
+  <= 1200 payload bytes (a decoy carries the first 1200); packets up to 1500
+  bytes are byte-identical to 2.0.1 (`desync_test`, `pieces_test`). The engine
+  prints `Large first segment: ...` (it ends up in the log). A TLS ClientHello
+  whose name is not in the segment gets the byte-2 cut instead of no cut
+  (`TCPDPI_FALLBACK_CUT`), also for the name-based and tlsrec presets.
 - **Payment protection** (default on, `--no-payment-exclude` / ini
   `PaymentProtection=0` to disable): ~100 bank/payment/3-D Secure domains are
-  never modified, matched by SNI/Host and by addresses learned from DNS answers.
+  never modified. `policy_excluded` (policy.c): the visible SNI/Host name decides
+  if there is one; an address learned from DNS (`exclude_check_ip`) counts only
+  when the segment carries no name or the name is a known ECH public name
+  (`cloudflare-ech.com`) - before 2.0.2 a blocked site sharing a CDN address with
+  a payment site was left alone for up to 2 hours. Learned addresses expire after
+  2 h, at most 16 per DNS answer, a full table replaces the entry that expires
+  soonest; the built-in names always fit. `--exclude` files load after the
+  built-in list (LF/CRLF/CR, UTF-8 BOM, `#` comments; NUL or over-long lines are
+  skipped).
 - **QUIC** Initials are dropped (engine default, both families) so browsers fall back to TCP.
 - **No bundled/embedded driver in the exe**: releases are zips with
   `TurkishDPI.exe` + WinDivert's signed `WinDivert.dll`/`WinDivert64.sys`
@@ -208,17 +284,33 @@ make ARCH=i686            # build/i686/TurkishDPI.exe
 # put WinDivert.dll + WinDivert64.sys (x64) next to the exe to run it
 ```
 
-Unit tests (run them under sanitizers when touching engine parsing code):
+Unit tests: the one list of tests lives in `.github/scripts/build-tests.sh`
+(13 tests; `<exe>|<sources>|<flags>|<libs>` per line, `-Wall -Wextra -Werror`,
+the same script for the native, cross (-static, x64/x86) and sanitizer builds):
 
 ```bash
-x86_64-w64-mingw32-gcc -g -O1 -fsanitize=undefined,address -Isrc/engine tests/dns_test.c src/engine/dns.c -lws2_32 -o build/dns_test.exe
-x86_64-w64-mingw32-gcc -g -O1 -fsanitize=undefined,address -Isrc/engine tests/exclude_test.c src/engine/exclude.c -lws2_32 -o build/exclude_test.exe
-x86_64-w64-mingw32-gcc -g -O1 -fsanitize=undefined,address -Isrc/app -Itests tests/updpkg_test.c src/app/updpkg.c -o build/updpkg_test.exe
-for t in proto tcpdpi udpdpi rawscope; do x86_64-w64-mingw32-gcc -g -O1 -fsanitize=undefined,address -Isrc/engine/core tests/core/test_$t.c src/engine/core/{proto,tcpdpi,udpdpi,rawscope}.c -lws2_32 -o build/test_$t.exe && ./build/test_$t.exe; done
+bash .github/scripts/build-tests.sh gcc build/tests          # native
+bash .github/scripts/build-tests.sh x86_64-w64-mingw32-gcc build/t64 -static
+# sanitizers (Linux or MinGW with ASan; tests that include Windows headers need
+# TEST_ONLY=...): -g -O1 -fsanitize=address,undefined
 ```
 
-Without MinGW, MSVC (`cl /fsanitize=address`, add `/Dssize_t=intptr_t`) builds
-and runs the unit tests; the release exe is built with MinGW (CI).
+Run them under sanitizers when touching engine parsing code. dns and exclude
+need winsock: CI runs them under MSVC ASan (`cl /fsanitize=address`).
+
+Without MinGW, MSVC (`cl /fsanitize=address`, add `/Dssize_t=intptr_t`) can build
+and run every unit test (desync_test, pieces_test, policy_test and upd_swap_test print
+their MSVC command line in the header comment) - good for a check, the release exe is built with MinGW (CI). Release
+exes link with `-Wl,-S` (drops only the DWARF debug info that the static MinGW
+libraries bring, so the exe is smaller); never `-s`: the symbol table stays on purpose (AV hygiene, see
+the v1.1.0-rc3 and VirusTotal notes in Status).
+
+C runtime: a local llvm-mingw build links ucrt, the CI release build uses
+Ubuntu's `gcc-mingw-w64` and links msvcrt (the Makefile does not choose; the
+toolchain does). The same source must work with both - see Conventions. To use a
+WinDivert other than the pinned official one: `make WINDIVERT=<folder>` (layout
+of the official archive: `include/`, `x64/`, `x86/`); the Makefile computes the
+DLL/driver SHA-256 pins from that folder.
 
 Quick checks without admin:
 - `__COMPAT_LAYER=RunAsInvoker TurkishDPI.exe --engine <args>`: "Error opening
@@ -231,17 +323,36 @@ Real end-to-end test (admin, UAC prompt; close any running instance first):
 
 ## Releasing
 
-Bump `src/app/version.h`, commit, push `main`, push a tag `vX.Y.Z` (tags with a
-`-`, e.g. `v1.1.0-rc2`, become pre-releases). CI builds and attaches
-`TurkishDPI-<tag>-x64.zip`, `-x86.zip`, `SHA256SUMS.txt`. Do not delete or
-re-push tags; publish a new version instead. WinDivert is pinned to 2.2.2-A by
-SHA-256 in the workflow.
+Bump `src/app/version.h` (string macros AND the three numeric
+`TURKISHDPI_VER_*` macros: the updater compares the numbers, the exe's file
+version comes from them), commit, push `main`, push a tag `vX.Y.Z` (tags with a
+`-`, e.g. `v1.1.0-rc2`, become pre-releases). CI refuses a tag that differs from
+version.h (a `-suffix` of the tag is ignored for the comparison), builds, runs
+the tests and the shipped exes ("smoke"), and the release job creates the
+GitHub Release as a DRAFT with `TurkishDPI-<tag>-x64.zip`, `-x86.zip`,
+`SHA256SUMS.txt`, verifies exactly those three assets (names, sizes, digests,
+sums) and only then publishes it (`make_latest` for normal tags, never for
+pre-releases): the one-click updater cannot see a half-uploaded release. A
+release that is already published is never touched: the job refuses; "Re-run
+jobs" or `workflow_dispatch` on a tag does not run the release job. Never
+delete or re-push a tag; publish a new version instead. WinDivert is pinned to
+2.2.2-A by SHA-256 in the workflow. Text files in the zip get CRLF line endings,
+BENIOKU.txt a UTF-8 BOM (done in the Package step; the repo files stay LF).
 
 ## Conventions and gotchas
 
 - Code must compile with both msvcrt (CI GCC) and ucrt (clang): no `wcstok`
   with 3 args, use `_snwprintf` + explicit termination for bounded wide output,
   `%ls` for wide strings, `%lu` for DWORD.
+- Test executables must not have "update", "install", "setup" or "patch" in
+  their name: an unmanifested 32-bit exe with such a name is treated as an
+  installer and demands elevation (hence `upd_swap_test`). build-tests.sh says
+  so too.
+- Engine stdout lines (all but `STATS`) are copied into the log by
+  `engine_reader`: `Error opening filter: N`, `Large first segment: ...`.
+- Pure engine logic (desync.c, policy.c, parts of dns.c/exclude.c) stays free of
+  WinDivert/Win32 so it can be unit tested; keep new decisions there, not in
+  engine.c's loop.
 - Engine buffers are packed bytes: use `memcpy`, not misaligned pointer casts.
 - `g_lock` guards `g_ui` and the command queue; file logging uses `g_log_lock`.
   Never hold `g_lock` across process waits, file I/O or message boxes.
@@ -325,8 +436,8 @@ SHA-256 in the workflow.
   is not blocked in Turkey and connects;
   WinDivert's signed driver itself gets generic "WinDivert" detections on
   VirusTotal (see Status), same as GoodbyeDPI/zapret. Payment protection
-  relies on the SNI in the first TLS segment or addresses seen in plain DNS
-  answers; with browser DoH and a ClientHello split over two segments it may
+  relies on the SNI in the first TLS segment (or, without a name / with an ECH
+  public name, on addresses seen in plain DNS answers); with browser DoH and a ClientHello split over two segments it may
   not apply (not measured yet, docs/SECURITY-REVIEW.md S6).
 - The log is rotated at 1 MB on write (`log_write`), not only at start.
 
@@ -336,9 +447,11 @@ SHA-256 in the workflow.
 - v1.1.0 (rc2 published as pre-release): hybrid DNS, fastest DNS, narrow
   filter, honest latency metric, payment IP learning, no embedded driver,
   first bug-hunting round (21 findings).
-- Branch `feature/hardening-autopilot` (not merged): security hardening and
-  autopilot work from docs/DEVELOPMENT-ROADMAP.md items 1, 2, 3 (partly), 5,
-  16; see docs/ for the analysis.
+- Branch `feature/hardening-autopilot` (merged into main, first released in
+  v1.2.0): security hardening and autopilot work from
+  docs/DEVELOPMENT-ROADMAP.md items 1, 2, 3 (partly), 5, 16. docs/ARCHITECTURE,
+  PROJECT-ANALYSIS, SECURITY-REVIEW, DEVELOPMENT-ROADMAP and docs/design/UI-AUDIT,
+  PREVIEW-PLAN are historical v1.1.0 snapshots (each says so at the top).
 - v1.2.0: merge of feature/hardening-autopilot + feature/ui-redesign, then a
   /code-review round (driver pinning, TCP-first diagnosis), a bug hunt
   (10 findings) and a full security audit (14 findings: same-user attacker
@@ -376,7 +489,65 @@ SHA-256 in the workflow.
   Elevated test scripts must stop the app before its engine: killing the
   engine first makes the app start a new one that is orphaned (suspended,
   outside the job) when the app is killed right after.
-- After rc2 (on main, not yet tagged): second bug-hunting round - app layer
+- v2.0.2 (this branch `release/v2.0.2`; merge of seven work packages, each
+  reviewed independently by a second reviewer before merging): engine
+  correctness (large first segments, nameless ClientHello cut, payment
+  precedence with ECH public names, never-valid decoy checksum, `--exclude`
+  after the built-in list), hybrid DNS accepting LAN addresses from local
+  resolvers, payment list loader/table hardening, controller/UI fixes (second
+  start raises the window, pause survives settings, one exit path for
+  interrupted scans and site tests, driver errors fatal after one attempt,
+  idempotent pause/resume, windows hidden first on exit/uninstall/update),
+  updater hardening (exe version must equal the tag and be newer, total
+  download deadlines, own redirect handling, specific failure reasons, WinDivert
+  files must match, texts replaced after the exe, exact leftover cleanup),
+  build/CI (smaller exe, draft-then-publish release, tag guard, smoke job,
+  one list of unit tests) and these docs.
+  Verification: unit tests on x64/x86 and under ASan pass (13 tests).
+  Elevated, 2026-11-14, developer's machine (Windows 11, Türk Telekom line,
+  Ethernet), local llvm-mingw builds of the merged branch (the release exe is
+  built by CI):
+  - `--selftest` x64: PASS, blocked targets 3/3, average 164 ms, payment
+    pass-through excluded=3, latency with/without engine -1 ms. x86: PASS, 3/3,
+    109 ms, excluded=3, +2 ms.
+  - Engine alone (preset 0) with Chromium 156 opening discord.com, roblox.com,
+    wattpad.com, wikipedia.org, github.com: all opened; 109 ClientHellos seen;
+    the largest first-segment payload was 1412 bytes (STATS maxpay). So no
+    segment larger than one packet reached the engine: the large-segment path
+    was NOT exercised on the real line; it is covered by unit tests and an
+    independent 700,000-case invariant check only.
+  - App: paused, then payment protection switched on -> "settings changed while
+    paused: applied on resume", stayed paused, next start used the new setting;
+    a second start brought the running window forward (from the tray and from
+    minimized); a `--tray` second start stayed silent; exit hid the window first
+    ("exit: window hidden, stopping"); a copy without WinDivert64.sys made one
+    engine start, logged "driver error 2: stopping, no preset is tried or
+    recorded", showed the text naming WinDivert64.sys and left the learned
+    stats in the ini unchanged.
+  - One-click update: a build of this branch labelled 1.9.9 updated itself to
+    the published v2.0.1 in about 2 s through the new download code (manual
+    redirect, version check): exe byte-identical to the release exe, licence and
+    read-me texts installed, the moved-aside exe removed by the next start.
+  - Reviews: every package was reviewed by a second engineer-agent; the engine's
+    output for packets up to 1500 bytes was compared byte for byte with the
+    released engine in 376,236 cases (no difference except the intended cut for
+    ClientHellos without a usable name); the PE version reader agreed with
+    Windows on 7,603 real binaries; the new download code fetched the real
+    release files with a matching SHA-256.
+  - NOT verified on a real system: double-click on pause/resume (code review
+    only), the site-check interruption paths, unknown driver error codes, update
+    failure/recovery paths (covered without elevation by tests/upd_swap_test.c),
+    the download deadline on a throttled line, IPv6, other ISPs, Windows 7/8.1,
+    and the release exe built by CI (GNU ld/msvcrt): the CI "smoke" job runs it
+    for the first time.
+  - Known issue, not fixed: starting a copy that lacks the driver file while
+    "Windows açılışında başlat" is on removes the logon task (`autostart_migrate`
+    -> `sys_install_copy` fails -> task deleted by design), although the task
+    already pointed at an intact Program Files copy.
+- Size and memory of the released v2.0.1 (measured 2026-11-14, idle): exe
+  2.16 MB, x64 zip about 0.57 MB; app process 16 MB working set / 7 MB private,
+  engine process 3 MB / 2 MB (README quotes these; do not quote older figures).
+- After rc2 (released in v1.1.0-rc3 and v1.1.0): second bug-hunting round - app layer
   (17 findings: folder-security race, laptop autostart, tray icon after
   Explorer restart, manual mode overridden by site test, watchdog balloon
   loop, validated block IPs, absolute System32 paths, non-elevated browser,
