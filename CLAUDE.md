@@ -134,8 +134,10 @@ Runtime data: `%ProgramData%\TurkishDPI\` (admin-owned, protected DACL):
   after 1 h - `block_ips_stale`/`learn_block_ips_if_stale`); try
   presets in learned order; after the first preset that opens every target,
   try up to two more presets that were not known on this network (`extra`
-  counts every preset tried after the winner, working or not) and keep the
-  fastest; the walk stops at a preset already known on this network, and on a
+  counts every preset whose engine started after the winner, working or not;
+  a non-fatal start failure is skipped before it counts) and keep the
+  fastest (a later preset replaces the winner only if it is more than 20%
+  faster); the walk stops at a preset already known on this network, and on a
   network with more than one learned preset a known preset that works ends it
   at once. The running engine stays on during the
   measurements and `engine_start` keeps it when the arguments are identical,
@@ -143,10 +145,12 @@ Runtime data: `%ProgramData%\TurkishDPI\` (admin-owned, protected DACL):
   Watchdog every `WatchdogMinutes` (1-240) with a second strike: a failed
   check is repeated after 20 s, only a repeated failure rescans. Network
   changes are debounced (4 s quiet, 20 s max). Partial mode only rescans if
-  it gets worse. Only every 6th successful watchdog check counts in the
-  learning stats (`health_record`), i.e. hourly at the default 10 minutes, more
-  often with a shorter `WatchdogMinutes`; a confirmed failure always counts
-  (outside partial mode).
+  it gets worse. Only every 6th successful check counts in the learning
+  stats (`health_record`; one counter shared by the watchdog and the
+  post-network-change check `health_ok(1)` in the controller loop), i.e.
+  hourly only at the default 10 minutes with no network changes. A confirmed
+  watchdog failure always counts (outside partial mode); the post-network-
+  change check has no second strike, so a single failure there counts at once.
 - **One-click update** (2.0.1): the update thread finds a newer
   `releases/latest` tag (digits and dots only); the banner's "Güncelle →"
   posts `CMD_UPDATE`; the controller (`update_install` -> `sys_update_install`)

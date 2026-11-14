@@ -1,4 +1,4 @@
-> **TARİHSEL BELGE – sürüm 1.1.0'ın anlık görüntüsü.** Bu belge güncellenmemiştir; yazıldığı zamanın (v1.1.0) kodunu anlatır. Sürüm 2.0'dan beri motor TurkishDPI'ın kendi motorudur (Shroudly çekirdeği, `src/engine/`); aşağıda adı geçen `goodbyedpi.c`, `dnsredir.c` gibi dosyalar artık yoktur. Burada planlanan `--ui-preview` aracı artık yazılmıştır ve plandan farklı olabilir; güncel hali `src/app/ui.c` içindedir. Güncel durum için [CLAUDE.md](../../CLAUDE.md) ve [README.md](../../README.md) dosyalarına bakın.
+> **TARİHSEL BELGE – sürüm 1.1.0 koduna göre yazılmış taslak.** Bu belge, v1.2.0'daki arayüz yenilemesi için yazılmış bir taslaktır (v1.1.0 koduna göre); planlanan `--ui-preview` aracı artık yazılmıştır ve plandan farklı olabilir, güncel hali `src/app/ui.c` içindedir. Motor 2.0'dan beri TurkishDPI'ın kendi motorudur (Shroudly çekirdeği). Güncel durum için [CLAUDE.md](../../CLAUDE.md) ve [README.md](../../README.md) dosyalarına bakın.
 
 # `--ui-preview` – teknik plan · TASLAK (kod yazılmadı)
 
