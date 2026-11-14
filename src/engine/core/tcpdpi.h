@@ -83,7 +83,9 @@ int  tcpdpi_hops_get(uint32_t ip_be, uint64_t now_ms); /* 0 if absent/expired */
  * header template (the captured packet's IP and TCP headers) plus new fields,
  * and fills in the IPv4 total length, the IP ID, the IPv4 header checksum and
  * the TCP checksum. With bad_tcp_csum != 0 the TCP checksum is deliberately
- * inverted so the destination drops the segment (a decoy the DPI still ingests
+ * inverted (TurkishDPI: except that a correct value of 0x0000 becomes 0x5a5a,
+ * since its inverse 0xffff would be the same one's-complement value - see
+ * tcpdpi_bad_csum) so the destination drops the segment (a decoy the DPI still ingests
  * but the server never accepts). ihl and tcphl are the header lengths in bytes.
  * Return the segment length, or 0 on any error (bad lengths, capacity) — never
  * a partially written buffer. */
@@ -219,7 +221,11 @@ int tcpdpi_build_tlsrec_pair(tcpdpi_seg segs[2], int *nsegs,
  *    headers - so everything such a packet produces is byte-identical to the
  *    original builders (as measured on real lines);
  *  - a larger one (segmentation offload) is cut into pieces of at most
- *    TCPDPI_PIECE_MAX bytes. That fits a PPPoE link (1492) with any IPv4
+ *    TCPDPI_PIECE_MAX bytes. (The original code handled these differently:
+ *    up to TCPDPI_SEG_MAX bytes it still desynced them but built pieces
+ *    larger than a 1500-byte MTU, DF copied - e.g. 20 + 32 + 1460 = 1512
+ *    bytes; above TCPDPI_SEG_MAX it sent the original unmodified.) That
+ *    fits a PPPoE link (1492) with any IPv4
  *    headers (60 + 60 + 1200 = 1320), and the IPv6 minimum MTU (1280) while
  *    the TCP header is at most 40 bytes (40 + 40 + 1200 = 1280; the usual 20
  *    or 32). It never depends on the path MTU.
@@ -287,7 +293,8 @@ int tcpdpi_build_piece4(uint8_t *dst, size_t dstcap,
 /* IPv6 (fixed header only, next header TCP): a copy of the 40-byte header
  * ip6_tmpl and the TCP header with payload[0,seg_len) at `seq`, hop limit
  * `hop`, the payload length set and the TCP checksum computed (inverted when
- * bad_tcp_csum != 0). Returns the packet length, 0 on error. */
+ * bad_tcp_csum != 0, except that a correct 0x0000 becomes 0x5a5a since 0xffff
+ * would be equivalent: tcpdpi_bad_csum). Returns the packet length, 0 on error. */
 int tcpdpi_build_segment6(uint8_t *dst, size_t dstcap,
                           const uint8_t *ip6_tmpl, const uint8_t *tcp_tmpl, int tcphl,
                           uint32_t seq, int hop, const uint8_t *payload, int seg_len,
@@ -302,9 +309,10 @@ int tcpdpi_build_piece6(uint8_t *dst, size_t dstcap,
 /* Where the real request is cut (the engine's choice, pure):
  *   split_pos > 0: after byte split_pos (or plen-1 when shorter);
  *   else inside the name (tcpdpi_split_points);
- *   else, for a TLS ClientHello whose name is not in this segment (it lies in
- *   a later one, as with a large post-quantum ClientHello), after byte
- *   TCPDPI_FALLBACK_CUT - the cut preset 0 uses - instead of no cut at all.
+ *   else, for a TLS ClientHello where no cut inside the name is possible -
+ *   the name is not in this segment (it lies in a later one, as with a large
+ *   post-quantum ClientHello) or it is too short to cut (a 1-byte name) -
+ *   after byte TCPDPI_FALLBACK_CUT, the cut preset 0 uses, instead of no cut.
  * Fills cuts[] (ascending) and returns how many (0: send the payload whole). */
 int tcpdpi_choose_cuts(const uint8_t *payload, int plen, int is_tls, int host_off, int host_len,
                        int split_pos, int cuts[2]);

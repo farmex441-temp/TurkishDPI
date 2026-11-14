@@ -11,7 +11,8 @@
  * What is sent is composed by desync.c: a captured packet that fits one
  * wire packet gives exactly what was measured on real lines; a larger one
  * (WinDivert sees segments before NIC segmentation offload) is sent in pieces
- * of at most TCPDPI_PIECE_MAX payload bytes.
+ * of at most TCPDPI_PIECE_MAX payload bytes (before 2.0.2: over-MTU pieces up
+ * to TCPDPI_SEG_MAX bytes, the original unmodified above that).
  * Payment and bank connections are never touched (exclude.c); DNS goes to a
  * clean resolver as well (dns.c, the hybrid race).
  *
@@ -643,6 +644,8 @@ int engine_main(int argc, char *argv[]) {
      * user's lists may use the whole set */
     if (payment) exclude_load_builtin();
     else exclude_skip_builtin();
+    /* an unreadable --exclude file is therefore reported only after the
+     * whole command line was parsed (same message, usage and exit code 2) */
     for (int i = 0; i < nxfiles; i++) {
         if (exclude_load_list(xfiles[i]) < 0) {
             printf("Unknown or invalid option: --exclude %s\n", xfiles[i]);
