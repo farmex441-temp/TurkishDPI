@@ -307,6 +307,16 @@ jobs:
             grep -qE "^[0-9a-f]{64}  TurkishDPI-$V-$w.zip$" dist/SHA256SUMS.txt
             ./build/updpkg_check dist/TurkishDPI-$V-$w.zip TurkishDPI.exe build/$a/TurkishDPI.exe
           done
+          # Every 2.0.2+ install refuses a release whose exe file version it
+          # cannot read or that differs from the tag (upd_fetch in system.c).
+          # Check the exes about to be released with that same parser against
+          # version.h (equal to the tag on tag builds: see "Tag matches version.h").
+          VER=$(tr -d '\r' < src/app/version.h | sed -n 's/^#define TURKISHDPI_VERSION_A[[:space:]][[:space:]]*"\([0-9.]*\)".*/\1/p')
+          [ -n "$VER" ] || { echo "::error::TURKISHDPI_VERSION_A not found in src/app/version.h"; exit 1; }
+          for a in x86_64 i686; do
+            ./build/updpkg_check --pe-version build/$a/TurkishDPI.exe "$VER" ||
+              { echo "::error::$a: TurkishDPI.exe file version is not $VER - installed copies would refuse this update"; exit 1; }
+          done
 
       - name: Cross-compile unit tests (x64, x86, msvcrt, static)
         run: |

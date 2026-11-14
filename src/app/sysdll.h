@@ -33,6 +33,7 @@ typedef HINTERNET (WINAPI *sd_WinHttpOpenRequest_t)(HINTERNET, LPCWSTR, LPCWSTR,
 typedef BOOL (WINAPI *sd_WinHttpQueryHeaders_t)(HINTERNET, DWORD, LPCWSTR, LPVOID, LPDWORD, LPDWORD);
 typedef BOOL (WINAPI *sd_WinHttpQueryOption_t)(HINTERNET, DWORD, LPVOID, LPDWORD);
 typedef BOOL (WINAPI *sd_WinHttpReadData_t)(HINTERNET, LPVOID, DWORD, LPDWORD);
+typedef BOOL (WINAPI *sd_WinHttpQueryDataAvailable_t)(HINTERNET, LPDWORD);
 typedef BOOL (WINAPI *sd_WinHttpReceiveResponse_t)(HINTERNET, LPVOID);
 typedef BOOL (WINAPI *sd_WinHttpSendRequest_t)(HINTERNET, LPCWSTR, DWORD, LPVOID, DWORD, DWORD, DWORD_PTR);
 typedef BOOL (WINAPI *sd_WinHttpSetOption_t)(HINTERNET, DWORD, LPVOID, DWORD);
@@ -53,6 +54,7 @@ extern sd_WinHttpOpenRequest_t       sd_WinHttpOpenRequest;
 extern sd_WinHttpQueryHeaders_t      sd_WinHttpQueryHeaders;
 extern sd_WinHttpQueryOption_t       sd_WinHttpQueryOption;
 extern sd_WinHttpReadData_t          sd_WinHttpReadData;
+extern sd_WinHttpQueryDataAvailable_t sd_WinHttpQueryDataAvailable;
 extern sd_WinHttpReceiveResponse_t   sd_WinHttpReceiveResponse;
 extern sd_WinHttpSendRequest_t       sd_WinHttpSendRequest;
 extern sd_WinHttpSetOption_t         sd_WinHttpSetOption;
@@ -71,6 +73,7 @@ extern sd_GetIfEntry2_t              sd_GetIfEntry2;
 #define WinHttpQueryHeaders      sd_WinHttpQueryHeaders
 #define WinHttpQueryOption       sd_WinHttpQueryOption
 #define WinHttpReadData          sd_WinHttpReadData
+#define WinHttpQueryDataAvailable sd_WinHttpQueryDataAvailable
 #define WinHttpReceiveResponse   sd_WinHttpReceiveResponse
 #define WinHttpSendRequest       sd_WinHttpSendRequest
 #define WinHttpSetOption         sd_WinHttpSetOption
