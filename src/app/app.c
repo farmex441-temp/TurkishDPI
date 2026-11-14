@@ -1092,24 +1092,32 @@ static void site_result(const wchar_t *fmt, const wchar_t *host) {
     ui_refresh();
 }
 
+/* How site_test_run ended; site_test() turns each into a consistent state. */
+typedef enum {
+    SITE_UNTOUCHED,    /* the engine was not changed (opens, bad name, IP block) */
+    SITE_NO_NET,       /* control sites unreachable                              */
+    SITE_INTERRUPTED,  /* a command (or exit) came during the preset search      */
+    SITE_NOT_FOUND,    /* every preset tried, none opened it                     */
+    SITE_SETTLED       /* a preset was announced, or a driver error was shown    */
+} site_end_t;
+
 /* "Site testi": check one site; if blocked, look for a preset that opens it
  * together with the existing targets, then remember the site. */
-static void site_test(const wchar_t *raw) {
+static site_end_t site_test_run(const wchar_t *raw, int prev) {
     wchar_t host[128];
     const wchar_t *h[1];
-    int order[PRESET_COUNT], prev = g_running_preset;
+    int order[PRESET_COUNT];
 
     normalize_host(raw, host, 128);
-    if (!host[0] || !wcschr(host, L'.')) { site_result(L"Geçersiz adres: %ls", raw); return; }
+    if (!host[0] || !wcschr(host, L'.')) { site_result(L"Geçersiz adres: %ls", raw); return SITE_UNTOUCHED; }
     h[0] = host;
     site_result(L"%ls test ediliyor…", host);
     probe_flush_dns_cache();
     if (probe_https_many(h, 1, 6000, NULL, NULL) == 1) {
         site_result(L"✓ %ls açılıyor", host);
-        if (g_scan_aborted && g_auto) auto_scan();   /* a scan we interrupted must still finish */
-        return;
+        return SITE_UNTOUCHED;
     }
-    if (!control_ok()) { site_result(L"İnternet yok, %ls test edilemedi", host); return; }
+    if (!control_ok()) { site_result(L"İnternet yok, %ls test edilemedi", host); return SITE_NO_NET; }
 
     /* Why does it not open? Only DNS and TLS/SNI blocks can be fixed by a
      * different preset; trying all of them for an IP block or a name that
@@ -1128,8 +1136,7 @@ static void site_test(const wchar_t *raw) {
             site_result(d == DIAG_OK ? L"✓ %ls açılıyor"
                       : d == DIAG_NO_DNS ? L"✗ %ls: alan adı bulunamadı (yazım hatası?)"
                       : L"✗ %ls: IP engeli ya da sunucu kapalı – DPI ile aşılamaz", host);
-            if (g_scan_aborted && g_auto) auto_scan();   /* a scan we interrupted must still finish */
-            return;
+            return SITE_UNTOUCHED;
         }
         switch (d) {
         case DIAG_DNS_POISON:
@@ -1144,27 +1151,101 @@ static void site_test(const wchar_t *raw) {
     smart_order(order, PRESET_COUNT);
     for (int k = 0; k < PRESET_COUNT; k++) {
         int p = order[k];
-        if (cmd_pending()) break;
+        if (cmd_pending()) {
+            /* not "no preset opened it": the search simply did not finish */
+            log_line("site test: interrupted by a command after %d of %d presets", k, PRESET_COUNT);
+            site_result(L"%ls testi yarıda kesildi", host);
+            return SITE_INTERRUPTED;
+        }
         if (p == prev) continue;
-        if (!engine_start(p, g_dns)) { if (engine_fatal()) return; continue; }
+        if (!engine_start(p, g_dns)) {
+            if (engine_fatal()) {
+                site_result(L"✗ %ls test edilemedi: sürücü başlatılamadı", host);
+                return SITE_SETTLED;
+            }
+            continue;
+        }
         probe_flush_dns_cache();
         if (probe_https_many(h, 1, 6000, NULL, NULL) == 1 && targets_score(NULL) >= g_ntargets) {
-            InterlockedExchange(&g_scan_aborted, 0);
             smart_record(p, 1, 0);
             site_result(targets_add(host)
                         ? L"✓ %ls açıldı – profil değişti ve site hatırlandı"
                         : L"✓ %ls açıldı – profil değişti (izleme listesi dolu)", host);
             announce(p, g_ntargets);
-            return;
+            return SITE_SETTLED;
         }
     }
     site_result(L"✗ %ls: hiçbir profil açamadı (DPI'ın aşamadığı bir engel)", host);
-    if (!g_auto)
-        manual_start(g_preset);                /* a manual choice stays the user's */
-    else if (!g_scan_aborted && prev >= 0 && engine_start(prev, g_dns))
-        announce(prev, targets_score(NULL));   /* the real score, not an assumed one */
-    else
-        auto_scan();
+    return SITE_NOT_FOUND;
+}
+
+/* A scan that a site test interrupted must still finish (it was an
+ * auto_scan, also when a "rescan" ran in manual mode). */
+static void resume_interrupted_scan(void) {
+    if (!g_scan_aborted) return;
+    log_line("site test: resuming the interrupted scan");
+    auto_scan();
+}
+
+/* Runs a site test and leaves one consistent state for every way it ends:
+ * never "scanning" with the engine on a candidate preset. */
+static void site_test(const wchar_t *raw) {
+    int prev = g_running_preset;
+    state_kind_t kind;
+    wchar_t status[128], detail[160];
+
+    EnterCriticalSection(&g_lock);   /* what the window showed before the test */
+    kind = g_ui.kind;
+    memcpy(status, g_ui.status, sizeof(status));
+    memcpy(detail, g_ui.detail, sizeof(detail));
+    LeaveCriticalSection(&g_lock);
+
+    switch (site_test_run(raw, prev)) {
+    case SITE_UNTOUCHED:
+        resume_interrupted_scan();
+        break;
+    case SITE_NO_NET:
+        if (g_scan_aborted) {
+            resume_interrupted_scan();   /* auto_scan finds the link down and goes offline */
+        } else {
+            engine_stop();
+            set_state(ST_OFFLINE, L"İnternet bağlantısı yok", L"Bağlantı gelince otomatik başlayacak");
+            log_line("site test: control sites unreachable, waiting for network");
+        }
+        break;
+    case SITE_INTERRUPTED:
+        if (g_quitting) break;
+        if (g_scan_aborted) {
+            /* the engine is on a candidate of the interrupted scan: the
+             * queued command either replaces that scan or finishes it
+             * (controller: "interrupted") */
+            log_line("site test: interrupted scan left to the queued command");
+            break;
+        }
+        /* Back to what ran before, without probing (the queued command
+         * comes first). engine_start keeps an identical running engine. */
+        if (prev >= 0 && !engine_start(prev, g_dns)) {
+            if (!engine_fatal()) set_state(ST_ERROR, L"Başlatılamadı", PRESETS[prev].name);
+            break;
+        }
+        if (prev < 0) engine_stop();
+        set_state(kind, status, detail);
+        log_line("site test: previous state restored (preset %d)", prev);
+        break;
+    case SITE_NOT_FOUND:
+        if (!g_auto)
+            manual_start(g_preset);                /* a manual choice stays the user's */
+        else if (!g_scan_aborted && prev >= 0 && engine_start(prev, g_dns))
+            announce(prev, targets_score(NULL));   /* the real score, not an assumed one */
+        else
+            auto_scan();
+        break;
+    case SITE_SETTLED:
+        /* a new preset was announced, or the driver cannot open: either way
+         * the interrupted scan (if any) is over */
+        InterlockedExchange(&g_scan_aborted, 0);
+        break;
+    }
 }
 
 /* CMD_UPDATE (controller thread): download, verify and put the new release
