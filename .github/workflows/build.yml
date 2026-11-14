@@ -11,6 +11,13 @@ on:
 permissions:
   contents: read
 
+# A newer push cancels the older run of the same branch/PR, but a run for a
+# tag is never cancelled (tags are never re-pushed, so a cancelled release
+# could not be repeated).
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/') }}
+
 env:
   WINDIVERT_URL: https://github.com/basil00/WinDivert/releases/download/v2.2.2/WinDivert-2.2.2-A.zip
   WINDIVERT_SHA256: 63cb41763bb4b20f600b6de04e991a9c2be73279e317d4d82f237b150c5f3f15
@@ -24,6 +31,7 @@ jobs:
     # payment exclusion, site diagnosis, WinDivert.dll pinning), with the
     # sanitizer-free MinGW that ships on the runner.
     runs-on: windows-latest
+    timeout-minutes: 15
     defaults:
       run:
         shell: bash
@@ -33,23 +41,14 @@ jobs:
           persist-credentials: false
       - name: Unit tests
         run: |
-          mkdir -p build
-          gcc -O2 -Wall -Isrc/engine tests/exclude_test.c src/engine/exclude.c -lws2_32 -o build/exclude_test.exe
-          gcc -O2 -Wall -Isrc/engine tests/dns_test.c src/engine/dns.c -lws2_32 -o build/dns_test.exe
-          gcc -O2 -Wall -Isrc/app tests/diag_test.c src/app/diag.c -o build/diag_test.exe
-          gcc -O2 -Wall -Isrc/app -Itests tests/updpkg_test.c src/app/updpkg.c -o build/updpkg_test.exe
-          ./build/exclude_test.exe
-          ./build/dns_test.exe
-          ./build/diag_test.exe
-          ./build/updpkg_test.exe
-          # the packet engine's helpers (from Shroudly's core, with its tests)
-          CORE="src/engine/core/proto.c src/engine/core/tcpdpi.c src/engine/core/udpdpi.c src/engine/core/rawscope.c"
-          for t in proto tcpdpi udpdpi rawscope; do
-            gcc -O2 -Wall -Isrc/engine/core tests/core/test_$t.c $CORE -lws2_32 -o build/test_$t.exe
-            ./build/test_$t.exe
+          # The list of tests lives in .github/scripts/build-tests.sh
+          # (-Wall -Wextra -Werror); the same script builds the 32-bit and
+          # msvcrt cross builds in the "build" job.
+          bash .github/scripts/build-tests.sh gcc build/tests
+          for t in build/tests/*.exe; do
+            echo "== $t"
+            "$t"
           done
-          gcc -O2 -Wall -Isrc/engine/core tests/xlate_test.c src/engine/core/tcpdpi.c -o build/xlate_test.exe
-          ./build/xlate_test.exe
       - name: WinDivert.dll pinning test
         run: |
           # Any harmless DLL stands in for WinDivert.dll: with its own hash it
@@ -63,7 +62,7 @@ jobs:
           B=0000000000000000000000000000000000000000000000000000000000000000
           for c in ok bad; do
             [ $c = ok ] && X=$H || X=$B
-            gcc -O2 -Wall -DWINDIVERTEXPORT=extern -DWINDIVERT_DLL_SHA256="\"$X\"" \
+            gcc -O2 -Wall -Wextra -Werror -DWINDIVERTEXPORT=extern -DWINDIVERT_DLL_SHA256="\"$X\"" \
                 -Ithird_party/WinDivert/include -Isrc/engine \
                 tests/windivert_hash_test.c src/engine/windivert_dyn.c -o build/h$c/t.exe
           done
@@ -78,7 +77,7 @@ jobs:
           done
           for c in sysok sysbad; do
             [ $c = sysok ] && S=$H || S=$B
-            gcc -O2 -Wall -DWINDIVERTEXPORT=extern -DWINDIVERT_DLL_SHA256="\"$H\"" \
+            gcc -O2 -Wall -Wextra -Werror -DWINDIVERTEXPORT=extern -DWINDIVERT_DLL_SHA256="\"$H\"" \
                 -DWINDIVERT_SYS64_SHA256="\"$S\"" \
                 -Ithird_party/WinDivert/include -Isrc/engine \
                 tests/windivert_hash_test.c src/engine/windivert_dyn.c -o build/h$c/t.exe
@@ -89,12 +88,42 @@ jobs:
           # one could be planted after the check (2)
           mkdir -p build/hsysmissing
           cp /c/Windows/System32/version.dll build/hsysmissing/WinDivert.dll
-          gcc -O2 -Wall -DWINDIVERTEXPORT=extern -DWINDIVERT_DLL_SHA256="\"$H\""               -DWINDIVERT_SYS64_SHA256="\"$H\""               -Ithird_party/WinDivert/include -Isrc/engine               tests/windivert_hash_test.c src/engine/windivert_dyn.c -o build/hsysmissing/t.exe
+          gcc -O2 -Wall -Wextra -Werror -DWINDIVERTEXPORT=extern -DWINDIVERT_DLL_SHA256="\"$H\"" \
+              -DWINDIVERT_SYS64_SHA256="\"$H\"" \
+              -Ithird_party/WinDivert/include -Isrc/engine \
+              tests/windivert_hash_test.c src/engine/windivert_dyn.c -o build/hsysmissing/t.exe
           ./build/hsysmissing/t.exe 2
+
+  test-asan-windows:
+    # dns.c and exclude.c need winsock, so the Ubuntu sanitizer job cannot
+    # build them: run them under MSVC's AddressSanitizer here.
+    runs-on: windows-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - name: dns + exclude (MSVC AddressSanitizer)
+        shell: cmd
+        run: |
+          set "VSWHERE=%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe"
+          if not exist "%VSWHERE%" (echo vswhere.exe not found & exit /b 1)
+          set "VSDIR="
+          for /f "usebackq tokens=*" %%i in (`"%VSWHERE%" -latest -property installationPath`) do set "VSDIR=%%i"
+          if not defined VSDIR (echo vswhere found no Visual Studio & exit /b 1)
+          call "%VSDIR%\VC\Auxiliary\Build\vcvars64.bat" || exit /b 1
+          mkdir build
+          rem vcvars64 puts the ASan runtime DLL's folder on PATH
+          cl /nologo /W3 /fsanitize=address /Zi /MD /D_CRT_SECURE_NO_WARNINGS /Dssize_t=intptr_t /Isrc/engine tests\dns_test.c src\engine\dns.c /Fobuild\ /Fe:build\dns_asan.exe /link ws2_32.lib || exit /b 1
+          cl /nologo /W3 /fsanitize=address /Zi /MD /D_CRT_SECURE_NO_WARNINGS /Dssize_t=intptr_t /Isrc/engine tests\exclude_test.c src\engine\exclude.c /Fobuild\ /Fe:build\exclude_asan.exe /link ws2_32.lib || exit /b 1
+          cd build
+          .\dns_asan.exe || exit /b 1
+          .\exclude_asan.exe || exit /b 1
 
   test-sanitizers:
     # Platform-independent code under AddressSanitizer + UBSan.
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
@@ -102,31 +131,50 @@ jobs:
       - name: diag (ASan/UBSan)
         run: |
           mkdir -p build
-          gcc -g -O1 -fsanitize=address,undefined -fno-sanitize-recover=all -Wall -Wextra \
+          gcc -g -O1 -fsanitize=address,undefined -fno-sanitize-recover=all -Wall -Wextra -Werror \
               -Isrc/app tests/diag_test.c src/app/diag.c -o build/diag_test
           ./build/diag_test
       - name: update package reader (ASan/UBSan)
         run: |
-          gcc -g -O1 -fsanitize=address,undefined -fno-sanitize-recover=all -Wall -Wextra               -Isrc/app -Itests tests/updpkg_test.c src/app/updpkg.c -o build/updpkg_test
+          gcc -g -O1 -fsanitize=address,undefined -fno-sanitize-recover=all -Wall -Wextra -Werror \
+              -Isrc/app -Itests tests/updpkg_test.c src/app/updpkg.c -o build/updpkg_test
           ./build/updpkg_test
       - name: engine core (ASan/UBSan)
         run: |
           CORE="src/engine/core/proto.c src/engine/core/tcpdpi.c src/engine/core/udpdpi.c src/engine/core/rawscope.c"
           for t in proto tcpdpi udpdpi rawscope; do
-            gcc -g -O1 -fsanitize=address,undefined -fno-sanitize-recover=all -Wall \
+            gcc -g -O1 -fsanitize=address,undefined -fno-sanitize-recover=all -Wall -Werror \
                 -Isrc/engine/core tests/core/test_$t.c $CORE -o build/test_$t
             ./build/test_$t
           done
-          gcc -g -O1 -fsanitize=address,undefined -fno-sanitize-recover=all -Wall               -Isrc/engine/core tests/xlate_test.c src/engine/core/tcpdpi.c -o build/xlate_test
+          gcc -g -O1 -fsanitize=address,undefined -fno-sanitize-recover=all -Wall -Werror \
+              -Isrc/engine/core tests/xlate_test.c src/engine/core/tcpdpi.c -o build/xlate_test
           ./build/xlate_test
 
   build:
-    needs: [test, test-sanitizers]
+    needs: [test, test-asan-windows, test-sanitizers]
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           persist-credentials: false
+
+      - name: Tag matches version.h
+        run: |
+          # Tags are never re-pushed. A tag that differs from the version
+          # inside the exe would make the exe see the release as "newer" than
+          # itself forever (endless update loop), so refuse it here.
+          if [[ "$GITHUB_REF" == refs/tags/* ]]; then
+            T="${GITHUB_REF_NAME#v}"   # v2.0.2-rc1 -> 2.0.2-rc1
+            T="${T%%-*}"               #            -> 2.0.2
+            VER=$(sed -n 's/^#define TURKISHDPI_VERSION_A "\([^"]*\)".*/\1/p' src/app/version.h | tr -d '\r')
+            echo "tag $GITHUB_REF_NAME -> $T; version.h TURKISHDPI_VERSION_A = '$VER'"
+            if [ -z "$VER" ] || [ "$T" != "$VER" ]; then
+              echo "::error::tag $GITHUB_REF_NAME does not match TURKISHDPI_VERSION_A ($VER) in src/app/version.h"
+              exit 1
+            fi
+          fi
 
       - name: Install MinGW-w64
         run: sudo apt-get update && sudo apt-get install -y --no-install-recommends gcc-mingw-w64 zip
@@ -147,21 +195,60 @@ jobs:
         run: |
           # REQUIRE_WINDIVERT_HASH: the exe pins the SHA-256 of the WinDivert.dll
           # it ships with (taken from the checksum-verified archive above).
+          # MAP: linker map, uploaded below to inspect section sizes.
           for a in x86_64 i686; do
-            make ARCH=$a WINDIVERT=$WINDIVERT_DIR OUT=build/$a REQUIRE_WINDIVERT_HASH=1 -j4
+            make ARCH=$a WINDIVERT=$WINDIVERT_DIR OUT=build/$a REQUIRE_WINDIVERT_HASH=1 MAP=build/$a/TurkishDPI.map -j4
           done
 
-      - name: Check imports
+      - name: Exe sizes and sections
+        run: |
+          {
+            for a in x86_64 i686; do
+              echo "### $a: TurkishDPI.exe $(stat -c %s build/$a/TurkishDPI.exe) bytes"
+              echo '```'
+              $a-w64-mingw32-objdump -h build/$a/TurkishDPI.exe
+              echo '```'
+            done
+          } | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: TurkishDPI-maps
+          path: build/*/TurkishDPI.map
+          retention-days: 14
+
+      - name: Check imports and header flags
         run: |
           # winhttp/iphlpapi/dnsapi/bcrypt/gdiplus must not be static imports: they are not
           # KnownDLLs and would be searched in the exe's (user-writable) folder
           # first. src/app/sysdll.c loads them from System32 instead.
+          # So the import table is an allowlist: exactly the DLLs the release
+          # exe uses today (a new one needs a conscious change here).
+          ALLOWED=" advapi32.dll comctl32.dll gdi32.dll kernel32.dll msvcrt.dll ole32.dll shell32.dll user32.dll ws2_32.dll "
           for a in x86_64 i686; do
-            imports=$($a-w64-mingw32-objdump -p build/$a/TurkishDPI.exe | grep "DLL Name" | tr 'A-Z' 'a-z')
-            echo "$a: $(echo $imports | tr '\n' ' ')"
-            if echo "$imports" | grep -E "winhttp|iphlpapi|dnsapi|bcrypt|gdiplus"; then
-              echo "::error::forbidden static import in $a build"; exit 1
+            exe=build/$a/TurkishDPI.exe
+            dump=$($a-w64-mingw32-objdump -p $exe | tr -d '\r')
+            echo "$a imports:"
+            for dll in $(echo "$dump" | sed -n 's/^[[:space:]]*DLL Name: //p' | tr 'A-Z' 'a-z' | sort -u); do
+              case "$ALLOWED" in
+                *" $dll "*) echo "  ok   $dll" ;;
+                *) echo "::error::$a build imports $dll, which is not on the allowlist"; exit 1 ;;
+              esac
+            done
+            # ASLR, DEP, terminal-server aware (and high-entropy ASLR on x64)
+            dc=$(echo "$dump" | awk '/^DllCharacteristics/ && !done { print $2; done = 1 }')
+            [ -n "$dc" ] || { echo "::error::$a: no DllCharacteristics in the PE header"; exit 1; }
+            v=$((16#$dc))
+            echo "$a DllCharacteristics=0x$dc"
+            need=$((0x40 | 0x100 | 0x8000))                  # DYNAMIC_BASE | NX_COMPAT | TERMINAL_SERVER_AWARE
+            [ $a = x86_64 ] && need=$((need | 0x20))         # HIGH_ENTROPY_VA
+            if [ $((v & need)) -ne $need ]; then
+              printf '::error::%s: DllCharacteristics 0x%s lacks flag(s) 0x%x\n' "$a" "$dc" $((need & ~v))
+              exit 1
             fi
+            # ASLR without a relocation section would not relocate anything
+            sections=$($a-w64-mingw32-objdump -h $exe)   # (not piped into grep -q: SIGPIPE + pipefail)
+            case "$sections" in *" .reloc "*) ;; *) echo "::error::$a: no .reloc section"; exit 1 ;; esac
           done
 
       - name: Package
@@ -179,6 +266,16 @@ jobs:
             cp LICENSE NOTICE THIRD_PARTY_LICENSES.txt pkg/$d/
             cp $WINDIVERT_DIR/LICENSE pkg/$d/WinDivert-LICENSE.txt
             cp docs/BENIOKU.txt pkg/$d/
+            # Notepad on Windows 7/8.1 shows LF-only text as one line: CRLF
+            # line endings (s/\r*$/\r/ is idempotent), and a UTF-8 BOM on the
+            # Turkish read-me so old Notepad does not guess ANSI.
+            for t in BENIOKU.txt LICENSE NOTICE THIRD_PARTY_LICENSES.txt WinDivert-LICENSE.txt; do
+              sed -i 's/\r*$/\r/' pkg/$d/$t
+            done
+            if [ "$(head -c 3 pkg/$d/BENIOKU.txt | od -An -tx1 | tr -d ' \n')" != efbbbf ]; then
+              { printf '\357\273\277'; cat pkg/$d/BENIOKU.txt; } > pkg/$d/BENIOKU.txt.new
+              mv pkg/$d/BENIOKU.txt.new pkg/$d/BENIOKU.txt
+            fi
             (cd pkg && zip -qr ../dist/$d.zip $d)
           done
           (cd dist && sha256sum * > SHA256SUMS.txt)
@@ -193,15 +290,87 @@ jobs:
             ./build/updpkg_check dist/TurkishDPI-$V-$w.zip TurkishDPI.exe build/$a/TurkishDPI.exe
           done
 
+      - name: Cross-compile unit tests (x64, x86, msvcrt, static)
+        run: |
+          # The shipped exe is a 32/64-bit msvcrt build, but the "test" job only
+          # runs the native build of the runner's gcc: build the same tests the
+          # way the exe is built; the "smoke" job runs them.
+          for a in x86_64 i686; do
+            bash .github/scripts/build-tests.sh $a-w64-mingw32-gcc dist-tests/$a -static
+          done
+          ls -l dist-tests/*
+
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: TurkishDPI
           path: dist/*
 
-  release:
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: TurkishDPI-tests
+          path: dist-tests
+          retention-days: 14
+
+  smoke:
+    # Runs what we ship: the unit tests built by the cross compilers, and the
+    # exes from the release zips (usage text, every UI preview scenario).
     needs: build
+    runs-on: windows-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: TurkishDPI
+          path: dist
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: TurkishDPI-tests
+          path: dist-tests
+      - name: Cross-compiled unit tests (x64, x86)
+        shell: pwsh
+        run: |
+          $failed = 0
+          foreach ($a in 'x86_64', 'i686') {
+            $tests = @(Get-ChildItem -Path "dist-tests/$a" -Filter *.exe | Sort-Object Name)
+            if ($tests.Count -eq 0) { Write-Host "::error::no unit tests found for $a"; $failed++ }
+            foreach ($t in $tests) {
+              Write-Host "== $a/$($t.Name)"
+              $p = Start-Process -FilePath $t.FullName -PassThru -NoNewWindow
+              $null = $p.Handle
+              if (-not $p.WaitForExit(120000)) {
+                try { $p.Kill() } catch { }
+                Write-Host "::error::$a/$($t.Name) timed out"; $failed++
+              } elseif ($p.ExitCode -ne 0) {
+                Write-Host "::error::$a/$($t.Name) exit code $($p.ExitCode)"; $failed++
+              }
+            }
+          }
+          if ($failed) { exit 1 }
+      - name: Release zips (usage, UI preview scenarios)
+        shell: pwsh
+        run: ./.github/scripts/smoke.ps1 -Dist dist -Work "$env:RUNNER_TEMP/smoke" -Shots smoke-shots
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        if: always()
+        with:
+          name: TurkishDPI-ui-shots
+          path: |
+            smoke-shots/*/active.bmp
+            smoke-shots/*/active-details.bmp
+            smoke-shots/*/active-settings.bmp
+            smoke-shots/*/partial.bmp
+            smoke-shots/*/error-driver.bmp
+            smoke-shots/*/banner-multi.bmp
+          if-no-files-found: warn
+          retention-days: 14
+
+  release:
+    needs: [build, smoke]
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     permissions:
       contents: write
     steps:
@@ -209,9 +378,42 @@ jobs:
         with:
           name: TurkishDPI
           path: dist
-      - name: Release
+      # The release is created as a DRAFT: it is invisible to "releases/latest"
+      # (and so to the one-click updater) until every asset is attached and
+      # checked below. Only then it is published.
+      - name: Release (draft)
+        id: release
         uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
         with:
           files: dist/*
+          fail_on_unmatched_files: true
           generate_release_notes: true
+          draft: true
           prerelease: ${{ contains(github.ref_name, '-') }}
+      - name: Verify the draft and publish it
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REL_ID: ${{ steps.release.outputs.id }}
+        run: |
+          set -euo pipefail
+          # A draft is not found by tag name through the API, so the release
+          # is addressed by the id the release step returned.
+          [ -n "$REL_ID" ] || { echo "::error::the release step returned no release id"; exit 1; }
+          (cd dist && sha256sum -c SHA256SUMS.txt)
+          gh api "repos/$GITHUB_REPOSITORY/releases/$REL_ID" > release.json
+          jq -e '.draft == true' release.json > /dev/null
+          expected=$(printf '%s\n' "TurkishDPI-$GITHUB_REF_NAME-x64.zip" "TurkishDPI-$GITHUB_REF_NAME-x86.zip" SHA256SUMS.txt | sort)
+          actual=$(jq -r '.assets[] | select(.state == "uploaded") | .name' release.json | sort)
+          echo "expected assets:"; echo "$expected"
+          echo "uploaded assets:"; echo "$actual"
+          [ "$expected" = "$actual" ] || { echo "::error::the draft does not hold exactly the 3 expected, fully uploaded assets"; exit 1; }
+          [ "$(jq '.assets | length' release.json)" = 3 ] || { echo "::error::the draft holds extra assets"; exit 1; }
+          # sizes on GitHub must equal the files that were verified above
+          for f in dist/*; do
+            n=$(basename "$f"); s=$(stat -c %s "$f")
+            jq -e --arg n "$n" --argjson s "$s" '.assets[] | select(.name == $n and .size == $s)' release.json > /dev/null ||
+              { echo "::error::asset $n differs in size from the verified file"; exit 1; }
+          done
+          gh api --method PATCH "repos/$GITHUB_REPOSITORY/releases/$REL_ID" -F draft=false > published.json
+          jq -e '.draft == false' published.json > /dev/null
+          echo "published: $(jq -r '.html_url' published.json)"
