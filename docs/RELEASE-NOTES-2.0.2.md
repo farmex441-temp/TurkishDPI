@@ -51,7 +51,7 @@ Bu sürüm yeni özellik getirmez; 2.0.1'deki hataları ve zayıf noktaları gid
 |---|---|
 | Kendi kendine test, x64 | Geçti: engelli 3 sitenin 3'ü açıldı (ortalama 164 ms), ödeme siteleri dokunulmadan geçti, motorun eklediği gecikme −1 ms |
 | Kendi kendine test, x86 | Geçti: 3/3 (ortalama 109 ms), ödeme siteleri dokunulmadan geçti, gecikme farkı +2 ms |
-| Tarayıcıyla engelli siteler (Chromium 156; discord.com, roblox.com, wattpad.com, wikipedia.org, github.com) | Beşi de açıldı |
+| Tarayıcıyla siteler (Chromium 156) | Engelli üç site (discord.com, roblox.com, wattpad.com) ve engelsiz iki site (wikipedia.org, github.com) açıldı |
 | İkinci açılış | Çalışan pencere öne geldi (tepsiden ve küçültülmüşken); `--tray` ile ikinci açılış sessiz kaldı |
 | Duraklatma + ayar | Duraklatılmışken ödeme koruması değiştirildi: durum duraklatılmış kaldı, yeni ayar sonraki açılışta uygulandı |
 | Çıkış | Pencere hemen gizlendi, program kapandı |

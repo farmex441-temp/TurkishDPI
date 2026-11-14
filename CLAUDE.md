@@ -339,6 +339,11 @@ delete or re-push a tag; publish a new version instead. WinDivert is pinned to
 2.2.2-A by SHA-256 in the workflow. Text files in the zip get CRLF line endings,
 BENIOKU.txt a UTF-8 BOM (done in the Package step; the repo files stay LF).
 
+Local builds use clang (llvm-mingw) while CI uses GCC and MSVC, so GCC-only
+warnings (e.g. `-Wmisleading-indentation` under `-Werror`) and MSVC's default C
+mode (`/std:c17` is needed for C11) only show up in CI: push the branch and let
+CI run before trusting "warning-free".
+
 ## Conventions and gotchas
 
 - Code must compile with both msvcrt (CI GCC) and ucrt (clang): no `wcstok`
@@ -537,13 +542,34 @@ BENIOKU.txt a UTF-8 BOM (done in the Package step; the repo files stay LF).
   - NOT verified on a real system: double-click on pause/resume (code review
     only), the site-check interruption paths, unknown driver error codes, update
     failure/recovery paths (covered without elevation by tests/upd_swap_test.c),
-    the download deadline on a throttled line, IPv6, other ISPs, Windows 7/8.1,
-    and the release exe built by CI (GNU ld/msvcrt): the CI "smoke" job runs it
-    for the first time.
+    the download deadline on a throttled line, IPv6, other ISPs, Windows 7/8.1.
   - Known issue, not fixed: starting a copy that lacks the driver file while
     "Windows açılışında başlat" is on removes the logon task (`autostart_migrate`
     -> `sys_install_copy` fails -> task deleted by design), although the task
     already pointed at an intact Program Files copy.
+  - Released 2026-11-14 (PR 5 merged as e864d33, tag v2.0.2). The first CI run
+    of the reworked workflow failed on two toolchain differences that local
+    builds could not show (GCC's -Wmisleading-indentation in
+    tests/core/test_tcpdpi.c under -Werror; MSVC needing /std:c17 for a C11
+    _Static_assert in exclude.c); after the fix all jobs passed, and the tag run
+    created the draft, verified the three assets and published it.
+  - Release exe built by CI (GNU ld, msvcrt): x64 1,842,861 bytes, x86
+    1,834,600 bytes (v2.0.1 x64: 2,159,187); zips 392,039 (x64) and 438,314
+    (x86) bytes. About 0.9 MB of the exe is still a zero-filled `.data` section
+    (objdump: .data 0xdb980, .bss 0xc40) - GNU ld with -fdata-sections; left for
+    a later version.
+  - Verified with the PUBLISHED files on the developer's machine, elevated:
+    `--selftest` of the release exes PASS for x64 (3/3, 155 ms, latency -10 ms)
+    and x86 (3/3, 110 ms, -5 ms); the installed v2.0.1 (Program Files copy
+    started by the logon task) updated itself to v2.0.2 with one click in about
+    2 s - exe byte-identical to the release exe, texts replaced (BENIOKU.txt now
+    with BOM), the moved-aside exe removed, logon task intact, protection active
+    afterwards. Assets match SHA256SUMS.txt; WinDivert files identical to the
+    pinned ones.
+  - Antivirus: local Windows Defender scan (signatures of 2026-11-14, real-time
+    protection on) of both zips and both exes: no threats. VirusTotal was NOT
+    checked for this release (its page required a reCAPTCHA); no numbers carried
+    over from earlier releases.
 - Size and memory of the released v2.0.1 (measured 2026-11-14, idle): exe
   2.16 MB, x64 zip about 0.57 MB; app process 16 MB working set / 7 MB private,
   engine process 3 MB / 2 MB (README quotes these; do not quote older figures).
