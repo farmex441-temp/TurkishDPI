@@ -14,4 +14,10 @@ int exclude_check_hostname(const char *host_addr, size_t host_len);
 void exclude_learn_dns(const char *data, unsigned int len);
 int  exclude_check_ip(const void *addr, int is_ipv6);   /* network byte order */
 
+/* Test hooks - only tests call these. Replace the clock (milliseconds, like
+ * GetTickCount64; NULL restores the real one) and forget every name and learned
+ * address. */
+void exclude_set_clock_for_test(unsigned long long (*clock_ms)(void));
+void exclude_reset_for_test(void);
+
 #endif

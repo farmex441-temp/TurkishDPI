@@ -6,15 +6,17 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <process.h>
 #include "exclude.h"
 
 static int fails;
 static int grp;
-static int cases[5];
+static int cases[6];
 #define G_HOST 0
 #define G_LEARN 1
 #define G_CAP 2
 #define G_LIST 3
+#define G_EXP 4
 
 #define EXPECT(cond) do { cases[grp]++; if (!(cond)) { \
     printf("FAIL line %d: %s\n", __LINE__, #cond); fails++; } } while (0)
@@ -32,7 +34,7 @@ static int host_n(const char *s, size_t n) {
 }
 static int host(const char *s) { return host_n(s, strlen(s)); }
 
-typedef struct { unsigned char b[2048]; unsigned n; } msg_t;
+typedef struct { unsigned char b[8192]; unsigned n; } msg_t;
 static void p8(msg_t *m, unsigned v) { m->b[m->n++] = (unsigned char)v; }
 static void p16(msg_t *m, unsigned v) { p8(m, v >> 8); p8(m, v); }
 static void p32(msg_t *m, unsigned v) { p16(m, v >> 16); p16(m, v); }
@@ -94,7 +96,14 @@ static void learn_a(const char *qn, int a, int b, int c, int d) {
 static int known;   /* names we know to be in the set (for the capacity test) */
 static void track(int r) { if (r > 0) known += r; }
 
-static const char *LISTFILE = "exclude_test_list.tmp";
+/* temp file in the current directory; the process id keeps two runs apart */
+static char listfile_buf[64];
+#define LISTFILE listfile_buf
+
+/* fake clock (milliseconds), see exclude_set_clock_for_test */
+static unsigned long long g_now = 1000000ull;
+static unsigned long long fake_clock(void) { return g_now; }
+#define TTL 7200000ull
 static void write_file(const void *data, size_t n) {
     FILE *f = fopen(LISTFILE, "wb");
     if (!f) { printf("cannot write %s\n", LISTFILE); exit(2); }
@@ -112,7 +121,6 @@ static int load_str(const char *s) {
 /* ---------- 1. host name matcher ---------- */
 static void test_hostname(void) {
     char big[400];
-    size_t i;
     grp = G_HOST;
     track(exclude_load_builtin());
     EXPECT(exclude_enabled());
@@ -171,17 +179,19 @@ static void test_hostname(void) {
     EXPECT(host_n("www.paypal.com", 13) == 0);   /* "www.paypal.co" */
     EXPECT(host_n("paypal.com", 9) == 0);
 
-    /* length limit 253 */
+    /* length limit 253: a 254-byte name that ends exactly in ".paypal.com" is not matched
+     * (the matcher refuses anything longer than a legal DNS name), the 253-byte one is */
     memset(big, 'a', sizeof big);
     EXPECT(!host_n(big, 254));
-    EXPECT(!host_n(big, 255));
     EXPECT(!host_n(big, 399));
-    for (i = 0; i < 253 - 11; i++) big[i] = 'a';
+    memset(big, 'a', sizeof big);
+    memcpy(big + 254 - 11, ".paypal.com", 11);
+    EXPECT(host_n(big, 254) == 0);
+    memset(big, 'a', sizeof big);
     memcpy(big + 253 - 11, ".paypal.com", 11);
-    EXPECT(host_n(big, 253) == 1);               /* longest legal name is still matched */
-    big[0] = 'b';
-    EXPECT(host_n(big, 254) == 0);               /* current behaviour: rejected */
-    EXPECT(host_n(big, 400) == 0);
+    EXPECT(host_n(big, 253) == 1);
+    EXPECT(host_n(big + 1, 253) == 0);            /* "aaa.paypa" cut: no suffix match */
+    EXPECT(host_n(big + 1, 252) == 1);            /* 252-byte name ending in .paypal.com */
 }
 
 /* ---------- 2. learning from DNS answers ---------- */
@@ -340,10 +350,35 @@ static void test_learn(void) {
     name(&m, "paypal.com"); p16(&m, 1); p16(&m, 1); rr(&m, 1, ip, 4);
     learn(&m);
     EXPECT(!has4(198, 51, 100, 83));
-    /* a question label length of 64+ */
-    hdr(&m, RESP, 1, 1); p8(&m, 64); memset(m.b + m.n, 'a', 64); m.n += 64; p8(&m, 0); p16(&m, 1); p16(&m, 1); rr(&m, 1, ip, 4);
+    /* a 64-byte label followed by paypal.com is not a legal label: nothing learned;
+     * a 63-byte label (the maximum) is a subdomain of paypal.com: learned */
+    ip[3] = 84;
+    hdr(&m, RESP, 1, 1); p8(&m, 64); memset(m.b + m.n, 'a', 64); m.n += 64; name(&m, "paypal.com");
+    p16(&m, 1); p16(&m, 1); rr(&m, 1, ip, 4);
     learn(&m);
-    EXPECT(!has4(198, 51, 100, 83));
+    EXPECT(!has4(198, 51, 100, 84));
+    ip[3] = 85;
+    hdr(&m, RESP, 1, 1); p8(&m, 63); memset(m.b + m.n, 'a', 63); m.n += 63; name(&m, "paypal.com");
+    p16(&m, 1); p16(&m, 1); rr(&m, 1, ip, 4);
+    learn(&m);
+    EXPECT(has4(198, 51, 100, 85));
+    /* labels that contain '.', ':' or NUL are not rejected: the name handed to the matcher
+     * is the raw bytes. known: accepted, see review note */
+    ip[3] = 90;   /* label "x.paypal" + "com" -> "x.paypal.com" */
+    hdr(&m, RESP, 1, 1); p8(&m, 8); memcpy(m.b + m.n, "x.paypal", 8); m.n += 8; p8(&m, 3);
+    memcpy(m.b + m.n, "com", 3); m.n += 3; p8(&m, 0); p16(&m, 1); p16(&m, 1); rr(&m, 1, ip, 4);
+    learn(&m);
+    EXPECT(has4(198, 51, 100, 90));               /* known: accepted, see review note */
+    ip[3] = 91;   /* one label "paypal.com:x" -> the port cut leaves "paypal.com" */
+    hdr(&m, RESP, 1, 1); p8(&m, 12); memcpy(m.b + m.n, "paypal.com:x", 12); m.n += 12; p8(&m, 0);
+    p16(&m, 1); p16(&m, 1); rr(&m, 1, ip, 4);
+    learn(&m);
+    EXPECT(has4(198, 51, 100, 91));               /* known: accepted, see review note */
+    ip[3] = 92;   /* one label "paypal.com\0z": the string ends at the NUL */
+    hdr(&m, RESP, 1, 1); p8(&m, 12); memcpy(m.b + m.n, "paypal.com\0z", 12); m.n += 12; p8(&m, 0);
+    p16(&m, 1); p16(&m, 1); rr(&m, 1, ip, 4);
+    learn(&m);
+    EXPECT(has4(198, 51, 100, 92));               /* known: accepted, see review note */
 
     /* every truncation of a two-record answer: an address is learned only when its whole
      * record is present. The copy handed to the code is exactly len bytes (ASan). */
@@ -392,47 +427,26 @@ static void test_learn(void) {
     }
 }
 
-/* ---------- 3. capacity of the learned-address tables ---------- */
-static void test_capacity(void) {
-    int i;
-    unsigned char a6[16];
-    grp = G_CAP;
 
-    /* IPv4: the table holds 512 entries and is a ring: when it is full the next new
-     * address replaces the entry that was written longest ago (insertion order). */
-    for (i = 0; i < 600; i++) learn_a("www.paypal.com", 172, 16, i >> 8, i & 255);
-    for (i = 0; i < 88; i++) EXPECT(!has4(172, 16, i >> 8, i & 255));       /* evicted */
-    for (i = 88; i < 600; i++) EXPECT(has4(172, 16, i >> 8, i & 255));      /* kept */
-    /* an address that is already known only refreshes its entry, it does not use a slot */
-    for (i = 0; i < 1000; i++) learn_a("www.paypal.com", 172, 16, 2, 87);   /* i = 599 */
-    EXPECT(has4(172, 16, 0, 88));
-    EXPECT(has4(172, 16, 2, 87));
-    /* ... but one more new address pushes out the oldest */
-    learn_a("www.paypal.com", 172, 17, 0, 1);
-    EXPECT(!has4(172, 16, 0, 88));
-    EXPECT(has4(172, 17, 0, 1));
-    EXPECT(has4(172, 16, 0, 89));
+/* ---------- 3. --exclude file ---------- */
 
-    /* IPv6: 256 entries */
-    for (i = 0; i < 300; i++) {
-        msg_t m;
-        memset(a6, 0, 16); a6[0] = 0x20; a6[1] = 0x01; a6[2] = 0x0d; a6[3] = 0xb8; a6[4] = 0x77;
-        a6[14] = (unsigned char)(i >> 8); a6[15] = (unsigned char)i;
-        hdr(&m, RESP, 1, 1); question(&m, "stripe.com"); rr(&m, 28, a6, 16);
-        learn(&m);
-    }
-    for (i = 0; i < 300; i++) {
-        memset(a6, 0, 16); a6[0] = 0x20; a6[1] = 0x01; a6[2] = 0x0d; a6[3] = 0xb8; a6[4] = 0x77;
-        a6[14] = (unsigned char)(i >> 8); a6[15] = (unsigned char)i;
-        EXPECT(has6(a6) == (i >= 44));
-    }
-    /* expiry (2 hours, GetTickCount64) cannot be tested here: the clock is read
-     * directly inside exclude.c. */
+static int load_bytes(const void *data, size_t n) {
+    int r;
+    write_file(data, n);
+    r = exclude_load_list(LISTFILE);
+    track(r);
+    return r;
 }
 
-/* ---------- 4. --exclude file ---------- */
+/* Fills line[0..total) with blanks and puts name at the very end. */
+static void padded(char *line, size_t total, const char *nm) {
+    size_t l = strlen(nm);
+    memset(line, ' ', total);
+    memcpy(line + total - l, nm, l);
+}
+
 static void test_list(void) {
-    char *big;
+    static char big[6000];
     int r, i, added, before;
     size_t n;
     grp = G_LIST;
@@ -448,90 +462,141 @@ static void test_list(void) {
     EXPECT(!host("c-three.test\r"));                                         /* nothing weird stored */
     EXPECT(load_str("e-five.test\r\nf-six.test") == 2);                      /* no final newline */
     EXPECT(host("f-six.test"));
+    EXPECT(load_str("crlf-a.test\r\n\r\n\r\ncrlf-b.test\r\n") == 2);         /* CRLF blank lines: no extra names */
+    EXPECT(host("crlf-a.test") && host("crlf-b.test"));
+
+    /* lone CR line ends (old Mac / some editors), and mixes */
+    EXPECT(load_str("lc-one.test\rlc-two.test\rlc-three.test") == 3);
+    EXPECT(host("lc-one.test") && host("lc-two.test") && host("lc-three.test"));
+    EXPECT(load_str("lc-four.test\r\rlc-five.test\n\r\nlc-six.test\r\n") == 3);
+    EXPECT(host("lc-four.test") && host("lc-five.test") && host("lc-six.test"));
+
+    /* a 0x1A (Ctrl-Z) byte must not end the file (binary mode) */
+    r = load_bytes("ctl-one.test\n" "\x1a" "\n" "ctl-two.test\n" "\x1a" "\n" "ctl-three.test\n" "\x1a",
+                   13 + 2 + 13 + 2 + 15 + 1);
+    EXPECT(r == 3);
+    EXPECT(host("ctl-one.test") && host("ctl-two.test") && host("ctl-three.test"));
 
     /* comments, blank lines, blanks around names, leading/trailing dots */
-    r = load_str("# a comment\n\n   \n\t \n  # indented comment.test\n"
+    r = load_str("# real-comment.test\n\n   \n\t \n  # indented-name.test\n"
                  "   g-seven.test   \t\n"
                  " .h-eight.test.  \n"
                  "i-nine.test # trailing comment j-ten.test\n"
                  "#k-eleven.test\n");
     EXPECT(r == 3);
     EXPECT(host("g-seven.test") && host("h-eight.test") && host("i-nine.test"));
-    EXPECT(!host("j-ten.test") && !host("k-eleven.test") && !host("indented.test"));
-    EXPECT(!host("# a comment") && !host("comment"));
+    EXPECT(!host("j-ten.test") && !host("k-eleven.test"));
+    EXPECT(!host("indented-name.test") && !host("real-comment.test"));
+    EXPECT(!host("comment.test") && !host("trailing"));
     /* duplicates (also of built-in names) and one-character lines are not added */
     EXPECT(load_str("paypal.com\nA-ONE.test\nx\n\n") == 0);
     EXPECT(load_str("paypal.com\nl-twelve.test\n") == 1);
-    /* CRLF file with a blank CRLF line and a comment */
     EXPECT(load_str("\r\n# c\r\nm-thirteen.test\r\n\r\n") == 1);
     EXPECT(host("m-thirteen.test"));
 
+    /* trailing blanks and dots do not count towards the 253-character limit */
+    memset(big, ' ', 600);
+    big[600] = '\n';
+    big[601] = 0;
+    memcpy(big, "pay-example.test", 16);
+    EXPECT(load_str(big) == 1);
+    EXPECT(host("pay-example.test"));
+    memset(big, '\t', 300); big[300] = 0;
+    memcpy(big, "pay-example2.test", 17);
+    r = exclude_add(big); track(r);
+    EXPECT(r == 1);
+    EXPECT(host("pay-example2.test"));
+    memset(big, 'q', 253); memset(big + 253, ' ', 200); big[453] = 0;
+    r = exclude_add(big); track(r);
+    EXPECT(r == 1);                                                          /* 253 + blanks: fine */
+    EXPECT(host_n(big, 253));
+    memset(big, 'r', 254); memset(big + 254, ' ', 200); big[454] = 0;
+    EXPECT(exclude_add(big) == 0);                                           /* 254 + blanks: too long */
+    memset(big, 's', 253); big[253] = '.'; big[254] = '.'; big[255] = 0;
+    r = exclude_add(big); track(r);
+    EXPECT(r == 1);                                                          /* 253 + trailing dots: fine */
+
     /* UTF-8 byte order mark (Notepad) must not swallow the first name */
-    write_file("\xEF\xBB\xBF" "bom-first.test\r\nbom-second.test\r\n", 3 + 14 + 2 + 15 + 2);
-    r = exclude_load_list(LISTFILE); track(r);
+    r = load_bytes("\xEF\xBB\xBF" "bom-first.test\r\nbom-second.test\r\n", 3 + 14 + 2 + 15 + 2);
     EXPECT(r == 2);
     EXPECT(host("bom-first.test") && host("bom-second.test"));
-    write_file("\xEF\xBB\xBF", 3);                                           /* BOM only */
-    EXPECT(exclude_load_list(LISTFILE) == 0);
+    EXPECT(load_bytes("\xEF\xBB\xBF", 3) == 0);                              /* BOM only */
+    r = load_bytes("\xEF\xBB\xBF" "bom-cr.test\rbom-cr2.test", 3 + 11 + 1 + 12);
+    EXPECT(r == 2);
+    EXPECT(host("bom-cr.test") && host("bom-cr2.test"));
 
-    /* over-long lines: the 1023-byte window of fgets must not turn the rest of a
-     * long comment (or of a long line) into names, and the next line must be read again */
-    big = (char *)malloc(5000);
+    /* line length: up to 1023 bytes are a valid line; longer lines are ignored as a whole
+     * (head and tail), and the next line is read normally */
+    padded(big, 1022, "e1022.test"); big[1022] = '\n';
+    r = load_bytes(big, 1023);
+    EXPECT(r == 1 && host("e1022.test"));
+    padded(big, 1023, "e1023.test"); big[1023] = '\n';
+    r = load_bytes(big, 1024);
+    EXPECT(r == 1 && host("e1023.test"));
+    padded(big, 1023, "e1023eof.test");                                      /* at EOF, no newline */
+    r = load_bytes(big, 1023);
+    EXPECT(r == 1 && host("e1023eof.test"));
+    padded(big, 1024, "e1024.test"); big[1024] = '\n';
+    memcpy(big + 1025, "after-1024.test\n", 16);
+    r = load_bytes(big, 1025 + 16);
+    EXPECT(r == 1);
+    EXPECT(!host("e1024.test") && host("after-1024.test"));
+    padded(big, 1024, "e1024eof.test");                                      /* at EOF */
+    EXPECT(load_bytes(big, 1024) == 0 && !host("e1024eof.test"));
+    memcpy(big, "long-head.test", 14);                                       /* name, blanks to 1023, then a tail */
+    memset(big + 14, ' ', 1009);
+    memcpy(big + 1023, "long-tail.test\r\nafter-long.test\r\n", 33);
+    r = load_bytes(big, 1023 + 33);
+    EXPECT(r == 1);
+    EXPECT(!host("long-head.test") && !host("long-tail.test") && host("after-long.test"));
     n = 0;
     big[n++] = '#'; big[n++] = ' ';
     while (n < 1023) big[n++] = 'x';
     memcpy(big + n, "tail-of-comment.test\nnext-line.test\n", 36); n += 36;
-    write_file(big, n);
-    r = exclude_load_list(LISTFILE); track(r);
+    r = load_bytes(big, n);
     EXPECT(r == 1);
     EXPECT(!host("tail-of-comment.test") && host("next-line.test"));
-
-    n = 0;
-    memcpy(big, "long-head.test", 14); n = 14;
-    while (n < 1023) big[n++] = ' ';
-    memcpy(big + n, "long-tail.test\r\nafter-long.test\r\n", 33); n += 33;
-    write_file(big, n);
-    r = exclude_load_list(LISTFILE); track(r);
-    /* current behaviour: trailing blanks count towards the 253-character limit, so
-     * the head is refused too; what matters is that the tail is dropped and the next
-     * line is read normally */
-    EXPECT(r == 1);
-    EXPECT(!host("long-head.test") && !host("long-tail.test") && host("after-long.test"));
-
-    /* a line of 5000 name characters is refused, a line of exactly 253/254 characters */
     for (n = 0; n < 4999; n++) big[n] = (char)('a' + n % 20);
     big[4999] = '\n';
-    write_file(big, 5000);
-    EXPECT(exclude_load_list(LISTFILE) == 0);
-    memset(big, 'a', 253); big[253] = '\n'; big[254] = 0;
-    r = load_str(big);
-    EXPECT(r == 1);
-    EXPECT(host_n(big, 253));
-    memset(big, 'b', 254); big[254] = '\n'; big[255] = 0;
-    r = load_str(big);
-    EXPECT(r == 0);
-    /* long line without any newline at all */
-    memset(big, 'c', 3000);
-    write_file(big, 3000);
-    EXPECT(exclude_load_list(LISTFILE) == 0);
-    /* exactly 1023 characters then newline / EOF */
-    memset(big, ' ', 1022); big[1022] = 'z'; big[1023] = '\n';
-    memcpy(big + 1024, "after-1023.test\n", 16);
-    write_file(big, 1024 + 16);
-    r = exclude_load_list(LISTFILE); track(r);
-    EXPECT(r == 1);                                                          /* "z" is one char: refused */
-    EXPECT(host("after-1023.test"));
-    free(big);
+    EXPECT(load_bytes(big, 5000) == 0);
+    memset(big, 'c', 3000);                                                  /* long, no newline at all */
+    EXPECT(load_bytes(big, 3000) == 0);
+    memset(big, 'z', 1100);                                                  /* lone CR after a long line */
+    memcpy(big + 1100, "\rcr-after-long.test\r", 20);
+    EXPECT(load_bytes(big, 1120) == 1 && host("cr-after-long.test"));
 
-    /* capacity: the set holds EXCL_SLOTS/2 = 512 names; further names are refused (and
-     * silently dropped, the call still succeeds); nothing already stored is lost */
+    /* NUL bytes: such a line is invalid as a whole (also when long, so the tail of a long
+     * line is never parsed as a line of its own) */
+    {
+        static const char d[] = "nul-a.test\0junk\nnul-b.test\n";
+        r = load_bytes(d, sizeof d - 1);
+        EXPECT(r == 1);
+        EXPECT(!host("nul-a.test") && host("nul-b.test"));
+    }
+    memset(big, 'a', 600);
+    big[600] = 0;
+    memcpy(big + 601, "tail-nul.test\nafter-nul.test\n", 29);
+    r = load_bytes(big, 601 + 29);
+    EXPECT(r == 1);
+    EXPECT(!host("tail-nul.test") && host("after-nul.test"));
+    memset(big, 'a', 1200);
+    big[300] = 0;
+    memcpy(big + 1200, "\ntail-nul2.test\nafter-nul2.test\n", 32);
+    r = load_bytes(big, 1200 + 32);
+    EXPECT(r == 2);                                      /* the long NUL line is dropped, the two lines after it load */
+    EXPECT(host("tail-nul2.test") && host("after-nul2.test"));
+
+    /* name set capacity: 512 names; further names are refused (silently, the call still
+     * succeeds); nothing already stored is lost */
     before = known;
     EXPECT(before > 0 && before < 512);
-    big = (char *)malloc(700 * 16 + 1);
-    n = 0;
-    for (i = 0; i < 700; i++) n += (size_t)sprintf(big + n, "cap%03d.test\n", i);
-    write_file(big, n);
-    free(big);
+    {
+        char *names = (char *)malloc(700 * 16 + 1);
+        n = 0;
+        for (i = 0; i < 700; i++) n += (size_t)sprintf(names + n, "cap%03d.test\n", i);
+        write_file(names, n);
+        free(names);
+    }
     added = exclude_load_list(LISTFILE);
     EXPECT(added == 512 - before);
     track(added);
@@ -554,14 +619,209 @@ static void test_list(void) {
     EXPECT(has4(192, 0, 2, 77));
 }
 
+/* ---------- 4. learned-address tables ---------- */
+static void ip6_of(unsigned char *a6, int i) {
+    memset(a6, 0, 16);
+    a6[0] = 0x20; a6[1] = 0x01; a6[2] = 0x0d; a6[3] = 0xb8; a6[4] = 0x77;
+    a6[14] = (unsigned char)(i >> 8); a6[15] = (unsigned char)i;
+}
+static void learn6(const unsigned char *a6) {
+    msg_t m;
+    hdr(&m, RESP, 1, 1); question(&m, "stripe.com"); rr(&m, 28, a6, 16);
+    learn(&m);
+}
+/* one tick of the fake clock per learned address: strict order of expiry */
+static void learn_a_t(int a, int b, int c, int d) { g_now++; learn_a("www.paypal.com", a, b, c, d); }
+static void learn6_t(int i) { unsigned char a6[16]; g_now++; ip6_of(a6, i); learn6(a6); }
+static int has6_i(int i) { unsigned char a6[16]; ip6_of(a6, i); return has6(a6); }
+
+static void fresh(void) {
+    exclude_reset_for_test();
+    exclude_load_builtin();
+    g_now = 10000000ull;
+}
+
+static void test_capacity(void) {
+    int i, k, live;
+    msg_t m;
+    unsigned char ip[4], a6[16];
+    grp = G_CAP;
+
+    /* IPv4: 512 entries. A full table replaces the entry that expires soonest (the one
+     * learned or refreshed longest ago), so a refreshed entry outlives older ones. */
+    fresh();
+    for (i = 0; i < 512; i++) learn_a_t(172, 16, i >> 8, i & 255);
+    for (i = 0; i < 512; i++) EXPECT(has4(172, 16, i >> 8, i & 255));
+    learn_a_t(172, 16, 0, 0);                                  /* refresh the oldest */
+    learn_a_t(172, 17, 0, 0);                                  /* new: pushes out entry 1, not 0 */
+    EXPECT(has4(172, 16, 0, 0));
+    EXPECT(!has4(172, 16, 0, 1));
+    EXPECT(has4(172, 16, 0, 2));
+    EXPECT(has4(172, 17, 0, 0));
+    for (i = 1; i < 100; i++) learn_a_t(172, 18, 0, i);        /* 99 more: entries 2..100 go */
+    EXPECT(has4(172, 16, 0, 0));
+    for (i = 1; i <= 100; i++) EXPECT(!has4(172, 16, i >> 8, i & 255));
+    for (i = 101; i < 512; i++) EXPECT(has4(172, 16, i >> 8, i & 255));
+    /* refreshing never uses a slot */
+    for (i = 0; i < 1000; i++) learn_a_t(172, 18, 0, 99);
+    for (i = 101; i < 512; i++) EXPECT(has4(172, 16, i >> 8, i & 255));
+    /* 600 distinct addresses in a row: exactly the last 512 are left */
+    fresh();
+    for (i = 0; i < 600; i++) learn_a_t(172, 16, i >> 8, i & 255);
+    for (i = 0; i < 600; i++) EXPECT(has4(172, 16, i >> 8, i & 255) == (i >= 88));
+
+    /* IPv6: 256 entries, same rule */
+    fresh();
+    for (i = 0; i < 256; i++) learn6_t(i);
+    learn6_t(0);                                               /* refresh */
+    learn6_t(1000);                                            /* new: entry 1 is replaced */
+    EXPECT(has6_i(0) && !has6_i(1) && has6_i(2) && has6_i(1000));
+    for (i = 0; i < 300; i++) learn6_t(2000 + i);
+    for (i = 0; i < 300; i++) EXPECT(has6_i(2000 + i) == (i >= 44));
+    EXPECT(!has6_i(0) && !has6_i(2));
+
+    /* at most 16 addresses are learned from one answer, the rest is ignored */
+    fresh();
+    hdr(&m, RESP, 1, 100); question(&m, "www.paypal.com");
+    for (i = 0; i < 100; i++) { ip[0] = 10; ip[1] = 20; ip[2] = 0; ip[3] = (unsigned char)i; rr(&m, 1, ip, 4); }
+    learn(&m);
+    for (i = 0; i < 100; i++) EXPECT(has4(10, 20, 0, i) == (i < 16));
+    hdr(&m, RESP, 1, 100); question(&m, "www.paypal.com");
+    for (i = 0; i < 100; i++) { ip6_of(a6, 3000 + i); rr(&m, 28, a6, 16); }
+    learn(&m);
+    for (i = 0; i < 100; i++) EXPECT(has6_i(3000 + i) == (i < 16));
+    /* the limit counts A and AAAA together; other record types do not count */
+    hdr(&m, RESP, 1, 33); question(&m, "www.paypal.com");
+    for (i = 0; i < 5; i++) { ip[0] = 10; ip[1] = 21; ip[2] = 0; ip[3] = (unsigned char)i; rr(&m, 16, ip, 4); }
+    for (i = 0; i < 8; i++) { ip[0] = 10; ip[1] = 22; ip[2] = 0; ip[3] = (unsigned char)i; rr(&m, 1, ip, 4); }
+    for (i = 0; i < 20; i++) { ip6_of(a6, 4000 + i); rr(&m, 28, a6, 16); }
+    learn(&m);
+    for (i = 0; i < 5; i++) EXPECT(!has4(10, 21, 0, i));
+    for (i = 0; i < 8; i++) EXPECT(has4(10, 22, 0, i));
+    for (i = 0; i < 20; i++) EXPECT(has6_i(4000 + i) == (i < 8));
+    /* a few oversized answers cannot flush the genuine addresses */
+    fresh();
+    for (i = 0; i < 512; i++) learn_a_t(172, 16, i >> 8, i & 255);
+    for (k = 0; k < 3; k++) {
+        g_now++;
+        hdr(&m, RESP, 1, 100); question(&m, "www.paypal.com");
+        for (i = 0; i < 100; i++) { ip[0] = 10; ip[1] = (unsigned char)(30 + k); ip[2] = 0; ip[3] = (unsigned char)i; rr(&m, 1, ip, 4); }
+        learn(&m);
+    }
+    live = 0;
+    for (i = 0; i < 512; i++) live += has4(172, 16, i >> 8, i & 255);
+    EXPECT(live == 512 - 48);
+}
+
+static void test_expiry(void) {
+    unsigned long long t0 = 20000000ull;
+    unsigned char a6[16];
+    int i, live;
+    grp = G_EXP;
+
+    fresh();
+    g_now = t0;
+    learn_a("www.paypal.com", 198, 18, 0, 1);
+    g_now = t0 + 1;
+    EXPECT(has4(198, 18, 0, 1));
+    g_now = t0 + TTL - 1;
+    EXPECT(has4(198, 18, 0, 1));                               /* just before the TTL */
+    g_now = t0 + TTL;
+    EXPECT(!has4(198, 18, 0, 1));                              /* at the TTL: gone */
+    g_now = t0 + TTL + 5000;
+    EXPECT(!has4(198, 18, 0, 1));
+
+    /* re-learned: fresh TTL from the moment of the new answer */
+    g_now = t0;
+    learn_a("www.paypal.com", 198, 18, 0, 2);
+    g_now = t0 + TTL - 10;
+    learn_a("www.paypal.com", 198, 18, 0, 2);
+    g_now = t0 + TTL + 5;
+    EXPECT(has4(198, 18, 0, 2));                               /* would have expired without the refresh */
+    g_now = t0 + 2 * TTL - 11;
+    EXPECT(has4(198, 18, 0, 2));
+    g_now = t0 + 2 * TTL - 10;
+    EXPECT(!has4(198, 18, 0, 2));
+    /* an already expired address is learned again */
+    g_now = t0 + 3 * TTL;
+    learn_a("www.paypal.com", 198, 18, 0, 2);
+    EXPECT(has4(198, 18, 0, 2));
+
+    /* IPv6 */
+    g_now = t0;
+    ip6_of(a6, 7); learn6(a6);
+    g_now = t0 + TTL - 1;
+    EXPECT(has6(a6));
+    g_now = t0 + TTL;
+    EXPECT(!has6(a6));
+
+    /* an expired entry is reused before any live one, wherever it sits in the table:
+     * entry E (learned at an early time) is stored after 100 later-expiring ones */
+    fresh();
+    g_now = t0 + TTL - 600;
+    for (i = 0; i < 100; i++) { g_now++; learn_a("www.paypal.com", 172, 16, 0, i); }
+    g_now = t0;
+    learn_a("www.paypal.com", 172, 31, 0, 1);                  /* E, expires at t0 + TTL */
+    g_now = t0 + TTL - 500;
+    for (i = 100; i < 511; i++) { g_now++; learn_a("www.paypal.com", 172, 16, i >> 8, i & 255); }
+    g_now = t0 + TTL - 1;
+    EXPECT(has4(172, 31, 0, 1));                               /* table is full, E still live */
+    g_now = t0 + TTL + 1;                                      /* E expired, the others are not */
+    EXPECT(!has4(172, 31, 0, 1));
+    learn_a("www.paypal.com", 172, 32, 0, 1);                  /* new address takes E's slot */
+    EXPECT(has4(172, 32, 0, 1));
+    live = 0;
+    for (i = 0; i < 511; i++) live += has4(172, 16, i >> 8, i & 255);
+    EXPECT(live == 511);
+    /* no expired entry left: the one that expires soonest (the oldest) goes */
+    g_now = t0 + TTL + 2;
+    learn_a("www.paypal.com", 172, 32, 0, 2);
+    EXPECT(has4(172, 32, 0, 2) && !has4(172, 16, 0, 0));
+    EXPECT(has4(172, 16, 0, 1) && has4(172, 32, 0, 1));
+}
+
+/* ---------- 5. built-in names win whatever the load order ---------- */
+static void test_builtin_first(void) {
+    char *names;
+    int i, user_added, builtin_n, builtin_n2;
+    size_t n;
+    grp = G_LIST;
+
+    exclude_reset_for_test();
+    builtin_n = exclude_load_builtin();
+    exclude_reset_for_test();
+    EXPECT(!exclude_enabled());                                 /* reset really empties */
+
+    /* a user list that is larger than the whole set, loaded BEFORE the built-in names */
+    names = (char *)malloc(700 * 16 + 1);
+    n = 0;
+    for (i = 0; i < 700; i++) n += (size_t)sprintf(names + n, "usr%03d.test\n", i);
+    write_file(names, n);
+    free(names);
+    user_added = exclude_load_list(LISTFILE);
+    EXPECT(user_added > 0 && user_added <= 512 - builtin_n);   /* room is kept for the built-in list */
+    builtin_n2 = exclude_load_builtin();
+    EXPECT(builtin_n2 == builtin_n);                           /* none of them displaced */
+    EXPECT(host("paypal.com") && host("www.garanti.com.tr") && host("isbank.com.tr"));
+    EXPECT(host("btcturk.com") && host("paribu.com") && host("sanalpos.iyzico.com"));
+    EXPECT(host("usr000.test") && !host("usr699.test"));
+    /* after the built-in names are in, user names may use the rest of the 512 */
+    EXPECT(exclude_add("late-user.test") == (user_added + builtin_n < 512));
+}
+
 int main(void) {
+    sprintf(listfile_buf, "exclude_test_list_%d.tmp", (int)_getpid());
+    remove(LISTFILE);
+    exclude_set_clock_for_test(fake_clock);
     test_hostname();
     test_learn();
-    test_capacity();
     test_list();
+    test_capacity();
+    test_expiry();
+    test_builtin_first();
     remove(LISTFILE);
-    printf("cases: hostname=%d learn=%d capacity=%d list=%d\n",
-           cases[G_HOST], cases[G_LEARN], cases[G_CAP], cases[G_LIST]);
+    printf("cases: hostname=%d learn=%d capacity=%d list=%d expiry=%d\n",
+           cases[G_HOST], cases[G_LEARN], cases[G_CAP], cases[G_LIST], cases[G_EXP]);
     printf(fails ? "%d failures\n" : "all passed\n", fails);
     return fails != 0;
 }
