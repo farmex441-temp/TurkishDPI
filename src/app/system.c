@@ -766,53 +766,132 @@ static int url_allowed(const wchar_t *url) {
     return n > sl && !_wcsnicmp(end - sl, sfx, sl);
 }
 
-/* GET https://github.com<path> (redirects followed, final host checked);
- * at most cap bytes into a malloc'ed buffer.
+/*
+ * GET https://github.com<path>, following up to 3 redirects by hand (each
+ * target checked with url_allowed before we connect to it); at most cap
+ * bytes into a malloc'ed buffer.
  *
  * total_ms bounds the whole download: it runs on the controller thread, and
- * the per-operation WinHTTP timeouts alone let a throttled connection that
- * sends a little every few seconds block the controller for hours. Each read
- * waits at most the time that is left (and at most 30 s), and the deadline
- * is checked after every step, so the overrun is at most one connect/send
- * timeout. Returns HG_OK, HG_FAIL, HG_TIMEOUT or HG_TOO_BIG. */
+ * WinHTTP's own per-phase timeouts (and its automatic redirects, which start
+ * a whole new resolve/connect/send/receive inside ReceiveResponse) would let
+ * a slow or throttled network block the controller for minutes or hours.
+ * So redirects are followed here, and before every blocking call the time
+ * left is computed and every phase that call can use is capped to it (and to
+ * its own maximum):
+ *   WinHttpSendRequest     resolve <= 10 s, connect <= 15 s (per address the
+ *                          name resolves to), TLS handshake + send <= 30 s
+ *                          (send/receive timeouts)
+ *   WinHttpReceiveResponse response headers <= 30 s (receive timeout and
+ *                          WINHTTP_OPTION_RECEIVE_RESPONSE_TIMEOUT, whose
+ *                          default is 90 s)
+ *   WinHttpReadData        receive <= 30 s
+ * each "<= time left" as well. The deadline is checked before every call, so
+ * no call starts after it. True worst case: one call that started just
+ * before the deadline runs to the sum of its own (capped) phases - for
+ * SendRequest at most 10 + 15 + 30 s (connect once more per extra address of
+ * the host), for the other calls at most 30 s - and then the download stops.
+ * The calls that make no network I/O (WinHttpOpen/Connect/OpenRequest,
+ * QueryHeaders/QueryOption/SetOption) are not bounded separately.
+ * Returns HG_OK, HG_FAIL, HG_TIMEOUT or HG_TOO_BIG.
+ */
 enum { HG_OK = 1, HG_FAIL = 0, HG_TIMEOUT = -1, HG_TOO_BIG = -2 };
+#ifndef WINHTTP_OPTION_RECEIVE_RESPONSE_TIMEOUT
+#define WINHTTP_OPTION_RECEIVE_RESPONSE_TIMEOUT 7
+#endif
+
+/* ms until deadline (0 = passed), never more than 0x7FFFFFFF */
+static DWORD ms_left(ULONGLONG deadline) {
+    ULONGLONG now = GetTickCount64();
+    if (now >= deadline) return 0;
+    return deadline - now > 0x7FFFFFFFull ? 0x7FFFFFFFu : (DWORD)(deadline - now);
+}
+
+/* min(left, max), at least 1: a WinHTTP timeout of 0 means "infinite" */
+static int capped(DWORD left, int max) {
+    int v = left < (DWORD)max ? (int)left : max;
+    return v < 1 ? 1 : v;
+}
+
+/* Caps every timeout of request r to the time left. */
+static void hop_timeouts(HINTERNET r, DWORD left) {
+    DWORD rr = (DWORD)capped(left, 30000);
+    WinHttpSetTimeouts(r, capped(left, 10000), capped(left, 15000), capped(left, 30000), capped(left, 30000));
+    /* header phase (default 90 s); may be unsupported on old systems: the
+     * receive timeout above still applies, so a failure is ignored */
+    WinHttpSetOption(r, WINHTTP_OPTION_RECEIVE_RESPONSE_TIMEOUT, &rr, sizeof(rr));
+}
 
 static int http_get(const char *path_a, size_t cap, DWORD total_ms, unsigned char **out, size_t *len) {
-    wchar_t path[512], url[4096];
-    DWORD status = 0, sz = sizeof(status), usz = sizeof(url);
+    wchar_t url[4096], host[256];
     HINTERNET s, c = NULL, r = NULL;
     unsigned char *buf = NULL;
     size_t n = 0, have = 0;
     const size_t limit = cap + 1;   /* room for the read that returns 0 after exactly cap bytes */
     const ULONGLONG deadline = GetTickCount64() + total_ms;
-    int rc = HG_FAIL;
+    int rc = HG_FAIL, hop;
     *out = NULL;
     *len = 0;
-    if (!MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, path_a, -1, path, 512)) return HG_FAIL;
+    {   /* the path is UTF-8 in our own code */
+        wchar_t p[1024];
+        if (!MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, path_a, -1, p, 1024) ||
+            !wfmt(url, 4096, L"https://github.com%ls", p))
+            return HG_FAIL;
+    }
     s = WinHttpOpen(L"TurkishDPI/" TURKISHDPI_VERSION_W, WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
                     WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
     if (!s) return HG_FAIL;
     sysdll_winhttp_tls(s);
-    {
-        int rt = total_ms < 30000 ? (int)total_ms : 30000;
-        WinHttpSetTimeouts(s, 10000, 15000, rt, rt);
-    }
-    c = WinHttpConnect(s, L"github.com", INTERNET_DEFAULT_HTTPS_PORT, 0);
-    if (c) r = WinHttpOpenRequest(c, L"GET", path, NULL, WINHTTP_NO_REFERER,
-                                  WINHTTP_DEFAULT_ACCEPT_TYPES, WINHTTP_FLAG_SECURE);
-    if (r && WinHttpSendRequest(r, WINHTTP_NO_ADDITIONAL_HEADERS, 0, WINHTTP_NO_REQUEST_DATA, 0, 0, 0) &&
-        WinHttpReceiveResponse(r, NULL) &&
-        WinHttpQueryHeaders(r, WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
-                            WINHTTP_HEADER_NAME_BY_INDEX, &status, &sz, WINHTTP_NO_HEADER_INDEX) &&
-        status == 200 && WinHttpQueryOption(r, WINHTTP_OPTION_URL, url, &usz) && url_allowed(url)) {
+
+    for (hop = 0; hop < 4; hop++) {
+        DWORD status = 0, sz = sizeof(status), left, nofollow = WINHTTP_DISABLE_REDIRECTS;
+        const wchar_t *h, *path;
+        size_t hl;
+        if (!url_allowed(url)) break;                        /* https, github.com / *.githubusercontent.com */
+        h = url + 8;
+        path = wcschr(h, L'/');                               /* url_allowed: present, no port */
+        hl = (size_t)(path - h);
+        if (hl >= sizeof(host) / sizeof(host[0])) break;
+        memcpy(host, h, hl * sizeof(wchar_t));
+        host[hl] = 0;
+        if ((left = ms_left(deadline)) == 0) { rc = HG_TIMEOUT; break; }
+        c = WinHttpConnect(s, host, INTERNET_DEFAULT_HTTPS_PORT, 0);
+        if (c) r = WinHttpOpenRequest(c, L"GET", path, NULL, WINHTTP_NO_REFERER,
+                                      WINHTTP_DEFAULT_ACCEPT_TYPES, WINHTTP_FLAG_SECURE);
+        if (!r || !WinHttpSetOption(r, WINHTTP_OPTION_DISABLE_FEATURE, &nofollow, sizeof(nofollow))) break;
+        hop_timeouts(r, left);
+        if (!WinHttpSendRequest(r, WINHTTP_NO_ADDITIONAL_HEADERS, 0, WINHTTP_NO_REQUEST_DATA, 0, 0, 0)) {
+            if (!ms_left(deadline)) rc = HG_TIMEOUT;
+            break;
+        }
+        if ((left = ms_left(deadline)) == 0) { rc = HG_TIMEOUT; break; }
+        hop_timeouts(r, left);
+        if (!WinHttpReceiveResponse(r, NULL)) {
+            if (!ms_left(deadline)) rc = HG_TIMEOUT;
+            break;
+        }
+        if (!WinHttpQueryHeaders(r, WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
+                                 WINHTTP_HEADER_NAME_BY_INDEX, &status, &sz, WINHTTP_NO_HEADER_INDEX))
+            break;
+        if (status == 301 || status == 302 || status == 303 || status == 307 || status == 308) {
+            DWORD lsz = sizeof(url) - sizeof(wchar_t);
+            /* absolute https URL expected; anything else fails url_allowed */
+            if (!WinHttpQueryHeaders(r, WINHTTP_QUERY_LOCATION, WINHTTP_HEADER_NAME_BY_INDEX, url, &lsz,
+                                     WINHTTP_NO_HEADER_INDEX))
+                break;
+            url[lsz / sizeof(wchar_t) < 4095 ? lsz / sizeof(wchar_t) : 4095] = 0;
+            WinHttpCloseHandle(r);
+            r = NULL;
+            WinHttpCloseHandle(c);
+            c = NULL;
+            continue;
+        }
+        if (status != 200) break;
         rc = HG_OK;
         for (;;) {
-            DWORD got = 0, left;
-            ULONGLONG now = GetTickCount64();
-            if (now >= deadline) { rc = HG_TIMEOUT; break; }
-            left = (DWORD)(deadline - now);
-            if (left > 30000) left = 30000;
-            WinHttpSetOption(r, WINHTTP_OPTION_RECEIVE_TIMEOUT, &left, sizeof(left));
+            DWORD got = 0, rt;
+            if ((left = ms_left(deadline)) == 0) { rc = HG_TIMEOUT; break; }
+            rt = (DWORD)capped(left, 30000);
+            WinHttpSetOption(r, WINHTTP_OPTION_RECEIVE_TIMEOUT, &rt, sizeof(rt));
             if (n == have) {
                 size_t nc = have ? have * 2 : 256 * 1024;
                 unsigned char *nb;
@@ -824,15 +903,14 @@ static int http_get(const char *path_a, size_t cap, DWORD total_ms, unsigned cha
                 have = nc;
             }
             if (!WinHttpReadData(r, buf + n, (DWORD)(have - n), &got)) {
-                rc = GetTickCount64() >= deadline ? HG_TIMEOUT : HG_FAIL;
+                rc = ms_left(deadline) ? HG_FAIL : HG_TIMEOUT;
                 break;
             }
             if (!got) break;
             n += got;
         }
         if (rc == HG_OK && n > cap) rc = HG_TOO_BIG;
-    } else if (GetTickCount64() >= deadline) {
-        rc = HG_TIMEOUT;
+        break;
     }
     if (r) WinHttpCloseHandle(r);
     if (c) WinHttpCloseHandle(c);
