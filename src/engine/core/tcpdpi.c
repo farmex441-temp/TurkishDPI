@@ -148,7 +148,7 @@ int tcpdpi_hops_get(uint32_t ip_be, uint64_t now_ms) {
 }
 
 /* ───────────────────────── segment builders ───────────────────────── */
-#define TCPDPI_SEG_MAX 1600  /* keep crafted segments within a normal MTU */
+/* TurkishDPI: TCPDPI_SEG_MAX (1600) moved to tcpdpi.h */
 
 int tcpdpi_build_segment4(uint8_t *dst, size_t dstcap,
                           const uint8_t *ip_tmpl, int ihl,
@@ -195,6 +195,10 @@ int tcpdpi_build_seqovl4(uint8_t *dst, size_t dstcap,
                                pay, paylen, 0 /* good: the server keeps it */);
 }
 
+/* TurkishDPI: now built from tcpdpi_plan_fakedsplit (one piece per part as
+ * before while the parts fit TCPDPI_PIECE_MAX; a larger payload needs more
+ * pieces than segs[3] holds and is refused here - the engine sends whole
+ * plans itself). Output for payloads that fit is unchanged. */
 int tcpdpi_build_fakedsplit4(tcpdpi_seg segs[3], int *nsegs,
                              const uint8_t *ip_tmpl, int ihl,
                              const uint8_t *tcp_tmpl, int tcphl,
@@ -203,41 +207,20 @@ int tcpdpi_build_fakedsplit4(tcpdpi_seg segs[3], int *nsegs,
                              int split_pos, int fake_ttl, uint8_t pattern,
                              int disorder) {
   if (!segs || !nsegs || !real) return 0;
-  if (real_len < 2 || real_len > TCPDPI_SEG_MAX) return 0;
-  if (split_pos < 1 || split_pos >= real_len) return 0;
-  int lenA = split_pos;                 /* real[0,split) at seq            */
-  int lenB = real_len - split_pos;      /* real[split,n) at seq+split      */
-  uint32_t seqB = seq + (uint32_t)split_pos;
-  uint8_t junk[TCPDPI_SEG_MAX];
-
+  tcpdpi_piece plan[3];
+  int n = tcpdpi_plan_fakedsplit(plan, 3, real_len, split_pos, disorder);
+  if (n != 3) return 0;
   /* The three segments in the order they are sent. The fake shadows the real
    * part that follows it, carrying junk so the DPI mis-reads that region; its
    * low TTL and bad checksum keep it from ever being accepted by the server. */
-  int a, f, b;
-  if (!disorder) {            /* fakedsplit: A, fake@split, B */
-    memset(junk, pattern, (size_t)lenB);
-    a = tcpdpi_build_segment4(segs[0].data, sizeof segs[0].data, ip_tmpl, ihl, tcp_tmpl, tcphl,
-                              ip_id, seq, ttl, real, lenA, 0);
-    f = tcpdpi_build_segment4(segs[1].data, sizeof segs[1].data, ip_tmpl, ihl, tcp_tmpl, tcphl,
-                              (uint16_t)(ip_id + 1), seqB, fake_ttl, junk, lenB, 1);
-    b = tcpdpi_build_segment4(segs[2].data, sizeof segs[2].data, ip_tmpl, ihl, tcp_tmpl, tcphl,
-                              (uint16_t)(ip_id + 2), seqB, ttl, real + split_pos, lenB, 0);
-    segs[0].is_fake = 0; segs[1].is_fake = 1; segs[2].is_fake = 0;
-  } else {                    /* fakeddisorder: B, fake@0, A */
-    memset(junk, pattern, (size_t)lenA);
-    b = tcpdpi_build_segment4(segs[0].data, sizeof segs[0].data, ip_tmpl, ihl, tcp_tmpl, tcphl,
-                              ip_id, seqB, ttl, real + split_pos, lenB, 0);
-    f = tcpdpi_build_segment4(segs[1].data, sizeof segs[1].data, ip_tmpl, ihl, tcp_tmpl, tcphl,
-                              (uint16_t)(ip_id + 1), seq, fake_ttl, junk, lenA, 1);
-    a = tcpdpi_build_segment4(segs[2].data, sizeof segs[2].data, ip_tmpl, ihl, tcp_tmpl, tcphl,
-                              (uint16_t)(ip_id + 2), seq, ttl, real, lenA, 0);
-    segs[0].is_fake = 0; segs[1].is_fake = 1; segs[2].is_fake = 0;
+  for (int i = 0; i < n; i++) {
+    int len = tcpdpi_build_piece4(segs[i].data, sizeof segs[i].data, ip_tmpl, ihl, tcp_tmpl, tcphl,
+                                  ip_id, seq, ttl, fake_ttl, pattern, real, &plan[i]);
+    if (len <= 0) return 0;
+    segs[i].len = len;
+    segs[i].is_fake = plan[i].fake;
   }
-  if (a <= 0 || f <= 0 || b <= 0) return 0;
-  segs[0].len = disorder ? b : a;
-  segs[1].len = f;
-  segs[2].len = disorder ? a : b;
-  *nsegs = 3;
+  *nsegs = n;
   return 1;
 }
 
@@ -266,24 +249,136 @@ int tcpdpi_build_multisplit4(tcpdpi_seg segs[3], int *nsegs,
                              const uint8_t *real, int real_len,
                              const int *cuts, int ncuts, int reverse) {
   if (!segs || !nsegs || !real || !cuts || ncuts < 1 || ncuts > 2 || real_len < 2) return 0;
-  int at[4], k = 0;
-  at[k++] = 0;
-  for (int i = 0; i < ncuts; i++) {
-    if (cuts[i] <= at[k - 1] || cuts[i] >= real_len) return 0;   /* ascending, inside */
-    at[k++] = cuts[i];
-  }
-  at[k] = real_len;
+  /* TurkishDPI: built from tcpdpi_plan_split; a payload whose parts do not
+   * fit TCPDPI_PIECE_MAX needs more than three pieces and is refused here. */
+  tcpdpi_piece plan[3];
+  int k = tcpdpi_plan_split(plan, 3, real_len, cuts, ncuts, reverse);
+  if (k != ncuts + 1) return 0;
   for (int i = 0; i < k; i++) {
-    int slot = reverse ? k - 1 - i : i;
-    int len = tcpdpi_build_segment4(segs[slot].data, sizeof segs[slot].data, ip_tmpl, ihl,
-                                    tcp_tmpl, tcphl, (uint16_t)(ip_id + i), seq + (uint32_t)at[i],
-                                    ttl, real + at[i], at[i + 1] - at[i], 0);
+    int len = tcpdpi_build_piece4(segs[i].data, sizeof segs[i].data, ip_tmpl, ihl, tcp_tmpl, tcphl,
+                                  ip_id, seq, ttl, ttl, 0, real, &plan[i]);
     if (len <= 0) return 0;
-    segs[slot].len = len;
-    segs[slot].is_fake = 0;
+    segs[i].len = len;
+    segs[i].is_fake = 0;
   }
   *nsegs = k;
   return 1;
+}
+
+/* ───────────── TurkishDPI: bounded pieces for payloads of any size ───────────── */
+/* Appends the runs of [from, to) to out[*n..], ids from *id; ascending. */
+static int plan_runs(tcpdpi_piece *out, int cap, int *n, int from, int to, int fake, int *id) {
+  for (int off = from; off < to; off += TCPDPI_PIECE_MAX) {
+    if (*n >= cap) return 0;
+    int len = to - off < TCPDPI_PIECE_MAX ? to - off : TCPDPI_PIECE_MAX;
+    out[*n].off = off; out[*n].len = len; out[*n].fake = fake; out[*n].id = (*id)++;
+    (*n)++;
+  }
+  return 1;
+}
+
+static void plan_reverse(tcpdpi_piece *p, int n) {
+  for (int i = 0, j = n - 1; i < j; i++, j--) { tcpdpi_piece t = p[i]; p[i] = p[j]; p[j] = t; }
+}
+
+int tcpdpi_plan_split(tcpdpi_piece *out, int cap, int plen, const int *cuts, int ncuts, int reverse) {
+  if (!out || cap < 1 || plen < 1 || ncuts < 0 || ncuts > 4 || (ncuts > 0 && !cuts)) return 0;
+  int n = 0, id = 0, start = 0;
+  for (int i = 0; i <= ncuts; i++) {
+    int end = i < ncuts ? cuts[i] : plen;
+    if (end <= start || end > plen || (i < ncuts && end >= plen)) return 0;  /* ascending, inside */
+    if (!plan_runs(out, cap, &n, start, end, 0, &id)) return 0;
+    start = end;
+  }
+  if (reverse) plan_reverse(out, n);
+  return n;
+}
+
+int tcpdpi_plan_fakedsplit(tcpdpi_piece *out, int cap, int plen, int split, int disorder) {
+  if (!out || cap < 1 || plen < 2 || split < 1 || split >= plen) return 0;
+  int n = 0, id = 0, m;
+  if (!disorder) {                                  /* A, decoy@split, B */
+    if (!plan_runs(out, cap, &n, 0, split, 0, &id)) return 0;
+    if (!plan_runs(out, cap, &n, split, split + (plen - split < TCPDPI_PIECE_MAX ? plen - split : TCPDPI_PIECE_MAX), 1, &id)) return 0;
+    if (!plan_runs(out, cap, &n, split, plen, 0, &id)) return 0;
+  } else {                                          /* B desc, decoy@0, A desc */
+    if (!plan_runs(out, cap, &n, split, plen, 0, &id)) return 0;
+    plan_reverse(out, n);
+    if (!plan_runs(out, cap, &n, 0, split < TCPDPI_PIECE_MAX ? split : TCPDPI_PIECE_MAX, 1, &id)) return 0;
+    m = n;
+    if (!plan_runs(out, cap, &n, 0, split, 0, &id)) return 0;
+    plan_reverse(out + m, n - m);
+  }
+  for (int i = 0; i < n; i++) out[i].id = i;        /* ids in send order */
+  return n;
+}
+
+int tcpdpi_build_piece4(uint8_t *dst, size_t dstcap,
+                        const uint8_t *ip_tmpl, int ihl,
+                        const uint8_t *tcp_tmpl, int tcphl,
+                        uint16_t ip_id, uint32_t seq, int ttl, int fake_ttl, uint8_t pattern,
+                        const uint8_t *data, const tcpdpi_piece *p) {
+  uint8_t junk[TCPDPI_PIECE_MAX];
+  if (!p || !data || p->off < 0 || p->len < 1 || p->len > TCPDPI_PIECE_MAX) return 0;
+  if (p->fake) memset(junk, pattern, (size_t)p->len);
+  return tcpdpi_build_segment4(dst, dstcap, ip_tmpl, ihl, tcp_tmpl, tcphl,
+                               (uint16_t)(ip_id + p->id), seq + (uint32_t)p->off,
+                               p->fake ? fake_ttl : ttl, p->fake ? junk : data + p->off, p->len, p->fake);
+}
+
+int tcpdpi_build_segment6(uint8_t *dst, size_t dstcap,
+                          const uint8_t *ip6_tmpl, const uint8_t *tcp_tmpl, int tcphl,
+                          uint32_t seq, int hop, const uint8_t *payload, int seg_len,
+                          int bad_tcp_csum) {
+  if (!dst || !ip6_tmpl || !tcp_tmpl || tcphl < 20 || tcphl > 60 || seg_len < 0) return 0;
+  int total = 40 + tcphl + seg_len;
+  if (total > TCPDPI_SEG_MAX || (size_t)total > dstcap) return 0;
+  if ((ip6_tmpl[0] >> 4) != 6) return 0;
+  memcpy(dst, ip6_tmpl, 40);
+  memcpy(dst + 40, tcp_tmpl, (size_t)tcphl);
+  if (seg_len > 0) {
+    if (!payload) return 0;
+    memcpy(dst + 40 + tcphl, payload, (size_t)seg_len);
+  }
+  dst[6] = 6;                                       /* next header: TCP, no extensions */
+  wr16(dst + 4, (uint16_t)(tcphl + seg_len));       /* payload length */
+  dst[7] = (uint8_t)(hop < 1 ? 1 : (hop > 255 ? 255 : hop));
+  wr32(dst + 40 + 4, seq);
+  uint32_t sum = csum_add(dst + 8, 32, 0);          /* source + destination */
+  sum += (uint32_t)(tcphl + seg_len);               /* upper-layer length */
+  sum += 6;                                         /* next header */
+  dst[40 + 16] = 0; dst[40 + 17] = 0;
+  uint16_t c = csum_fold(csum_add(dst + 40, tcphl + seg_len, sum));
+  if (bad_tcp_csum) c = (uint16_t)(c ^ 0xffff);
+  wr16(dst + 40 + 16, c);
+  return total;
+}
+
+int tcpdpi_build_piece6(uint8_t *dst, size_t dstcap,
+                        const uint8_t *ip6_tmpl, const uint8_t *tcp_tmpl, int tcphl,
+                        uint32_t seq, int hop, int fake_hop, uint8_t pattern,
+                        const uint8_t *data, const tcpdpi_piece *p) {
+  uint8_t junk[TCPDPI_PIECE_MAX];
+  if (!p || !data || p->off < 0 || p->len < 1 || p->len > TCPDPI_PIECE_MAX) return 0;
+  if (p->fake) memset(junk, pattern, (size_t)p->len);
+  return tcpdpi_build_segment6(dst, dstcap, ip6_tmpl, tcp_tmpl, tcphl, seq + (uint32_t)p->off,
+                               p->fake ? fake_hop : hop, p->fake ? junk : data + p->off, p->len, p->fake);
+}
+
+int tcpdpi_choose_cuts(const uint8_t *payload, int plen, int is_tls, int host_off, int host_len,
+                       int split_pos, int cuts[2]) {
+  if (!payload || !cuts || plen < 2) return 0;
+  if (split_pos > 0) {
+    cuts[0] = split_pos < plen ? split_pos : plen - 1;
+    return 1;
+  }
+  int n = tcpdpi_split_points(payload, plen, host_off, host_len, cuts);
+  if (n > 0) return n;
+  if (is_tls && plen > TCPDPI_FALLBACK_CUT) {       /* the name is in a later segment */
+    cuts[0] = TCPDPI_FALLBACK_CUT;
+    return 1;
+  }
+  return 0;
 }
 
 void tcpdpi_refresh_csum4(uint8_t *pkt, int len, int ihl) {
@@ -302,6 +397,12 @@ void tcpdpi_refresh_csum4(uint8_t *pkt, int len, int ihl) {
  * table); the split only needs the name to straddle it, and the name's SNI sits
  * early, in this first segment. */
 static int tlsrec_form(uint8_t *pay, const uint8_t *real, int real_len, int cut, int *rec1_len) {
+  return tcpdpi_tlsrec_form(pay, TCPDPI_SEG_MAX, real, real_len, cut, rec1_len);
+}
+
+/* TurkishDPI: the same with the capacity given (the engine forms a large
+ * ClientHello's records in a 64 KB buffer and sends them in pieces). */
+int tcpdpi_tlsrec_form(uint8_t *pay, int cap, const uint8_t *real, int real_len, int cut, int *rec1_len) {
   if (!pay || !real || real_len < 6) return 0;
   if (real[0] != 0x16 || real[1] != 0x03) return 0;        /* a TLS record */
   int rl = rd16(real + 3);                                  /* this record's body */
@@ -314,7 +415,7 @@ static int tlsrec_form(uint8_t *pay, const uint8_t *real, int real_len, int cut,
   int rec2_here = this_rec - k;                             /* record 2 body bytes in this segment */
   int tail = present - this_rec;                            /* bytes after this record (another record) */
   int total = real_len + TCPDPI_TLSREC_GROWTH;
-  if (total > TCPDPI_SEG_MAX) return 0;
+  if (total > cap) return 0;
 
   int o = 0;
   pay[o++] = 0x16; pay[o++] = real[1]; pay[o++] = real[2];   /* record 1 header, length k */

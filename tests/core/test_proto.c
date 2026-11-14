@@ -84,7 +84,35 @@ static void test_truncated_tls(void) {
   }
 }
 
-
+/* TurkishDPI: a ~1.8 KB ClientHello (a post-quantum key share) whose
+ * server_name is the LAST extension, seen as its first 1460-byte segment:
+ * still a TLS ClientHello, with no name in it (the engine then cuts after
+ * byte 2 instead of not at all). */
+static void test_large_hello_name_later(void) {
+  static uint8_t b[2048];
+  const char *host = "www.blocked.example";
+  int hl = (int)strlen(host), p = 0, ks = 1700;
+  b[p++] = 0x16; b[p++] = 3; b[p++] = 1; p += 2;
+  int hs = p; b[p++] = 1; p += 3;
+  b[p++] = 3; b[p++] = 3; for (int i = 0; i < 32; i++) b[p++] = (uint8_t)i;
+  b[p++] = 0;
+  b[p++] = 0; b[p++] = 2; b[p++] = 0x13; b[p++] = 0x01;
+  b[p++] = 1; b[p++] = 0;
+  int ext = p; p += 2;
+  b[p++] = 0x00; b[p++] = 0x33; b[p++] = (uint8_t)(ks >> 8); b[p++] = (uint8_t)ks;
+  memset(b + p, 0x5c, (size_t)ks); p += ks;
+  b[p++] = 0; b[p++] = 0; b[p++] = 0; b[p++] = (uint8_t)(hl + 5); b[p++] = 0; b[p++] = (uint8_t)(hl + 3);
+  b[p++] = 0; b[p++] = 0; b[p++] = (uint8_t)hl; memcpy(b + p, host, (size_t)hl); p += hl;
+  b[ext] = (uint8_t)((p - ext - 2) >> 8); b[ext + 1] = (uint8_t)(p - ext - 2);
+  int hlen = p - hs - 4; b[hs + 1] = (uint8_t)(hlen >> 16); b[hs + 2] = (uint8_t)(hlen >> 8); b[hs + 3] = (uint8_t)hlen;
+  b[3] = (uint8_t)((p - 5) >> 8); b[4] = (uint8_t)(p - 5);
+  CHECK(p > 1750 && p < 1900);
+  proto_info pi;
+  proto_inspect(b, (size_t)p, &pi);                 /* whole: the name is found */
+  CHECK(pi.kind == PROTO_TLS && strcmp(pi.host, host) == 0 && pi.host_off > 1460);
+  proto_inspect(b, 1460, &pi);                      /* first segment only */
+  CHECK(pi.kind == PROTO_TLS && pi.host_off == -1 && pi.host_len == 0 && pi.tls_record_total == p);
+}
 
 /* A ClientHello as browsers send one: a 32-byte session id, a GREASE
  * extension and supported_versions before the server name, padding after. */
@@ -245,6 +273,7 @@ int main(void) {
   test_http_not_xforward();
   test_http_port_strip();
   test_truncated_tls();
+  test_large_hello_name_later();
   test_decoy_names();
   if (fails == 0) { printf("ALL TESTS PASSED\n"); return 0; }
   printf("%d TEST(S) FAILED\n", fails);
