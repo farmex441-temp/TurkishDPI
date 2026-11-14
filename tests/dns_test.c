@@ -1,4 +1,4 @@
-/* Tests forged-answer detection and the hybrid DNS race in src/engine/dnsredir.c. */
+/* Tests forged-answer detection and the hybrid DNS race in src/engine/dns.c. */
 #include <winsock2.h>
 #include <ws2tcpip.h>
 #include <stdio.h>
@@ -121,6 +121,174 @@ int main(void) {
         EXPECT(dns_handle_outgoing(local, lport, isp, p53, (char *)q, 29, 0), "tracked again");
         n = build(m, 0x9999, 0, 1, real, 4);
         EXPECT(dns_handle_incoming_hybrid(local, lport, isp, p53, (char *)m, (unsigned)n, &ci, 0) == DNS_IN_NOT_OURS, "foreign txid ignored");
+
+        /* 4) local names: a resolver on the LAN/VPN answers with LAN addresses */
+        {
+            static const struct { const char *resolver, *answer, *what; } ok[] = {
+                { "192.168.1.1", "192.168.1.20",  "router answers a LAN name" },
+                { "10.8.0.1",    "10.0.0.20",     "VPN resolver answers an intranet name" },
+                { "172.20.0.53", "172.20.4.4",    "172.16/12 resolver and answer" },
+                { "100.64.0.1",  "192.168.1.20",  "CGNAT resolver answers a LAN name" },
+                { "192.168.1.1", "169.254.10.10", "link-local answer from a LAN resolver" },
+            };
+            for (unsigned i = 0; i < sizeof(ok) / sizeof(ok[0]); i++) {
+                uint32_t res[4] = { 0 };
+                unsigned char a[4];
+                inet_pton(AF_INET, ok[i].resolver, res);
+                inet_pton(AF_INET, ok[i].answer, a);
+                EXPECT(dns_handle_outgoing(local, lport, res, p53, (char *)q, 29, 0), "tracked for local name");
+                n = build(m, 0x1234, 0, 1, a, 4);
+                EXPECT(dns_handle_incoming_hybrid(local, lport, res, p53, (char *)m, (unsigned)n, &ci, 0) == DNS_IN_PASS, ok[i].what);
+                n = build(m, 0x1234, 3, 1, NULL, 0);
+                EXPECT(dns_handle_incoming_hybrid(local, lport, clean, cport, (char *)m, (unsigned)n, &ci, 0) == DNS_IN_DROP,
+                       "clean NXDOMAIN after a local answer is a late duplicate");
+            }
+        }
+        /* 4b) a LAN resolver still cannot pass a block page, a block-listed
+         *     private address (--dns-block-ip 10.1.2.3 above), loopback,
+         *     0.0.0.0 or multicast: dropped, the clean answer is rewritten */
+        {
+            static const char *bad[] = { "195.175.254.2", "10.1.2.3", "127.0.0.1", "0.0.0.0", "224.0.0.251" };
+            for (unsigned i = 0; i < sizeof(bad) / sizeof(bad[0]); i++) {
+                unsigned char a[4];
+                inet_pton(AF_INET, bad[i], a);
+                EXPECT(dns_handle_outgoing(local, lport, isp, p53, (char *)q, 29, 0), "tracked for 4b");
+                n = build(m, 0x1234, 0, 1, a, 4);
+                EXPECT(dns_handle_incoming_hybrid(local, lport, isp, p53, (char *)m, (unsigned)n, &ci, 0) == DNS_IN_DROP,
+                       bad[i]);
+                n = build(m, 0x1234, 0, 1, real, 4);
+                EXPECT(dns_handle_incoming_hybrid(local, lport, clean, cport, (char *)m, (unsigned)n, &ci, 0) == DNS_IN_REWRITE,
+                       "clean answer rewritten after a LAN resolver's forged one");
+                EXPECT(ci.dstip[0] == isp[0] && ci.dstport == p53, "rewrite targets the LAN resolver");
+            }
+        }
+        /* 4c) a LAN resolver's NXDOMAIN is still held back (the router may
+         *     forward the ISP's censorship); the clean NXDOMAIN gets through */
+        EXPECT(dns_handle_outgoing(local, lport, isp, p53, (char *)q, 29, 0), "tracked for 4c");
+        n = build(m, 0x1234, 3, 1, NULL, 0);
+        EXPECT(dns_handle_incoming_hybrid(local, lport, isp, p53, (char *)m, (unsigned)n, &ci, 0) == DNS_IN_DROP,
+               "LAN resolver NXDOMAIN held back");
+        EXPECT(dns_handle_incoming_hybrid(local, lport, clean, cport, (char *)m, (unsigned)n, &ci, 0) == DNS_IN_REWRITE,
+               "clean NXDOMAIN delivered after a LAN NXDOMAIN");
+        /* 4d) malformed answers from a LAN resolver are still dropped */
+        {
+            unsigned char lan[4] = { 192, 168, 1, 20 };
+            EXPECT(dns_handle_outgoing(local, lport, isp, p53, (char *)q, 29, 0), "tracked for 4d");
+            n = build(m, 0x1234, 0, 1, lan, 4);
+            EXPECT(dns_handle_incoming_hybrid(local, lport, isp, p53, (char *)m, (unsigned)n - 2, &ci, 0) == DNS_IN_DROP,
+                   "truncated LAN answer dropped");
+            /* the public check itself is unchanged: a private address is
+             * forged when the sender is unknown (payment learning relies on it) */
+            EXPECT(dns_answer_is_forged((char *)m, (unsigned)n), "private address forged without a resolver context");
+            /* 4e) a third party on the LAN answering with a LAN address is
+             *     neither trusted nor delivered (unchanged) */
+            {
+                uint32_t other[4] = { 0 };
+                inet_pton(AF_INET, "192.168.1.2", other);
+                EXPECT(dns_handle_incoming_hybrid(local, lport, other, p53, (char *)m, (unsigned)n, &ci, 0) == DNS_IN_DROP,
+                       "third-party LAN answer still dropped");
+            }
+        }
+        /* 4f) a public asked resolver answering with a private address: as
+         *     before, the answer is treated as forged (dropped) and the clean
+         *     resolver's answer is rewritten in its place */
+        {
+            uint32_t pub[4] = { 0 };
+            unsigned char lan[4] = { 192, 168, 1, 20 };
+            inet_pton(AF_INET, "195.175.39.39", pub);
+            EXPECT(dns_handle_outgoing(local, lport, pub, p53, (char *)q, 29, 0), "tracked for 4f");
+            n = build(m, 0x1234, 0, 1, lan, 4);
+            EXPECT(dns_handle_incoming_hybrid(local, lport, pub, p53, (char *)m, (unsigned)n, &ci, 0) == DNS_IN_DROP,
+                   "public resolver's private answer dropped");
+            n = build(m, 0x1234, 3, 1, NULL, 0);
+            EXPECT(dns_handle_incoming_hybrid(local, lport, clean, cport, (char *)m, (unsigned)n, &ci, 0) == DNS_IN_REWRITE,
+                   "clean answer rewritten after a public resolver's private one");
+            EXPECT(ci.dstip[0] == pub[0], "rewrite targets the public resolver");
+        }
+        /* 4g) the check uses the address the question went to, not the
+         *     packet's claimed source: a public question cannot be answered
+         *     with a LAN address by a LAN host claiming to be the resolver */
+        {
+            uint32_t pub[4] = { 0 };
+            unsigned char lan[4] = { 192, 168, 1, 20 };
+            inet_pton(AF_INET, "8.8.8.8", pub);
+            EXPECT(dns_handle_outgoing(local, lport, pub, p53, (char *)q, 29, 0), "tracked for 4g");
+            n = build(m, 0x1234, 0, 1, lan, 4);
+            EXPECT(dns_handle_incoming_hybrid(local, lport, isp, p53, (char *)m, (unsigned)n, &ci, 0) == DNS_IN_DROP,
+                   "LAN sender cannot answer a public question with a LAN address");
+            EXPECT(dns_handle_incoming_hybrid(local, lport, pub, p53, (char *)m, (unsigned)n, &ci, 0) == DNS_IN_DROP,
+                   "public resolver's LAN answer still dropped");
+        }
+    }
+
+    /* 5) IPv6: ULA / link-local resolvers and answers */
+    {
+        uint32_t local6[4], res6[4], ll6[4], pub6[4], clean6[4], clean4 = 0;
+        uint16_t lport = htons(5001), p53 = htons(53), cport = htons(5353);
+        conntrack_info_t ci;
+        unsigned char ula[16], lla[16];
+        unsigned char q[64] = { 0x43, 0x21, 0x01, 0x00, 0, 1, 0, 0, 0, 0, 0, 0,
+                                7, 'd', 'i', 's', 'c', 'o', 'r', 'd', 3, 'c', 'o', 'm', 0, 0, 28, 0, 1 };
+        inet_pton(AF_INET6, "fd00::10", local6);
+        inet_pton(AF_INET6, "fd00::1", res6);
+        inet_pton(AF_INET6, "fe80::1", ll6);
+        inet_pton(AF_INET6, "2001:4860:4860::8888", pub6);
+        inet_pton(AF_INET6, "2a10:50c0::ad1:ff", clean6);
+        inet_pton(AF_INET6, "fd00::20", ula);
+        inet_pton(AF_INET6, "fe80::20", lla);
+        inet_pton(AF_INET, "94.140.14.140", &clean4);
+        dns_set_clean(clean4, cport, clean6, cport);
+
+        EXPECT(dns_handle_outgoing(local6, lport, res6, p53, (char *)q, 29, 1), "v6 tracked");
+        n = build(m, 0x4321, 0, 28, ula, 16);
+        EXPECT(dns_handle_incoming_hybrid(local6, lport, res6, p53, (char *)m, (unsigned)n, &ci, 1) == DNS_IN_PASS,
+               "ULA resolver answers a ULA address");
+        EXPECT(dns_handle_incoming_hybrid(local6, lport, clean6, cport, (char *)m, (unsigned)n, &ci, 1) == DNS_IN_DROP,
+               "v6 clean late duplicate dropped");
+
+        EXPECT(dns_handle_outgoing(local6, lport, ll6, p53, (char *)q, 29, 1), "v6 tracked link-local");
+        n = build(m, 0x4321, 0, 28, lla, 16);
+        EXPECT(dns_handle_incoming_hybrid(local6, lport, ll6, p53, (char *)m, (unsigned)n, &ci, 1) == DNS_IN_PASS,
+               "link-local resolver answers a link-local address");
+
+        /* an IPv4 private address in an A answer carried over IPv6 from a ULA resolver */
+        EXPECT(dns_handle_outgoing(local6, lport, res6, p53, (char *)q, 29, 1), "v6 tracked for A");
+        {
+            unsigned char lan[4] = { 192, 168, 1, 20 };
+            n = build(m, 0x4321, 0, 1, lan, 4);
+        }
+        EXPECT(dns_handle_incoming_hybrid(local6, lport, res6, p53, (char *)m, (unsigned)n, &ci, 1) == DNS_IN_PASS,
+               "ULA resolver answers a private A record");
+
+        /* block page from a ULA resolver: dropped, clean rewritten */
+        EXPECT(dns_handle_outgoing(local6, lport, res6, p53, (char *)q, 29, 1), "v6 tracked for block");
+        n = build(m, 0x4321, 0, 28, v6blk, 16);
+        EXPECT(dns_handle_incoming_hybrid(local6, lport, res6, p53, (char *)m, (unsigned)n, &ci, 1) == DNS_IN_DROP,
+               "ULA resolver's IPv6 block page dropped");
+        n = build(m, 0x4321, 0, 28, v6real, 16);
+        EXPECT(dns_handle_incoming_hybrid(local6, lport, clean6, cport, (char *)m, (unsigned)n, &ci, 1) == DNS_IN_REWRITE,
+               "v6 clean answer rewritten");
+        EXPECT(!memcmp(ci.dstip, res6, 16) && ci.dstport == p53, "v6 rewrite targets the ULA resolver");
+
+        /* a ULA resolver's NXDOMAIN is still held back */
+        EXPECT(dns_handle_outgoing(local6, lport, res6, p53, (char *)q, 29, 1), "v6 tracked for NX");
+        n = build(m, 0x4321, 3, 28, NULL, 0);
+        EXPECT(dns_handle_incoming_hybrid(local6, lport, res6, p53, (char *)m, (unsigned)n, &ci, 1) == DNS_IN_DROP,
+               "ULA resolver NXDOMAIN held back");
+
+        /* public IPv6 resolver: unchanged - ULA AAAA was never forged and still
+         * passes; a private A record is still forged */
+        EXPECT(dns_handle_outgoing(local6, lport, pub6, p53, (char *)q, 29, 1), "v6 tracked public");
+        n = build(m, 0x4321, 0, 28, ula, 16);
+        EXPECT(dns_handle_incoming_hybrid(local6, lport, pub6, p53, (char *)m, (unsigned)n, &ci, 1) == DNS_IN_PASS,
+               "public v6 resolver's ULA answer passes (as before)");
+        EXPECT(dns_handle_outgoing(local6, lport, pub6, p53, (char *)q, 29, 1), "v6 tracked public A");
+        {
+            unsigned char lan[4] = { 10, 0, 0, 20 };
+            n = build(m, 0x4321, 0, 1, lan, 4);
+        }
+        EXPECT(dns_handle_incoming_hybrid(local6, lport, pub6, p53, (char *)m, (unsigned)n, &ci, 1) == DNS_IN_DROP,
+               "public v6 resolver's private A answer dropped (as before)");
     }
     printf(fails ? "%d failures\n" : "all passed\n", fails);
     return fails != 0;
