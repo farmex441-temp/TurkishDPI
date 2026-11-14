@@ -20,12 +20,20 @@ param(
 )
 $ErrorActionPreference = 'Stop'
 $env:__COMPAT_LAYER = 'RunAsInvoker'   # the manifest asks for admin; preview needs none
+# absolute paths once (child processes and relative -Shots would otherwise
+# depend on the current directory)
+$Dist  = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($Dist)
+$Work  = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($Work)
+$Shots = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($Shots)
 $failures = New-Object System.Collections.Generic.List[string]
 function Fail([string]$msg) { Write-Host "::error::$msg"; $failures.Add($msg) }
 
 # Runs a process with a time limit; a hang fails the job instead of blocking it.
-function Invoke-Timed([string]$Exe, [string[]]$ArgList, [int]$Seconds, [string]$StdOutFile) {
-    $sp = @{ FilePath = $Exe; ArgumentList = $ArgList; PassThru = $true; NoNewWindow = $true }
+# The arguments are ONE command-line string, so the quoting is ours and the
+# same in Windows PowerShell 5.1 and PowerShell 7.
+function Invoke-Timed([string]$Exe, [string]$ArgLine, [int]$Seconds, [string]$StdOutFile) {
+    if (-not $ArgLine) { throw 'Invoke-Timed: empty argument line' }
+    $sp = @{ FilePath = $Exe; ArgumentList = $ArgLine; PassThru = $true; NoNewWindow = $true }
     if ($StdOutFile) {
         $sp.RedirectStandardOutput = $StdOutFile
         $sp.RedirectStandardError = "$StdOutFile.err"
@@ -83,7 +91,7 @@ foreach ($w in 'x64', 'x86') {
 
     # engine usage
     $out = Join-Path $Work "$w-engine-help.txt"
-    $code = Invoke-Timed $exe @('--engine', '--help') 30 $out
+    $code = Invoke-Timed $exe '--engine --help' 30 $out
     $text = if (Test-Path $out) { Get-Content -Raw $out } else { '' }
     Write-Host "--engine --help: exit $code, $($text.Length) chars of output"
     if ($code -ne 0) { Fail "${w}: --engine --help exit code $code (expected 0; -9999 = timeout)" }
@@ -101,7 +109,7 @@ foreach ($w in 'x64', 'x86') {
         if (-not $s -or -not $page) { Fail "${w}: internal error, empty scenario/page in the job list"; continue }
         $name = if ($page -eq 'status') { $s } else { "$s-$page" }
         $bmp = Join-Path $shotDir "$name.bmp"
-        $code = Invoke-Timed $exe @('--ui-preview', $s, '--page', $page, '--shot', "`"$bmp`"") 60 $null
+        $code = Invoke-Timed $exe "--ui-preview $s --page $page --shot `"$bmp`"" 60 $null
         if ($code -ne 0) { Fail "${w}: --ui-preview $s --page $page exit code $code (-9999 = timeout)"; continue }
         if (-not (Test-Path $bmp) -or (Get-Item $bmp).Length -lt 1000) { Fail "${w}: --ui-preview $s --page $page wrote no/empty BMP"; continue }
         $hdr = [IO.File]::ReadAllBytes($bmp)[0..1]

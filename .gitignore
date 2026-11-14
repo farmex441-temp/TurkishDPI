@@ -12,3 +12,4 @@ third_party/WinDivert/x86/
 /BENIOKU.txt
 /WinDivert-LICENSE.txt
 .worktrees/
+.claude/worktrees/
