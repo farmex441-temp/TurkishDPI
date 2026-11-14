@@ -1145,33 +1145,54 @@ out:
     return rc;
 }
 
+/* 1 if w[0..n) is one of the UPD_ITEMS names (ASCII, case-insensitive). */
+static int upd_item_name(const wchar_t *w, size_t n) {
+    for (size_t i = 0; i < UPD_NITEMS; i++) {
+        const char *a = UPD_ITEMS[i].name;
+        size_t k = 0;
+        for (; k < n && a[k]; k++) {
+            wchar_t x = w[k], y = (wchar_t)(unsigned char)a[k];
+            if (x >= L'A' && x <= L'Z') x = (wchar_t)(x - L'A' + L'a');
+            if (y >= L'A' && y <= L'Z') y = (wchar_t)(y - L'A' + L'a');
+            if (x != y) break;
+        }
+        if (k == n && !a[k]) return 1;
+    }
+    return 0;
+}
+
+/*
+ * 1 if name is something an update of the exe called base leaves behind:
+ * "<base>.<digits>.old" (the previous exe, or whatever squatted the exe's
+ * name during a failed update) or "<n>.upd-new" where n is base or one of
+ * the package's file names. Nothing else: the folder may be Downloads.
+ */
+static int upd_leftover(const wchar_t *name, const wchar_t *base) {
+    size_t n = wcslen(name), bl = wcslen(base), d;
+    if (n > 8 && !_wcsicmp(name + n - 8, L".upd-new"))
+        return (n - 8 == bl && !_wcsnicmp(name, base, bl)) || upd_item_name(name, n - 8);
+    if (n < bl + 1 + 1 + 4 || _wcsnicmp(name, base, bl) || name[bl] != L'.' || _wcsicmp(name + n - 4, L".old"))
+        return 0;
+    for (d = bl + 1; d < n - 4; d++)
+        if (name[d] < L'0' || name[d] > L'9') return 0;
+    return d - (bl + 1) <= 10;   /* a DWORD tick count */
+}
+
 /* Removes what an update left in the exe's folder: the previous exe (moved
- * aside while it ran) and unfinished writes. Only our own name patterns. */
+ * aside while it ran) and unfinished writes. Only our own exact names
+ * (upd_leftover), each deleted through a handle that does not follow links. */
 void sys_update_cleanup(const wchar_t *running_exe) {
-    static const wchar_t *pats[] = { L"*.old", L"*.upd-new" };
     wchar_t real[MAX_PATH * 2], pat[MAX_PATH], path[MAX_PATH], longp[MAX_PATH];
     const wchar_t *slash;
     WIN32_FIND_DATAW fd;
     HANDLE dirh, f;
-    size_t bl;
     /* the long file name: the start path may use 8.3 names */
     if (!GetLongPathNameW(running_exe, longp, MAX_PATH) || !(slash = wcsrchr(longp, L'\\'))) return;
-    bl = wcslen(slash + 1);
     if ((dirh = open_update_dir(running_exe, real, MAX_PATH * 2)) == INVALID_HANDLE_VALUE) return;
-    for (int k = 0; k < 2; k++) {
-        if (!path_join(pat, MAX_PATH, real, pats[k])) continue;
-        f = FindFirstFileW(pat, &fd);
-        if (f == INVALID_HANDLE_VALUE) continue;
+    if (path_join(pat, MAX_PATH, real, L"*") && (f = FindFirstFileW(pat, &fd)) != INVALID_HANDLE_VALUE) {
         do {
-            size_t n = wcslen(fd.cFileName);
-            int ours;
             if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
-            if (k == 0)   /* "<exe name>.<number>.old" */
-                ours = n > bl + 5 && !_wcsnicmp(fd.cFileName, slash + 1, bl) && fd.cFileName[bl] == L'.' &&
-                       !_wcsicmp(fd.cFileName + n - 4, L".old");
-            else          /* "<name>.upd-new" */
-                ours = n > 8 && !_wcsicmp(fd.cFileName + n - 8, L".upd-new");
-            if (!ours) continue;
+            if (!upd_leftover(fd.cFileName, slash + 1)) continue;
             if (!path_join(path, MAX_PATH, real, fd.cFileName)) continue;
             delete_object(path, real, 0);
         } while (FindNextFileW(f, &fd));
