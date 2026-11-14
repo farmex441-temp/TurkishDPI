@@ -97,10 +97,22 @@ int exclude_load_builtin(void) {
 
 int exclude_load_list(const char *filename) {
     char line[1024];
-    int cnt = 0;
+    int cnt = 0, first = 1, skipping = 0;
     FILE *fp = fopen(filename, "r");
     if (!fp) return -1;
     while (fgets(line, sizeof(line), fp)) {
+        size_t n = strlen(line);
+        int complete = n && line[n - 1] == '\n';
+        if (skipping) {                 /* tail of an over-long line: ignore it */
+            skipping = !complete;
+            continue;
+        }
+        skipping = !complete && n == sizeof(line) - 1;
+        /* UTF-8 byte order mark (Notepad writes one) */
+        if (first && n >= 3 && (unsigned char)line[0] == 0xEF &&
+            (unsigned char)line[1] == 0xBB && (unsigned char)line[2] == 0xBF)
+            memmove(line, line + 3, n - 3 + 1);
+        first = 0;
         line[strcspn(line, "\r\n#")] = '\0';
         cnt += exclude_add(line);
     }
