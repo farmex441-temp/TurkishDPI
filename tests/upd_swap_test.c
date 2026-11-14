@@ -1,4 +1,4 @@
-/* MSVC: /DUPD_TEST /Isrc/app /Isrc/engine /Itests tests/upd_swap_test.c src/app/updpkg.c advapi32.lib shell32.lib ole32.lib */
+/* MSVC: /DUPD_TEST /Isrc/app /Isrc/engine /Itests tests/upd_swap_test.c src/app/updpkg.c advapi32.lib shell32.lib ole32.lib uuid.lib ws2_32.lib */
 /*
  * TurkishDPI: the install half of the one-click update (upd_install_files
  * in src/app/system.c) against real files - no elevation, no network, no
@@ -32,6 +32,7 @@ sd_WinHttpOpenRequest_t sd_WinHttpOpenRequest;
 sd_WinHttpQueryHeaders_t sd_WinHttpQueryHeaders;
 sd_WinHttpQueryOption_t sd_WinHttpQueryOption;
 sd_WinHttpReadData_t sd_WinHttpReadData;
+sd_WinHttpQueryDataAvailable_t sd_WinHttpQueryDataAvailable;
 sd_WinHttpReceiveResponse_t sd_WinHttpReceiveResponse;
 sd_WinHttpSendRequest_t sd_WinHttpSendRequest;
 sd_WinHttpSetOption_t sd_WinHttpSetOption;

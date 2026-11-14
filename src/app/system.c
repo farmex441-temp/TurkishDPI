@@ -771,28 +771,40 @@ static int url_allowed(const wchar_t *url) {
  * target checked with url_allowed before we connect to it); at most cap
  * bytes into a malloc'ed buffer.
  *
- * total_ms bounds the whole download: it runs on the controller thread, and
+ * total_ms bounds the download: it runs on the controller thread, and
  * WinHTTP's own per-phase timeouts (and its automatic redirects, which start
  * a whole new resolve/connect/send/receive inside ReceiveResponse) would let
  * a slow or throttled network block the controller for minutes or hours.
- * So redirects are followed here, and before every blocking call the time
- * left is computed and every phase that call can use is capped to it (and to
- * its own maximum):
- *   WinHttpSendRequest     resolve <= 10 s, connect <= 15 s (per address the
- *                          name resolves to), TLS handshake + send <= 30 s
- *                          (send/receive timeouts)
- *   WinHttpReceiveResponse response headers <= 30 s (receive timeout and
- *                          WINHTTP_OPTION_RECEIVE_RESPONSE_TIMEOUT, whose
- *                          default is 90 s)
- *   WinHttpReadData        receive <= 30 s
- * each "<= time left" as well. The deadline is checked before every call, so
- * no call starts after it. True worst case: one call that started just
- * before the deadline runs to the sum of its own (capped) phases - for
- * SendRequest at most 10 + 15 + 30 s (connect once more per extra address of
- * the host), for the other calls at most 30 s - and then the download stops.
- * The calls that make no network I/O (WinHttpOpen/Connect/OpenRequest,
+ * So redirects are followed here, the deadline is checked before every
+ * blocking call (no call starts after it), and every timeout that call can
+ * use is set to min(time left, its maximum), never 0 (WinHTTP's "infinite"):
+ *   WinHttpSendRequest        resolve <= 10 s, connect <= 15 s (once per
+ *                             address the name resolves to), send <= 30 s;
+ *                             the TLS handshake inside it uses the send and
+ *                             receive timeouts (<= 30 s each) per network
+ *                             operation - it is NOT known to be bounded as a
+ *                             whole (not measured), only per receive/send
+ *   WinHttpReceiveResponse    <= 30 s (receive timeout and
+ *                             WINHTTP_OPTION_RECEIVE_RESPONSE_TIMEOUT, default
+ *                             90 s; that option may be unsupported on old
+ *                             systems, then the receive timeout still holds)
+ *   WinHttpQueryDataAvailable waits for the next data: <= one receive
+ *                             timeout (<= 30 s)
+ *   WinHttpReadData           asks only for what QueryDataAvailable reported,
+ *                             which is already buffered: returns at once. (A
+ *                             large ReadData would keep receiving until its
+ *                             buffer is full - the receive timeout applies to
+ *                             each internal receive, not to the call - so a
+ *                             drip-fed body could hold one call for minutes.)
+ * True worst case: the deadline plus one call started just before it -
+ * SendRequest: 10 + 15 s (+15 s per extra address) + its send/handshake
+ * operations (each <= 30 s, their number not bounded by us); the others
+ * <= 30 s. The calls without network I/O (WinHttpOpen/Connect/OpenRequest,
  * QueryHeaders/QueryOption/SetOption) are not bounded separately.
- * Returns HG_OK, HG_FAIL, HG_TIMEOUT or HG_TOO_BIG.
+ * Returns HG_OK, HG_FAIL, HG_TIMEOUT or HG_TOO_BIG; *detail is a short
+ * English reason for every failure ("HTTP 404", "error 12175", "redirect
+ * refused", "too many redirects", "took longer than 30 seconds", "too
+ * large") - never a URL (the signed redirect URL must not be logged).
  */
 enum { HG_OK = 1, HG_FAIL = 0, HG_TIMEOUT = -1, HG_TOO_BIG = -2 };
 #ifndef WINHTTP_OPTION_RECEIVE_RESPONSE_TIMEOUT
@@ -821,63 +833,84 @@ static void hop_timeouts(HINTERNET r, DWORD left) {
     WinHttpSetOption(r, WINHTTP_OPTION_RECEIVE_RESPONSE_TIMEOUT, &rr, sizeof(rr));
 }
 
-static int http_get(const char *path_a, size_t cap, DWORD total_ms, unsigned char **out, size_t *len) {
+static int http_get(const char *path_a, size_t cap, DWORD total_ms, unsigned char **out, size_t *len,
+                    const char **detail) {
+    static char det[64];   /* controller thread only */
     wchar_t url[4096], host[256];
     HINTERNET s, c = NULL, r = NULL;
     unsigned char *buf = NULL;
     size_t n = 0, have = 0;
-    const size_t limit = cap + 1;   /* room for the read that returns 0 after exactly cap bytes */
+    const size_t limit = cap + 1;   /* room to see that a body is longer than cap */
     const ULONGLONG deadline = GetTickCount64() + total_ms;
+    DWORD err = 0;                  /* GetLastError() of the failing call */
     int rc = HG_FAIL, hop;
     *out = NULL;
     *len = 0;
+    *detail = "failed";
     {   /* the path is UTF-8 in our own code */
         wchar_t p[1024];
         if (!MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, path_a, -1, p, 1024) ||
-            !wfmt(url, 4096, L"https://github.com%ls", p))
+            !wfmt(url, 4096, L"https://github.com%ls", p)) {
+            *detail = "bad path";
             return HG_FAIL;
+        }
     }
     s = WinHttpOpen(L"TurkishDPI/" TURKISHDPI_VERSION_W, WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
                     WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
-    if (!s) return HG_FAIL;
+    if (!s) {
+        snprintf(det, sizeof(det), "error %lu", (unsigned long)GetLastError());
+        *detail = det;
+        return HG_FAIL;
+    }
     sysdll_winhttp_tls(s);
 
-    for (hop = 0; hop < 4; hop++) {
+    for (hop = 0;; hop++) {
         DWORD status = 0, sz = sizeof(status), left, nofollow = WINHTTP_DISABLE_REDIRECTS;
         const wchar_t *h, *path;
         size_t hl;
-        if (!url_allowed(url)) break;                        /* https, github.com / *.githubusercontent.com */
+        if (hop == 4) { *detail = "too many redirects"; break; }
+        if (!url_allowed(url)) { *detail = "redirect refused"; break; }   /* hop 0 is always allowed */
         h = url + 8;
         path = wcschr(h, L'/');                               /* url_allowed: present, no port */
         hl = (size_t)(path - h);
-        if (hl >= sizeof(host) / sizeof(host[0])) break;
+        if (hl >= sizeof(host) / sizeof(host[0])) { *detail = "redirect refused"; break; }
         memcpy(host, h, hl * sizeof(wchar_t));
         host[hl] = 0;
         if ((left = ms_left(deadline)) == 0) { rc = HG_TIMEOUT; break; }
-        c = WinHttpConnect(s, host, INTERNET_DEFAULT_HTTPS_PORT, 0);
-        if (c) r = WinHttpOpenRequest(c, L"GET", path, NULL, WINHTTP_NO_REFERER,
-                                      WINHTTP_DEFAULT_ACCEPT_TYPES, WINHTTP_FLAG_SECURE);
-        if (!r || !WinHttpSetOption(r, WINHTTP_OPTION_DISABLE_FEATURE, &nofollow, sizeof(nofollow))) break;
+        if (!(c = WinHttpConnect(s, host, INTERNET_DEFAULT_HTTPS_PORT, 0)) ||
+            !(r = WinHttpOpenRequest(c, L"GET", path, NULL, WINHTTP_NO_REFERER,
+                                     WINHTTP_DEFAULT_ACCEPT_TYPES, WINHTTP_FLAG_SECURE)) ||
+            !WinHttpSetOption(r, WINHTTP_OPTION_DISABLE_FEATURE, &nofollow, sizeof(nofollow))) {
+            err = GetLastError();
+            break;
+        }
         hop_timeouts(r, left);
         if (!WinHttpSendRequest(r, WINHTTP_NO_ADDITIONAL_HEADERS, 0, WINHTTP_NO_REQUEST_DATA, 0, 0, 0)) {
+            err = GetLastError();
             if (!ms_left(deadline)) rc = HG_TIMEOUT;
             break;
         }
         if ((left = ms_left(deadline)) == 0) { rc = HG_TIMEOUT; break; }
         hop_timeouts(r, left);
         if (!WinHttpReceiveResponse(r, NULL)) {
+            err = GetLastError();
             if (!ms_left(deadline)) rc = HG_TIMEOUT;
             break;
         }
         if (!WinHttpQueryHeaders(r, WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
-                                 WINHTTP_HEADER_NAME_BY_INDEX, &status, &sz, WINHTTP_NO_HEADER_INDEX))
+                                 WINHTTP_HEADER_NAME_BY_INDEX, &status, &sz, WINHTTP_NO_HEADER_INDEX)) {
+            err = GetLastError();
             break;
+        }
         if (status == 301 || status == 302 || status == 303 || status == 307 || status == 308) {
             DWORD lsz = sizeof(url) - sizeof(wchar_t);
-            /* absolute https URL expected; anything else fails url_allowed */
+            /* absolute https URL expected; a relative, over-long or missing
+             * Location is refused (url_allowed on the next round) */
             if (!WinHttpQueryHeaders(r, WINHTTP_QUERY_LOCATION, WINHTTP_HEADER_NAME_BY_INDEX, url, &lsz,
-                                     WINHTTP_NO_HEADER_INDEX))
+                                     WINHTTP_NO_HEADER_INDEX)) {
+                *detail = "redirect refused";
                 break;
+            }
             url[lsz / sizeof(wchar_t) < 4095 ? lsz / sizeof(wchar_t) : 4095] = 0;
             WinHttpCloseHandle(r);
             r = NULL;
@@ -885,24 +918,38 @@ static int http_get(const char *path_a, size_t cap, DWORD total_ms, unsigned cha
             c = NULL;
             continue;
         }
-        if (status != 200) break;
+        if (status != 200) {
+            snprintf(det, sizeof(det), "HTTP %lu", (unsigned long)status);
+            *detail = det;
+            break;
+        }
         rc = HG_OK;
         for (;;) {
-            DWORD got = 0, rt;
+            DWORD got = 0, avail = 0, rt, want;
             if ((left = ms_left(deadline)) == 0) { rc = HG_TIMEOUT; break; }
             rt = (DWORD)capped(left, 30000);
             WinHttpSetOption(r, WINHTTP_OPTION_RECEIVE_TIMEOUT, &rt, sizeof(rt));
+            /* waits for the next data, at most one receive timeout */
+            if (!WinHttpQueryDataAvailable(r, &avail)) {
+                err = GetLastError();
+                rc = ms_left(deadline) ? HG_FAIL : HG_TIMEOUT;
+                break;
+            }
+            if (!avail) break;                               /* end of the body */
             if (n == have) {
                 size_t nc = have ? have * 2 : 256 * 1024;
                 unsigned char *nb;
-                if (have >= limit) { rc = HG_TOO_BIG; break; }   /* larger than any real package */
+                if (have >= limit) { rc = HG_TOO_BIG; break; }   /* more than cap bytes */
                 if (nc > limit) nc = limit;
                 nb = (unsigned char *)realloc(buf, nc);
-                if (!nb) { rc = HG_FAIL; break; }
+                if (!nb) { *detail = "out of memory"; rc = HG_FAIL; break; }
                 buf = nb;
                 have = nc;
             }
-            if (!WinHttpReadData(r, buf + n, (DWORD)(have - n), &got)) {
+            /* only what is buffered already: this returns at once */
+            want = have - n < avail ? (DWORD)(have - n) : avail;
+            if (!WinHttpReadData(r, buf + n, want, &got)) {
+                err = GetLastError();
                 rc = ms_left(deadline) ? HG_FAIL : HG_TIMEOUT;
                 break;
             }
@@ -915,7 +962,17 @@ static int http_get(const char *path_a, size_t cap, DWORD total_ms, unsigned cha
     if (r) WinHttpCloseHandle(r);
     if (c) WinHttpCloseHandle(c);
     WinHttpCloseHandle(s);
+    if (rc == HG_TIMEOUT) {
+        snprintf(det, sizeof(det), "took longer than %lu seconds", (unsigned long)(total_ms / 1000));
+        *detail = det;
+    } else if (rc == HG_TOO_BIG) {
+        *detail = "too large";
+    } else if (rc == HG_FAIL && err) {
+        snprintf(det, sizeof(det), "error %lu", (unsigned long)err);
+        *detail = det;
+    }
     if (rc != HG_OK) { free(buf); return rc; }
+    *detail = "";
     *out = buf;
     *len = n;
     return HG_OK;
@@ -935,7 +992,10 @@ static HANDLE open_update_dir(const wchar_t *running_exe, wchar_t *real, DWORD c
      * something inside it is open - and our own lock on the running exe is
      * always open during an update. Denying delete sharing here would add
      * nothing and would only make this open fail whenever another process
-     * holds the folder with DELETE access. */
+     * holds the folder with DELETE access. That NTFS rule was verified on
+     * NTFS only (not on FAT/exFAT or network shares); everywhere the code
+     * relies on its own later checks instead - final paths, path_within and
+     * file IDs on the handles it acts on. */
     h = CreateFileW(dir, FILE_LIST_DIRECTORY | FILE_TRAVERSE | FILE_READ_ATTRIBUTES | SYNCHRONIZE,
                     FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, NULL, OPEN_EXISTING,
                     FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT, NULL);
@@ -1183,10 +1243,12 @@ void upd_test_hook(int step, const wchar_t *real, const wchar_t *base);
  * under its name - replacing or moving away whatever sits there - and keeps
  * ho as the new lock. Results 1, 0 and -1 leave either the old exe or the
  * verified new exe (locked in *lock_out) under the exe's name, no temp file,
- * and no handle of ours open besides that lock. Only -2 differs: another
- * process holds the name without delete sharing, so whatever file sits
- * there is NOT verified (it is never started by us), the old exe stays as
- * <name>.<n>.old, and no handle is handed back. Texts are only replaced
+ * and no handle of ours open besides that lock. Only -2 differs, and no
+ * handle is handed back: either another process holds the name without
+ * delete sharing - whatever file sits there is NOT verified (it is never
+ * started by us) and the old exe stays as <name>.<n>.old - or the running
+ * exe could not be re-opened/re-locked after the read-only lock was closed,
+ * so for a moment it was unlocked and may have been moved anywhere. Texts are only replaced
  * after the exe step succeeded, so a failed update never mixes versions.
  * Returns as sys_update_install.
  */
@@ -1343,24 +1405,26 @@ static int upd_fetch(const char *tag, unsigned char *data[], size_t dlen[], cons
     char path[256], asset[96];
     unsigned char *sums = NULL, *zip = NULL, want[32], got[32];
     size_t sums_len = 0, zip_len = 0;
+    static char why_buf[96];   /* controller thread only */
     uint64_t tag_ver = 0, exe_ver;
-    int ok = 0, r;
+    const char *detail = "";
+    int ok = 0;
 
     if (!upd_tag_parse(tag, &tag_ver)) { *why = "bad tag"; return 0; }
     snprintf(asset, sizeof(asset), "TurkishDPI-%s-" UPD_ARCH ".zip", tag);
 
     /* checksums, then the package, checked against them */
     snprintf(path, sizeof(path), TURKISHDPI_REPO_PATH_A "/releases/download/%s/SHA256SUMS.txt", tag);
-    if ((r = http_get(path, 64 * 1024, 30 * 1000, &sums, &sums_len)) != HG_OK) {
-        *why = r == HG_TIMEOUT ? "download SHA256SUMS.txt: took longer than 30 s"
-             : r == HG_TOO_BIG ? "download SHA256SUMS.txt: too large" : "download SHA256SUMS.txt";
+    if (http_get(path, 64 * 1024, 30 * 1000, &sums, &sums_len, &detail) != HG_OK) {
+        snprintf(why_buf, sizeof(why_buf), "download SHA256SUMS.txt: %s", detail);
+        *why = why_buf;
         goto out;
     }
     if (!upd_sums_find((const char *)sums, sums_len, asset, want)) { *why = "zip not in SHA256SUMS.txt"; goto out; }
     snprintf(path, sizeof(path), TURKISHDPI_REPO_PATH_A "/releases/download/%s/%s", tag, asset);
-    if ((r = http_get(path, 64u * 1024 * 1024, 3 * 60 * 1000, &zip, &zip_len)) != HG_OK) {
-        *why = r == HG_TIMEOUT ? "download zip: took longer than 3 minutes"
-             : r == HG_TOO_BIG ? "download zip: too large" : "download zip";
+    if (http_get(path, 64u * 1024 * 1024, 3 * 60 * 1000, &zip, &zip_len, &detail) != HG_OK) {
+        snprintf(why_buf, sizeof(why_buf), "download zip: %s", detail);
+        *why = why_buf;
         goto out;
     }
     if (!sha256_mem(zip, zip_len, got) || memcmp(want, got, 32) != 0) { *why = "zip SHA-256 mismatch"; goto out; }
