@@ -6,7 +6,11 @@
  *   updpkg_test pkg.zip name file     also: extract name from pkg.zip and
  *                                     compare it with file (real releases)
  *   updpkg_test --pe-version exe [2.0.1]
- *                                     print the exe's file version (and check it)
+ *                                     print the exe's file version; exit 0 only
+ *                                     if it is readable and (when given) its
+ *                                     MAJOR.MINOR.PATCH equals the argument -
+ *                                     the updater's own rule (build ignored);
+ *                                     CI runs it on the exes before release
  */
 #include <stdio.h>
 #include <stdlib.h>
@@ -184,7 +188,10 @@ int main(int argc, char **argv) {
     unsigned char out[2048], z[4096];
     size_t zl;
     make_text();
-    if (argc >= 3 && !strcmp(argv[1], "--pe-version")) return version_mode(argv[2], argc > 3 ? argv[3] : NULL);
+    if (argc >= 2 && !strcmp(argv[1], "--pe-version")) {
+        if (argc != 3 && argc != 4) { printf("usage: updpkg_test --pe-version exe [MAJOR.MINOR.PATCH]\n"); return 2; }
+        return version_mode(argv[2], argc == 4 ? argv[3] : NULL);
+    }
     if (argc == 4) return file_mode(argv[1], argv[2], argv[3]);
 
     EXPECT(upd_crc32((const unsigned char *)"123456789", 9) == 0xCBF43926u, "crc32 check value");

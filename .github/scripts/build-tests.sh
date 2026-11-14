@@ -14,8 +14,8 @@
 #              missing  -> the default libs (-lws2_32; TEST_LIBS overrides it)
 #              "-"      -> no libs at all
 #              other    -> exactly those, e.g. "-ladvapi32 -lshell32 -lole32 -luuid"
-#   Example (a test that needs a define and Windows libs, not ws2_32):
-#     update_install_test|tests/update_install_test.c src/app/updpkg.c|-DUPD_TEST -Isrc/app -Isrc/engine -Itests|-ladvapi32 -lshell32 -lole32 -luuid
+#   Example (a test that needs a define and its own list of Windows libs):
+#     upd_swap_test|tests/upd_swap_test.c src/app/updpkg.c|-DUPD_TEST -Isrc/app -Isrc/engine -Itests|-ladvapi32 -lshell32 -lole32 -luuid -lws2_32
 #
 # Environment:
 #   WARN_FLAGS  warning policy (the workflow sets it; default below = the exe's)
@@ -35,6 +35,9 @@ DEFLIBS="${TEST_LIBS--lws2_32}"
 EXT="${TEST_EXT-.exe}"
 ONLY="${TEST_ONLY:-}"
 
+# No test exe may be named "*update*", "*install*", "*setup*" or "*patch*":
+# Windows' installer detection makes an unmanifested 32-bit exe with such a
+# name demand elevation (upd_swap_test is the updater's install test).
 TESTS="
 exclude_test|tests/exclude_test.c src/engine/exclude.c|-Isrc/engine
 dns_test|tests/dns_test.c src/engine/dns.c|-Isrc/engine
@@ -45,6 +48,7 @@ test_tcpdpi|tests/core/test_tcpdpi.c $CORE|-Isrc/engine/core
 test_udpdpi|tests/core/test_udpdpi.c $CORE|-Isrc/engine/core
 test_rawscope|tests/core/test_rawscope.c $CORE|-Isrc/engine/core
 xlate_test|tests/xlate_test.c src/engine/core/tcpdpi.c|-Isrc/engine/core
+upd_swap_test|tests/upd_swap_test.c src/app/updpkg.c|-DUPD_TEST -Isrc/app -Isrc/engine -Itests|-ladvapi32 -lshell32 -lole32 -luuid -lws2_32
 "
 
 mkdir -p "$OUT"
