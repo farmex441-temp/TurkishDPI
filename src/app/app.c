@@ -532,8 +532,9 @@ static const wchar_t *windivert_error_text(long e) {
     case 50:   return L"ARM işlemcili Windows desteklenmiyor: WinDivert sürücüsünün ARM64 sürümü yok. "
                       L"x64 veya x86 işlemcili bir bilgisayar gerekir.";
     default:
-        _snwprintf(buf, 159, L"WinDivert sürücüsü açılamadı (hata %ld). Ayrıntılar günlükte: "
-                             L"Ayarlar > Günlüğü aç.", e);
+        /* the log has nothing more than the code: say what to try */
+        _snwprintf(buf, 159, L"WinDivert sürücüsü açılamadı (hata %ld). Başka bir WinDivert aracı "
+                             L"(GoodbyeDPI, zapret) çalışıyorsa kapatıp yeniden deneyin.", e);
         buf[159] = 0;
         return buf;
     }
@@ -1369,8 +1370,8 @@ static void update_install(void) {
     if (r == -1) app_open_url(TURKISHDPI_RELEASES_URL);
 }
 
-/* A setting the engine's command line depends on changed (CMD_RESTART,
- * CMD_PAYMENT): restart what runs, no full rescan. While paused nothing
+/* A setting the engine's command line depends on changed (CMD_PAYMENT):
+ * restart what runs, no full rescan. While paused nothing
  * runs and nothing is started: the new setting applies at resume. */
 static void restart_running(int interrupted) {
     set_reason(WHY_SETTINGS);
@@ -1459,9 +1460,6 @@ static DWORD WINAPI controller(LPVOID unused) {
                               g_paused = 1; engine_stop(); probe_flush_dns_cache();
                               log_line("paused");
                               set_state(ST_PAUSED, L"Duraklatıldı", L"Açmak için düğmeye basın"); break;
-            case CMD_RESTART: /* settings changed: restart what runs, no full rescan */
-                              restart_running(interrupted);
-                              break;
             case CMD_PAYMENT: /* the UI's toggle: the flag, the ini and the engine change here */
                               if ((arg != 0) != (g_payment_protect != 0)) {
                                   g_payment_protect = arg != 0;

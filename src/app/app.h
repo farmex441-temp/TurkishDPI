@@ -23,7 +23,7 @@ typedef enum {
  * snapshot, and ignored by the controller when already in that state: two
  * quick clicks can no longer pause and then start a full rescan. */
 enum { CMD_NONE, CMD_RESCAN, CMD_SELECT, CMD_AUTO, CMD_PAUSE, CMD_RESUME,
-       CMD_TESTSITE, CMD_RESTART, CMD_AUTOSTART, CMD_UPDATE,
+       CMD_TESTSITE, CMD_AUTOSTART, CMD_UPDATE,
        CMD_PAYMENT /* arg: 1 on, 0 off */ };
 
 typedef struct {
