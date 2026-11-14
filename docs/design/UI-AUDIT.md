@@ -1,3 +1,5 @@
+> **TARİHSEL BELGE – sürüm 1.1.0'ın anlık görüntüsü.** Bu belge güncellenmemiştir; yazıldığı zamanın (v1.1.0) kodunu anlatır. Sürüm 2.0'dan beri motor TurkishDPI'ın kendi motorudur (Shroudly çekirdeği, `src/engine/`); aşağıda adı geçen `goodbyedpi.c`, `dnsredir.c` gibi dosyalar artık yoktur. Arayüz o zaman 440×734 px tek sayfaydı; bugünkü pencere 400×520 px ve üç sayfalıdır (Durum / Ayrıntılar / Ayarlar). Güncel durum için [CLAUDE.md](../../CLAUDE.md) ve [README.md](../../README.md) dosyalarına bakın.
+
 # TurkishDPI – Arayüz denetimi (UI-AUDIT)
 
 Kaynak: `src/app/ui.c` (main @ 55b6244), `src/app/app.h`, `src/app/app.c`

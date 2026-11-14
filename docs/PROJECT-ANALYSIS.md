@@ -1,3 +1,5 @@
+> **TARİHSEL BELGE – sürüm 1.1.0'ın anlık görüntüsü.** Bu belge güncellenmemiştir; yazıldığı zamanın (v1.1.0) kodunu anlatır. Sürüm 2.0'dan beri motor TurkishDPI'ın kendi motorudur (Shroudly çekirdeği, `src/engine/`); aşağıda adı geçen `goodbyedpi.c`, `dnsredir.c` gibi dosyalar artık yoktur. Bulgular ve referanslar 1.1.0 içindir; birçoğu sonraki sürümlerde kapatıldı veya geçerliliğini yitirdi. Güncel durum için [CLAUDE.md](../CLAUDE.md) ve [README.md](../README.md) dosyalarına bakın.
+
 # TurkishDPI – Proje Analizi (v1.1.0, `main` @ 55b6244)
 
 > Kapsam: kaynak kodun tamamı (`src/app`, `src/engine`, `tests`, CI, Makefile) okunarak hazırlandı.
