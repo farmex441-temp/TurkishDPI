@@ -40,6 +40,7 @@ static void autostart_migrate(void);
 CRITICAL_SECTION g_lock;
 ui_state_t g_ui;
 int g_auto = 1, g_preset = 0, g_paused = 0, g_payment_protect = 1;
+int g_payment_shown = 1;
 wchar_t g_log[MAX_PATH], g_ini[MAX_PATH];
 
 static wchar_t g_dir[MAX_PATH], g_exe[MAX_PATH];
@@ -255,6 +256,7 @@ static void config_load(void) {
     g_dns = ini_int(L"Dns", 0);
     if (g_dns < 0 || g_dns >= DNS_SERVER_COUNT) g_dns = 0;
     g_payment_protect = ini_int(L"PaymentProtection", 1) != 0;
+    g_payment_shown = g_payment_protect;   /* before the UI and the controller exist */
     g_dns_hybrid = ini_int(L"DnsHybrid", 1) != 0;
     g_watchdog_min = ini_int(L"WatchdogMinutes", 10);
     if (g_watchdog_min < 1) g_watchdog_min = 1;
@@ -418,6 +420,8 @@ static int engine_start(int preset, int dns) {
     EnterCriticalSection(&g_lock);
     g_ui.driver_err = 0;   /* an old driver error must not label a new failure */
     LeaveCriticalSection(&g_lock);
+    /* nor make engine_fatal() stop on a failure before the engine ran */
+    InterlockedExchange(&g_engine_err, 0);
     build_args(preset, dns, args, sizeof(args));
     /* Already running with exactly these arguments: keep it. Restarting
      * would only drop the user's connections for nothing (a watchdog or
@@ -487,11 +491,30 @@ static int engine_start(int preset, int dns) {
     return 0;
 }
 
+/* The driver WinDivert loads on this system (as in sys_install_copy and
+ * windivert_dyn.c): a 32-bit build on 64-bit Windows needs the 64-bit one. */
+static const wchar_t *needed_driver(void) {
+#ifdef _WIN64
+    return L"WinDivert64.sys";
+#else
+    typedef BOOL (WINAPI *wow_fn)(HANDLE, PBOOL);
+    BOOL wow = FALSE;
+    wow_fn f = (wow_fn)(void *)GetProcAddress(GetModuleHandleW(L"kernel32.dll"), "IsWow64Process");
+    if (f) f(GetCurrentProcess(), &wow);
+    return wow ? L"WinDivert64.sys" : L"WinDivert32.sys";
+#endif
+}
+
+/* Text for a driver error; never NULL. Controller thread only (static buffer). */
 static const wchar_t *windivert_error_text(long e) {
+    static wchar_t buf[160];
     switch (e) {
     /* each text fits g_ui.detail (159 chars) and four lines of the window */
-    case 2:    return L"WinDivert64.sys bulunamadı. Zip'teki tüm dosyaları exe ile aynı klasöre "
-                      L"çıkarın; dosya varsa antivirüs karantinasına bakın.";
+    case 2:
+        _snwprintf(buf, 159, L"%ls bulunamadı. Zip'teki tüm dosyaları exe ile aynı klasöre "
+                             L"çıkarın; dosya varsa antivirüs karantinasına bakın.", needed_driver());
+        buf[159] = 0;
+        return buf;
     case 126:  return L"WinDivert.dll bulunamadı. Zip'teki tüm dosyaları exe ile aynı klasöre "
                       L"çıkarın; dosya varsa antivirüs karantinasına bakın.";
     case 1920: return L"WinDivert dosyalarına erişilemiyor: antivirüs engellemiş ya da başka bir "
@@ -508,7 +531,12 @@ static const wchar_t *windivert_error_text(long e) {
                       L"güvenlik için yüklenmedi. Resmi zip'i yeniden indirin.";
     case 50:   return L"ARM işlemcili Windows desteklenmiyor: WinDivert sürücüsünün ARM64 sürümü yok. "
                       L"x64 veya x86 işlemcili bir bilgisayar gerekir.";
-    default:   return NULL;
+    default:
+        /* the log has nothing more than the code: say what to try */
+        _snwprintf(buf, 159, L"WinDivert sürücüsü açılamadı (hata %ld). Başka bir WinDivert aracı "
+                             L"(GoodbyeDPI, zapret) çalışıyorsa kapatıp yeniden deneyin.", e);
+        buf[159] = 0;
+        return buf;
     }
 }
 
@@ -658,20 +686,32 @@ static void load_block_ips(void) {
     LeaveCriticalSection(&g_lock);
 }
 
+/*
+ * 1 when the last engine start failed in a way no other preset can fix: any
+ * driver error the engine reported, except 87 (filter syntax, i.e. a bug in
+ * that one preset's arguments, worth trying the others). No reported code
+ * (timeout, crash) is not fatal either. The caller stops at once and records
+ * nothing in the learned stats: the presets are not at fault.
+ */
+#define ENGINE_ERR_FILTER_SYNTAX 87
+
 static int engine_fatal(void) {
-    const wchar_t *msg = windivert_error_text(g_engine_err);
+    long e = g_engine_err;
+    const wchar_t *msg;
     wchar_t st[64];
-    if (!msg) return 0;
-    swprintf(st, 64, L"Sürücü başlatılamadı (%ld)", g_engine_err);
+    if (e == 0 || e == ENGINE_ERR_FILTER_SYNTAX) return 0;
+    msg = windivert_error_text(e);
+    log_line("driver error %ld: stopping, no preset is tried or recorded", e);
+    swprintf(st, 64, L"Sürücü başlatılamadı (%ld)", e);
     EnterCriticalSection(&g_lock);
-    g_ui.driver_err = g_engine_err;
+    g_ui.driver_err = e;
     LeaveCriticalSection(&g_lock);
     set_state(ST_ERROR, st, msg);
     g_quiet_start = 0;
-    if (g_engine_err != g_last_fatal) {   /* no repeated balloons from the watchdog */
+    if (e != g_last_fatal) {   /* no repeated balloons from the watchdog */
         notify(L"TurkishDPI çalışamıyor", msg);
         g_notified_kind = ST_ERROR;   /* the next success is news again */
-        g_last_fatal = g_engine_err;
+        g_last_fatal = e;
     }
     return 1;
 }
@@ -754,22 +794,56 @@ static DWORD g_controller_id;
 
 /* Stops the controller thread (it checks g_quitting between steps) so that
  * nothing restarts the engine or writes files while we tear down. */
-static void stop_controller(DWORD wait_ms) {
+/* Returns 1 when the controller thread is known to have ended (or never ran). */
+static int stop_controller(DWORD wait_ms) {
     InterlockedExchange(&g_quitting, 1);
     if (g_quit_event) SetEvent(g_quit_event);
     SetEvent(g_cmd_event);
-    if (g_controller && GetCurrentThreadId() != g_controller_id)
-        WaitForSingleObject(g_controller, wait_ms);
+    if (!g_controller) return 1;
+    if (GetCurrentThreadId() == g_controller_id) return 0;   /* still running: it is us */
+    return WaitForSingleObject(g_controller, wait_ms) == WAIT_OBJECT_0;
+}
+
+/*
+ * The payment toggle shows its new state at once, but the controller applies
+ * it (CMD_PAYMENT). If we quit before it popped that command, the ini would
+ * keep the old value: apply and save it here. UI thread only (it owns
+ * g_payment_shown; in --selftest app_exit runs on the controller thread and
+ * there is no toggle), and only once the controller has ended, so nothing
+ * else touches g_payment_protect or the ini.
+ */
+static void apply_pending_payment(int controller_stopped) {
+    HWND w = ui_hwnd();
+    if (!controller_stopped || !w || GetWindowThreadProcessId(w, NULL) != GetCurrentThreadId()) return;
+    if ((g_payment_shown != 0) == (g_payment_protect != 0)) return;
+    g_payment_protect = g_payment_shown != 0;
+    config_save();
+    log_line("payment protection %s (applied at exit)", g_payment_protect ? "on" : "off");
+}
+
+/* Exit / uninstall: the window and the tray icon go away first, so the
+ * slow part (joining the controller, stopping the engine, schtasks, file
+ * deletion - seconds on the UI thread) does not look like a hung window. */
+static void ui_hide_for_exit(void) {
+    NOTIFYICONDATAW n;
+    HWND w = ui_hwnd();
+    ZeroMemory(&n, sizeof(n));
+    n.cbSize = sizeof(n);
+    n.hWnd = w;
+    n.uID = 1;
+    Shell_NotifyIconW(NIM_DELETE, &n);
+    if (w && IsWindowVisible(w)) {
+        /* app_exit also runs on the controller thread (--selftest): never
+         * wait on the UI thread from there */
+        if (GetWindowThreadProcessId(w, NULL) == GetCurrentThreadId()) ShowWindow(w, SW_HIDE);
+        else ShowWindowAsync(w, SW_HIDE);
+    }
 }
 
 void app_uninstall(void) {
-    NOTIFYICONDATAW n;
-    ZeroMemory(&n, sizeof(n));
-    n.cbSize = sizeof(n);
-    n.hWnd = ui_hwnd();
-    n.uID = 1;
-    Shell_NotifyIconW(NIM_DELETE, &n);
-    stop_controller(30000);
+    ui_hide_for_exit();
+    log_line("uninstall: window hidden, stopping");
+    apply_pending_payment(stop_controller(30000));   /* moot: the ini is removed below */
     engine_stop();
     run_hidden(L"schtasks.exe", L"/Delete /F /TN \"TurkishDPI\"");
     sys_uninstall(g_dir);
@@ -778,7 +852,7 @@ void app_uninstall(void) {
     MessageBoxW(NULL, L"TurkishDPI kaldırıldı: başlangıç görevi, Program Files kopyası, ayarlar, günlük ve "
                       L"WinDivert sürücü hizmeti silindi.\n"
                       L"Son olarak TurkishDPI.exe dosyasını silebilirsiniz.", L"TurkishDPI",
-                MB_ICONINFORMATION);
+                MB_ICONINFORMATION | MB_SETFOREGROUND | MB_TOPMOST);
     ExitProcess(0);
 }
 
@@ -1090,24 +1164,32 @@ static void site_result(const wchar_t *fmt, const wchar_t *host) {
     ui_refresh();
 }
 
+/* How site_test_run ended; site_test() turns each into a consistent state. */
+typedef enum {
+    SITE_UNTOUCHED,    /* the engine was not changed (opens, bad name, IP block) */
+    SITE_NO_NET,       /* control sites unreachable                              */
+    SITE_INTERRUPTED,  /* a command (or exit) came during the preset search      */
+    SITE_NOT_FOUND,    /* every preset tried, none opened it                     */
+    SITE_SETTLED       /* a preset was announced, or a driver error was shown    */
+} site_end_t;
+
 /* "Site testi": check one site; if blocked, look for a preset that opens it
  * together with the existing targets, then remember the site. */
-static void site_test(const wchar_t *raw) {
+static site_end_t site_test_run(const wchar_t *raw, int prev) {
     wchar_t host[128];
     const wchar_t *h[1];
-    int order[PRESET_COUNT], prev = g_running_preset;
+    int order[PRESET_COUNT];
 
     normalize_host(raw, host, 128);
-    if (!host[0] || !wcschr(host, L'.')) { site_result(L"Geçersiz adres: %ls", raw); return; }
+    if (!host[0] || !wcschr(host, L'.')) { site_result(L"Geçersiz adres: %ls", raw); return SITE_UNTOUCHED; }
     h[0] = host;
     site_result(L"%ls test ediliyor…", host);
     probe_flush_dns_cache();
     if (probe_https_many(h, 1, 6000, NULL, NULL) == 1) {
         site_result(L"✓ %ls açılıyor", host);
-        if (g_scan_aborted && g_auto) auto_scan();   /* a scan we interrupted must still finish */
-        return;
+        return SITE_UNTOUCHED;
     }
-    if (!control_ok()) { site_result(L"İnternet yok, %ls test edilemedi", host); return; }
+    if (!control_ok()) { site_result(L"İnternet yok, %ls test edilemedi", host); return SITE_NO_NET; }
 
     /* Why does it not open? Only DNS and TLS/SNI blocks can be fixed by a
      * different preset; trying all of them for an IP block or a name that
@@ -1126,8 +1208,7 @@ static void site_test(const wchar_t *raw) {
             site_result(d == DIAG_OK ? L"✓ %ls açılıyor"
                       : d == DIAG_NO_DNS ? L"✗ %ls: alan adı bulunamadı (yazım hatası?)"
                       : L"✗ %ls: IP engeli ya da sunucu kapalı – DPI ile aşılamaz", host);
-            if (g_scan_aborted && g_auto) auto_scan();   /* a scan we interrupted must still finish */
-            return;
+            return SITE_UNTOUCHED;
         }
         switch (d) {
         case DIAG_DNS_POISON:
@@ -1142,27 +1223,115 @@ static void site_test(const wchar_t *raw) {
     smart_order(order, PRESET_COUNT);
     for (int k = 0; k < PRESET_COUNT; k++) {
         int p = order[k];
-        if (cmd_pending()) break;
+        if (cmd_pending()) {
+            /* not "no preset opened it": the search simply did not finish */
+            log_line("site test: interrupted by a command after %d of %d presets", k, PRESET_COUNT);
+            site_result(L"%ls testi yarıda kesildi", host);
+            return SITE_INTERRUPTED;
+        }
         if (p == prev) continue;
-        if (!engine_start(p, g_dns)) { if (engine_fatal()) return; continue; }
+        if (!engine_start(p, g_dns)) {
+            if (engine_fatal()) {
+                site_result(L"✗ %ls test edilemedi: sürücü başlatılamadı", host);
+                return SITE_SETTLED;
+            }
+            continue;
+        }
         probe_flush_dns_cache();
         if (probe_https_many(h, 1, 6000, NULL, NULL) == 1 && targets_score(NULL) >= g_ntargets) {
-            InterlockedExchange(&g_scan_aborted, 0);
             smart_record(p, 1, 0);
             site_result(targets_add(host)
                         ? L"✓ %ls açıldı – profil değişti ve site hatırlandı"
                         : L"✓ %ls açıldı – profil değişti (izleme listesi dolu)", host);
             announce(p, g_ntargets);
-            return;
+            return SITE_SETTLED;
         }
     }
     site_result(L"✗ %ls: hiçbir profil açamadı (DPI'ın aşamadığı bir engel)", host);
-    if (!g_auto)
-        manual_start(g_preset);                /* a manual choice stays the user's */
-    else if (!g_scan_aborted && prev >= 0 && engine_start(prev, g_dns))
-        announce(prev, targets_score(NULL));   /* the real score, not an assumed one */
-    else
-        auto_scan();
+    return SITE_NOT_FOUND;
+}
+
+/*
+ * Finishes a scan that a command interrupted (auto_scan gives way to every
+ * queued command); called by every command or site-test ending that does
+ * not replace the scan itself. One rule everywhere, also in manual mode
+ * (g_auto == 0), where a scan only exists because the user pressed
+ * "Yeniden tara": an interrupted scan is finished as a scan, which is what
+ * the user asked for. If yet another command is queued, nothing is started
+ * (a scan begun now would give way at once and only cost a DNS measurement):
+ * the "interrupted" flag stays set and that command replaces or finishes it.
+ */
+static void finish_interrupted_scan(void) {
+    if (g_paused || g_quitting) return;
+    if (cmd_pending()) {
+        InterlockedExchange(&g_scan_aborted, 1);
+        log_line("scan: interrupted scan left to the next queued command");
+        return;
+    }
+    log_line("scan: finishing the interrupted scan");
+    auto_scan();
+}
+
+/* Runs a site test and leaves one consistent state for every way it ends:
+ * never "scanning" with the engine on a candidate preset. */
+static void site_test(const wchar_t *raw) {
+    int prev = g_running_preset;
+    state_kind_t kind;
+    wchar_t status[128], detail[160];
+
+    EnterCriticalSection(&g_lock);   /* what the window showed before the test */
+    kind = g_ui.kind;
+    memcpy(status, g_ui.status, sizeof(status));
+    memcpy(detail, g_ui.detail, sizeof(detail));
+    LeaveCriticalSection(&g_lock);
+
+    switch (site_test_run(raw, prev)) {
+    case SITE_UNTOUCHED:
+        if (g_scan_aborted) finish_interrupted_scan();
+        break;
+    case SITE_NO_NET:
+        /* The engine was not touched. One failed probe round may be a short
+         * glitch: the result line says so and the watchdog handles a link
+         * that is really down. Only a scan we interrupted must still finish
+         * (auto_scan finds the link down and goes offline itself). */
+        log_line("site test: control sites unreachable");
+        if (g_scan_aborted) finish_interrupted_scan();
+        break;
+    case SITE_INTERRUPTED:
+        if (g_quitting) break;
+        if (g_scan_aborted) {
+            /* the engine is on a candidate of the interrupted scan: the
+             * queued command either replaces that scan or finishes it
+             * (controller: "interrupted") */
+            log_line("site test: interrupted scan left to the queued command");
+            break;
+        }
+        /* Back to what ran before, without probing (the queued command
+         * comes first). engine_start keeps an identical running engine. */
+        if (prev >= 0 && !engine_start(prev, g_dns)) {
+            if (!engine_fatal()) set_state(ST_ERROR, L"Başlatılamadı", PRESETS[prev].name);
+            break;
+        }
+        if (prev < 0) engine_stop();
+        set_state(kind, status, detail);
+        log_line("site test: previous state restored (preset %d)", prev);
+        break;
+    case SITE_NOT_FOUND:
+        if (g_scan_aborted)
+            finish_interrupted_scan();             /* the scan we interrupted, in either mode */
+        else if (!g_auto)
+            manual_start(g_preset);                /* a manual choice stays the user's */
+        else if (prev >= 0 && engine_start(prev, g_dns))
+            announce(prev, targets_score(NULL));   /* the real score, not an assumed one */
+        else
+            auto_scan();
+        break;
+    case SITE_SETTLED:
+        /* a new preset was announced, or the driver cannot open: either way
+         * the interrupted scan (if any) is over */
+        InterlockedExchange(&g_scan_aborted, 0);
+        break;
+    }
 }
 
 /* CMD_UPDATE (controller thread): download, verify and put the new release
@@ -1199,6 +1368,27 @@ static void update_install(void) {
     ui_refresh();
     /* the release changes WinDivert: that takes the zip from the page */
     if (r == -1) app_open_url(TURKISHDPI_RELEASES_URL);
+}
+
+/* A setting the engine's command line depends on changed (CMD_PAYMENT):
+ * restart what runs, no full rescan. While paused nothing
+ * runs and nothing is started: the new setting applies at resume. */
+static void restart_running(int interrupted) {
+    set_reason(WHY_SETTINGS);
+    if (g_paused) {
+        log_line("settings changed while paused: applied on resume");
+        return;
+    }
+    /* mid-scan the running preset is only a candidate */
+    if (g_running_preset >= 0 && !interrupted) {
+        int p = g_running_preset;
+        if (engine_start(p, g_dns)) announce(p, targets_score(NULL));
+        else if (!engine_fatal()) { if (g_auto) auto_scan(); else manual_start(g_preset); }
+        return;
+    }
+    /* nothing runs (stand-by, offline, error): the next start uses the new
+     * setting; an interrupted scan must still finish (with the new setting) */
+    if (interrupted) finish_interrupted_scan();
 }
 
 /* ---------- controller thread ---------- */
@@ -1250,10 +1440,11 @@ static DWORD WINAPI controller(LPVOID unused) {
 
         if ((cmd = cmd_pop(&arg)) != CMD_NONE) {
             /* auto_scan gives way to any queued command; a command that does
-             * not replace the scan must finish it afterwards, otherwise the
-             * engine stays on whatever preset was being tried. */
+             * not replace the scan must finish it afterwards
+             * (finish_interrupted_scan), otherwise the engine stays on
+             * whatever preset was being tried. CMD_TESTSITE keeps the flag:
+             * site_test finishes the scan itself. */
             int interrupted = g_scan_aborted != 0;
-            if (cmd == CMD_TOGGLE_PAUSE) cmd = g_paused ? CMD_RESUME : CMD_PAUSE;
             if (cmd != CMD_TESTSITE) InterlockedExchange(&g_scan_aborted, 0);
             switch (cmd) {
             case CMD_RESCAN:  g_paused = 0; set_reason(WHY_USER_RESCAN); auto_scan(); break;
@@ -1265,28 +1456,39 @@ static DWORD WINAPI controller(LPVOID unused) {
                                   config_save(); manual_start((int)arg);
                               }
                               break;
-            case CMD_PAUSE:   g_paused = 1; engine_stop(); probe_flush_dns_cache();
+            case CMD_PAUSE:   if (g_paused) { log_line("pause: already paused, ignored"); break; }
+                              g_paused = 1; engine_stop(); probe_flush_dns_cache();
+                              log_line("paused");
                               set_state(ST_PAUSED, L"Duraklatıldı", L"Açmak için düğmeye basın"); break;
-            case CMD_RESTART: /* settings changed: restart what runs, no full rescan */
-                              set_reason(WHY_SETTINGS);
-                              /* mid-scan the running preset is only a candidate */
-                              if (!g_paused && g_running_preset >= 0 && !interrupted) {
-                                  int p = g_running_preset;
-                                  if (engine_start(p, g_dns)) announce(p, targets_score(NULL));
-                                  else if (!engine_fatal()) { if (g_auto) auto_scan(); else manual_start(g_preset); }
+            case CMD_PAYMENT: /* the UI's toggle: the flag, the ini and the engine change here */
+                              if ((arg != 0) != (g_payment_protect != 0)) {
+                                  g_payment_protect = arg != 0;
+                                  config_save();
+                                  log_line("payment protection %s", g_payment_protect ? "on" : "off");
+                                  restart_running(interrupted);
+                              } else if (interrupted) {
+                                  /* no change (e.g. off and on again): only finish the scan */
+                                  finish_interrupted_scan();
+                              }
+                              break;
+            case CMD_RESUME:  if (!g_paused) {
+                                  log_line("resume: not paused, ignored");
+                                  if (interrupted) finish_interrupted_scan();
                                   break;
                               }
-                              /* fall through */
-            case CMD_RESUME:  g_paused = 0;
-                              if (cmd == CMD_RESUME) set_reason(WHY_RESUME_PAUSE);
+                              g_paused = 0;
+                              log_line("resumed");
+                              set_reason(WHY_RESUME_PAUSE);
                               if (g_auto) auto_scan(); else manual_start(g_preset);
                               break;
+            /* commands that do not replace a scan finish it (see
+             * finish_interrupted_scan for the rule, also in manual mode) */
             case CMD_AUTOSTART: autostart_set((int)arg);
-                              if (interrupted && g_auto && !g_paused) auto_scan();
+                              if (interrupted) finish_interrupted_scan();
                               break;
             case CMD_UPDATE:  update_install();
                               if (g_quitting) return 0;
-                              if (interrupted && g_auto && !g_paused) auto_scan();
+                              if (interrupted) finish_interrupted_scan();
                               break;
             case CMD_TESTSITE: {
                 wchar_t h[256];
@@ -1375,16 +1577,26 @@ static DWORD WINAPI controller(LPVOID unused) {
     return 0;
 }
 
-void post_cmd(LONG cmd, LONG arg) {
+int post_cmd(LONG cmd, LONG arg) {
+    int queued = 1, merged = 0;
     EnterCriticalSection(&g_lock);
-    if (g_cmdq_count < CMD_QUEUE) {
+    if (cmd == CMD_RESCAN && g_cmdq_count &&
+        g_cmdq[(g_cmdq_head + g_cmdq_count - 1) % CMD_QUEUE].cmd == CMD_RESCAN) {
+        merged = 1;   /* back-to-back rescans are one rescan */
+    } else if (g_cmdq_count < CMD_QUEUE) {
         int tail = (g_cmdq_head + g_cmdq_count) % CMD_QUEUE;
         g_cmdq[tail].cmd = cmd;
         g_cmdq[tail].arg = arg;
         g_cmdq_count++;
+    } else {
+        queued = 0;
     }
     LeaveCriticalSection(&g_lock);
+    /* logged outside g_lock (file I/O) */
+    if (merged) log_line("command %ld merged with the queued one", cmd);
+    if (!queued) log_line("command %ld dropped: queue full (%d)", cmd, CMD_QUEUE);
     SetEvent(g_cmd_event);
+    return queued;
 }
 
 void post_site_test(const wchar_t *host) {
@@ -1395,11 +1607,11 @@ void post_site_test(const wchar_t *host) {
     post_cmd(CMD_TESTSITE, 0);
 }
 
+/* UI thread: shown at once, applied by the controller (CMD_PAYMENT saves
+ * the ini and restarts what runs; a paused app stays paused). */
 void set_payment_protect(int on) {
-    g_payment_protect = on;
-    config_save();
-    if (g_running_preset >= 0) post_cmd(CMD_RESTART, 0);
-    else ui_refresh();
+    if (post_cmd(CMD_PAYMENT, on != 0)) g_payment_shown = on != 0;   /* dropped: unchanged */
+    ui_refresh();
 }
 
 /* ---------- autostart via Task Scheduler (elevated, no UAC prompt) ---------- */
@@ -1648,24 +1860,26 @@ static void check_conflicts(void) {
  * new version (whatever it does at start) finds no running instance.
  */
 void app_update_done(int how) {
-    NOTIFYICONDATAW n;
     STARTUPINFOW si;
     PROCESS_INFORMATION pi;
     wchar_t cmd[MAX_PATH + 32], image[MAX_PATH * 2];
     DWORD il = MAX_PATH * 2;
+    /* read before hiding: it decides --tray for the new process */
     int hidden = !IsWindowVisible(ui_hwnd()), started = 0;
-    ZeroMemory(&n, sizeof(n));
-    n.cbSize = sizeof(n);
-    n.hWnd = ui_hwnd();
-    n.uID = 1;
-    Shell_NotifyIconW(NIM_DELETE, &n);
-    stop_controller(5000);
+    /* window and tray icon away first: the controller is stopping, so its
+     * buttons would only post commands nobody runs */
+    ui_hide_for_exit();
+    apply_pending_payment(stop_controller(5000));
     engine_stop();
     if (how != 1 || g_update_lock == INVALID_HANDLE_VALUE) {
-        log_line("update: stopped, the program must be started again by hand");
-        MessageBoxW(NULL, L"Güncelleme yarıda kaldı. TurkishDPI kapatılıyor.\n\n"
-                          L"TurkishDPI.exe'yi yeniden açın; açılmazsa son sürümü GitHub'dan indirin.",
-                    L"TurkishDPI", MB_ICONERROR);
+        /* The running exe was moved aside: the file now at its name may not
+         * be the verified one, so do not tell the user to open it again. */
+        log_line("update: stopped, opening the releases page for a manual download");
+        MessageBoxW(NULL, L"Güncelleme tamamlanamadı. TurkishDPI kapatılıyor.\n\n"
+                          L"Son sürümü GitHub'daki sürümler sayfasından indirin. "
+                          L"Tamam'a basınca sayfa açılır.",
+                    L"TurkishDPI", MB_ICONERROR | MB_SETFOREGROUND | MB_TOPMOST);
+        app_open_url(TURKISHDPI_RELEASES_URL);
         ExitProcess(1);
     }
     if (g_mutex) { ReleaseMutex(g_mutex); CloseHandle(g_mutex); g_mutex = NULL; }
@@ -1698,18 +1912,14 @@ void app_update_done(int how) {
     log_line(started ? "update: new version started" : "update: new version could not be started");
     if (!started)
         MessageBoxW(NULL, L"Yeni sürüm kuruldu ama başlatılamadı. TurkishDPI.exe'yi yeniden açın.",
-                    L"TurkishDPI", MB_ICONWARNING);
+                    L"TurkishDPI", MB_ICONWARNING | MB_SETFOREGROUND | MB_TOPMOST);
     ExitProcess(0);
 }
 
 void app_exit(void) {
-    NOTIFYICONDATAW n;
-    ZeroMemory(&n, sizeof(n));
-    n.cbSize = sizeof(n);
-    n.hWnd = ui_hwnd();
-    n.uID = 1;
-    Shell_NotifyIconW(NIM_DELETE, &n);
-    stop_controller(5000);
+    ui_hide_for_exit();
+    log_line("exit: window hidden, stopping");
+    apply_pending_payment(stop_controller(5000));
     engine_stop();
     probe_flush_dns_cache();
     log_line("exit");
@@ -1774,6 +1984,43 @@ static int lock_self_exe(void) {
     return 1;
 }
 
+/* 1 if the process is elevated (its token says so); 0 if not or unknown. */
+static int process_elevated(DWORD pid) {
+    HANDLE p, tok = NULL;
+    TOKEN_ELEVATION el;
+    DWORD len = 0;
+    int r = 0;
+    p = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+    if (!p) return 0;
+    if (OpenProcessToken(p, TOKEN_QUERY, &tok)) {
+        if (GetTokenInformation(tok, TokenElevation, &el, sizeof(el), &len) && el.TokenIsElevated)
+            r = 1;
+        CloseHandle(tok);
+    }
+    CloseHandle(p);
+    return r;
+}
+
+/*
+ * The running instance's main window. Any program of the same user can
+ * register a window class with our name, so only a window whose process is
+ * elevated is accepted (the real instance always is: requireAdministrator).
+ * Image paths are not compared: the Program Files copy and a downloaded
+ * copy are different files.
+ */
+static HWND find_running_window(DWORD *pid_out) {
+    HWND w = NULL;
+    while ((w = FindWindowExW(NULL, w, L"TurkishDPI_main", NULL)) != NULL) {
+        DWORD pid = 0;
+        GetWindowThreadProcessId(w, &pid);
+        if (pid && pid != GetCurrentProcessId() && process_elevated(pid)) {
+            *pid_out = pid;
+            return w;
+        }
+    }
+    return NULL;
+}
+
 static int app_main(int quiet) {
     HANDLE mtx, t;
     MSG m;
@@ -1789,10 +2036,22 @@ static int app_main(int quiet) {
         return 1;
     }
     if (GetLastError() == ERROR_ALREADY_EXISTS) {
-        /* Bring the running instance's window to front. */
-        HWND w = FindWindowW(L"TurkishDPI_main", NULL);
+        /* Bring the running instance's window to front. Not through WM_TRAY:
+         * that one is open to every program (UIPI allow-list) and therefore
+         * only acted on when the pointer is on our tray icon. */
+        UINT show = RegisterWindowMessageW(TURKISHDPI_SHOW_MSG);
+        DWORD pid = 0;
+        HWND w;
         if (g_selftest) return 3;   /* another instance is running: cannot self-test */
-        if (w && !quiet) PostMessageW(w, WM_TRAY, 0, WM_LBUTTONUP);
+        if (quiet || !show) return 0;
+        w = find_running_window(&pid);
+        if (w) {
+            /* We were just started by the user, so we may take the
+             * foreground; hand that right to the running instance, or its
+             * SetForegroundWindow only flashes the taskbar button. */
+            AllowSetForegroundWindow(pid);
+            PostMessageW(w, show, 0, 0);
+        }
         return 0;
     }
 
