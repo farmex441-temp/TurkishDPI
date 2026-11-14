@@ -801,13 +801,28 @@ static void stop_controller(DWORD wait_ms) {
         WaitForSingleObject(g_controller, wait_ms);
 }
 
-void app_uninstall(void) {
+/* Exit / uninstall: the window and the tray icon go away first, so the
+ * slow part (joining the controller, stopping the engine, schtasks, file
+ * deletion - seconds on the UI thread) does not look like a hung window. */
+static void ui_hide_for_exit(void) {
     NOTIFYICONDATAW n;
+    HWND w = ui_hwnd();
     ZeroMemory(&n, sizeof(n));
     n.cbSize = sizeof(n);
-    n.hWnd = ui_hwnd();
+    n.hWnd = w;
     n.uID = 1;
     Shell_NotifyIconW(NIM_DELETE, &n);
+    if (w && IsWindowVisible(w)) {
+        /* app_exit also runs on the controller thread (--selftest): never
+         * wait on the UI thread from there */
+        if (GetWindowThreadProcessId(w, NULL) == GetCurrentThreadId()) ShowWindow(w, SW_HIDE);
+        else ShowWindowAsync(w, SW_HIDE);
+    }
+}
+
+void app_uninstall(void) {
+    ui_hide_for_exit();
+    log_line("uninstall: window hidden, stopping");
     stop_controller(30000);
     engine_stop();
     run_hidden(L"schtasks.exe", L"/Delete /F /TN \"TurkishDPI\"");
@@ -1867,12 +1882,8 @@ void app_update_done(int how) {
 }
 
 void app_exit(void) {
-    NOTIFYICONDATAW n;
-    ZeroMemory(&n, sizeof(n));
-    n.cbSize = sizeof(n);
-    n.hWnd = ui_hwnd();
-    n.uID = 1;
-    Shell_NotifyIconW(NIM_DELETE, &n);
+    ui_hide_for_exit();
+    log_line("exit: window hidden, stopping");
     stop_controller(5000);
     engine_stop();
     probe_flush_dns_cache();
