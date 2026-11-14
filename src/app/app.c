@@ -793,12 +793,31 @@ static DWORD g_controller_id;
 
 /* Stops the controller thread (it checks g_quitting between steps) so that
  * nothing restarts the engine or writes files while we tear down. */
-static void stop_controller(DWORD wait_ms) {
+/* Returns 1 when the controller thread is known to have ended (or never ran). */
+static int stop_controller(DWORD wait_ms) {
     InterlockedExchange(&g_quitting, 1);
     if (g_quit_event) SetEvent(g_quit_event);
     SetEvent(g_cmd_event);
-    if (g_controller && GetCurrentThreadId() != g_controller_id)
-        WaitForSingleObject(g_controller, wait_ms);
+    if (!g_controller) return 1;
+    if (GetCurrentThreadId() == g_controller_id) return 0;   /* still running: it is us */
+    return WaitForSingleObject(g_controller, wait_ms) == WAIT_OBJECT_0;
+}
+
+/*
+ * The payment toggle shows its new state at once, but the controller applies
+ * it (CMD_PAYMENT). If we quit before it popped that command, the ini would
+ * keep the old value: apply and save it here. UI thread only (it owns
+ * g_payment_shown; in --selftest app_exit runs on the controller thread and
+ * there is no toggle), and only once the controller has ended, so nothing
+ * else touches g_payment_protect or the ini.
+ */
+static void apply_pending_payment(int controller_stopped) {
+    HWND w = ui_hwnd();
+    if (!controller_stopped || !w || GetWindowThreadProcessId(w, NULL) != GetCurrentThreadId()) return;
+    if ((g_payment_shown != 0) == (g_payment_protect != 0)) return;
+    g_payment_protect = g_payment_shown != 0;
+    config_save();
+    log_line("payment protection %s (applied at exit)", g_payment_protect ? "on" : "off");
 }
 
 /* Exit / uninstall: the window and the tray icon go away first, so the
@@ -823,7 +842,7 @@ static void ui_hide_for_exit(void) {
 void app_uninstall(void) {
     ui_hide_for_exit();
     log_line("uninstall: window hidden, stopping");
-    stop_controller(30000);
+    apply_pending_payment(stop_controller(30000));   /* moot: the ini is removed below */
     engine_stop();
     run_hidden(L"schtasks.exe", L"/Delete /F /TN \"TurkishDPI\"");
     sys_uninstall(g_dir);
@@ -1838,7 +1857,7 @@ void app_update_done(int how) {
     n.hWnd = ui_hwnd();
     n.uID = 1;
     Shell_NotifyIconW(NIM_DELETE, &n);
-    stop_controller(5000);
+    apply_pending_payment(stop_controller(5000));
     engine_stop();
     if (how != 1 || g_update_lock == INVALID_HANDLE_VALUE) {
         /* The running exe was moved aside: the file now at its name may not
@@ -1888,7 +1907,7 @@ void app_update_done(int how) {
 void app_exit(void) {
     ui_hide_for_exit();
     log_line("exit: window hidden, stopping");
-    stop_controller(5000);
+    apply_pending_payment(stop_controller(5000));
     engine_stop();
     probe_flush_dns_cache();
     log_line("exit");
