@@ -81,11 +81,16 @@ src/engine/         the packet engine
                     QUIC/Discord-voice adapted from Shroudly raw_windows.c; own
                     IPv6 split+decoy (build6/desync6, no extension headers),
                     DNS redirection, payment exclusion, STATS reporter
-  core/             from Shroudly core/src (MIT, unchanged except a header
-                    line): proto (TLS/HTTP parse, decoy names), tcpdpi (segment
-                    builders, hop table, tlsrec seq translation), udpdpi (QUIC
-                    Initial, Discord voice), rawscope (local addresses, touched
-                    servers for RST drop, no-decoy table), raw_desync.h (config)
+  core/             from Shroudly core/src (MIT): proto (TLS/HTTP parse, decoy
+                    names), tcpdpi (segment builders, hop table, tlsrec seq
+                    translation), udpdpi (QUIC Initial, Discord voice), rawscope
+                    (local addresses, touched servers for RST drop, no-decoy
+                    table), raw_desync.h (config). Unchanged except a header
+                    line, apart from tcpdpi.c/.h: TurkishDPI added
+                    `tcpdpi_xlate_fin` and the `fins`/`dead_at` fields (retire a
+                    tlsrec translation entry after both FINs) and a high-water
+                    mark so the per-packet lookup scans only used slots (marked
+                    `TurkishDPI:` in the source)
   dns.c/.h          own DNS question table + hybrid race verdicts + forged-answer
                     check (block IPs, bogons, error rcodes, malformed = forged)
   exclude.c/.h      payment/bank "never touch" list (SNI + IPs learned from DNS)
@@ -123,16 +128,29 @@ Runtime data: `%ProgramData%\TurkishDPI\` (admin-owned, protected DACL):
 ## Key behaviours (what was built and why)
 
 - **Auto scan** (`auto_scan`): no internet -> wait; measure all clean DNS servers
-  in parallel and keep the fastest; learn the ISP's block-page IPs (engine must
-  be stopped, so at most once per 24 h per network: `bt=` in `[net_<id>]`); try
-  presets in learned order; on a new network measure up to two extra working
-  presets and keep the fastest. The running engine stays on during the
+  in parallel and keep the fastest; with hybrid DNS on, learn the ISP's
+  block-page IPs (engine must be stopped; `bt=` in `[net_<id>]` holds the
+  time: a result is reused for 24 h per network, an empty result is retried
+  after 1 h - `block_ips_stale`/`learn_block_ips_if_stale`); try
+  presets in learned order; after the first preset that opens every target,
+  try up to two more presets that were not known on this network (`extra`
+  counts every preset whose engine started after the winner, working or not;
+  a non-fatal start failure is skipped before it counts) and keep the
+  fastest (a later preset replaces the winner only if it is more than 20%
+  faster); the walk stops at a preset already known on this network, and on a
+  network with more than one learned preset a known preset that works ends it
+  at once. The running engine stays on during the
   measurements and `engine_start` keeps it when the arguments are identical,
   so a re-check that ends on the same preset drops no connection.
   Watchdog every `WatchdogMinutes` (1-240) with a second strike: a failed
   check is repeated after 20 s, only a repeated failure rescans. Network
   changes are debounced (4 s quiet, 20 s max). Partial mode only rescans if
-  it gets worse. Watchdog successes count in the learning stats once an hour.
+  it gets worse. Only every 6th successful check counts in the learning
+  stats (`health_record`; one counter shared by the watchdog and the
+  post-network-change check `health_ok(1)` in the controller loop), i.e.
+  hourly only at the default 10 minutes with no network changes. A confirmed
+  watchdog failure always counts (outside partial mode); the post-network-
+  change check has no second strike, so a single failure there counts at once.
 - **One-click update** (2.0.1): the update thread finds a newer
   `releases/latest` tag (digits and dots only); the banner's "Güncelle →"
   posts `CMD_UPDATE`; the controller (`update_install` -> `sys_update_install`)
@@ -170,11 +188,13 @@ Runtime data: `%ProgramData%\TurkishDPI\` (admin-owned, protected DACL):
 - **Hybrid DNS** (`--dns-hybrid`, `--dns-block-ip`): each query goes to the
   system resolver *and* the clean one; first trustworthy answer wins; forged
   answers (block pages, bogons, NXDOMAIN/SERVFAIL/REFUSED from the ISP) dropped.
-- **Narrow filter** (`build_filter`): outbound only HTTP requests (port 80 with
-  payload) and TLS records 22/21 on 443 (ClientHello, client alerts); with
-  tlsrec every IPv4 443 segment (its sequence numbers move); QUIC Initials;
-  DNS port 53 out, answers from 53 (hybrid/learning) and from the clean
-  resolver's exact IP:port; inbound RST / SYN-ACK / TLS alerts from 80/443.
+- **Narrow filter** (`build_filter`): outbound every port-80 segment that
+  carries payload (not only requests: the parser decides) and TLS records
+  22/21 on 443 (ClientHello, client alerts); with tlsrec every outbound IPv4
+  443 segment (its sequence numbers move) and, inbound, every IPv4 segment
+  from 443 (their ACKs are translated); QUIC Initials; DNS port 53 out,
+  answers from 53 (hybrid/learning) and from the clean resolver's exact
+  IP:port; inbound RST / SYN-ACK / TLS alerts from 80/443.
   Do not widen this without a reason: every diverted packet costs two
   context switches.
 - **Presets** (presets.h, measured on Türk Telekom 2026-11-08, 5 runs x 4
@@ -189,7 +209,8 @@ Runtime data: `%ProgramData%\TurkishDPI\` (admin-owned, protected DACL):
   keys are ignored); reordering presets invalidates them.
 - **Payment protection** (default on, `--no-payment-exclude` / ini
   `PaymentProtection=0` to disable): ~100 bank/payment/3-D Secure domains are
-  never modified, matched by SNI/Host and by addresses learned from DNS answers.
+  never modified. `excluded_conn` checks the destination address first (addresses
+  learned from DNS answers, `exclude_check_ip`), then the SNI/Host name.
 - **QUIC** Initials are dropped (engine default, both families) so browsers fall back to TCP.
 - **No bundled/embedded driver in the exe**: releases are zips with
   `TurkishDPI.exe` + WinDivert's signed `WinDivert.dll`/`WinDivert64.sys`
@@ -218,7 +239,14 @@ for t in proto tcpdpi udpdpi rawscope; do x86_64-w64-mingw32-gcc -g -O1 -fsaniti
 ```
 
 Without MinGW, MSVC (`cl /fsanitize=address`, add `/Dssize_t=intptr_t`) builds
-and runs the unit tests; the release exe is built with MinGW (CI).
+and runs the unit tests too; the release exe is built with MinGW (CI).
+
+C runtime: a local llvm-mingw build links ucrt, the CI release build uses
+Ubuntu's `gcc-mingw-w64` and links msvcrt (the Makefile does not choose; the
+toolchain does). The same source must work with both - see Conventions. To use a
+WinDivert other than the pinned official one: `make WINDIVERT=<folder>` (layout
+of the official archive: `include/`, `x64/`, `x86/`); the Makefile computes the
+DLL/driver SHA-256 pins from that folder.
 
 Quick checks without admin:
 - `__COMPAT_LAYER=RunAsInvoker TurkishDPI.exe --engine <args>`: "Error opening
@@ -336,9 +364,11 @@ SHA-256 in the workflow.
 - v1.1.0 (rc2 published as pre-release): hybrid DNS, fastest DNS, narrow
   filter, honest latency metric, payment IP learning, no embedded driver,
   first bug-hunting round (21 findings).
-- Branch `feature/hardening-autopilot` (not merged): security hardening and
-  autopilot work from docs/DEVELOPMENT-ROADMAP.md items 1, 2, 3 (partly), 5,
-  16; see docs/ for the analysis.
+- Branch `feature/hardening-autopilot` (merged into main, first released in
+  v1.2.0): security hardening and autopilot work from
+  docs/DEVELOPMENT-ROADMAP.md items 1, 2, 3 (partly), 5, 16. docs/ARCHITECTURE,
+  PROJECT-ANALYSIS, SECURITY-REVIEW, DEVELOPMENT-ROADMAP and docs/design/UI-AUDIT,
+  PREVIEW-PLAN are historical v1.1.0 snapshots (each says so at the top).
 - v1.2.0: merge of feature/hardening-autopilot + feature/ui-redesign, then a
   /code-review round (driver pinning, TCP-first diagnosis), a bug hunt
   (10 findings) and a full security audit (14 findings: same-user attacker
@@ -376,7 +406,10 @@ SHA-256 in the workflow.
   Elevated test scripts must stop the app before its engine: killing the
   engine first makes the app start a new one that is orphaned (suspended,
   outside the job) when the app is killed right after.
-- After rc2 (on main, not yet tagged): second bug-hunting round - app layer
+- Size and memory of the released v2.0.1 (measured 2026-11-14, idle): exe
+  2.16 MB, x64 zip about 0.57 MB; app process 16 MB working set / 7 MB private,
+  engine process 3 MB / 2 MB (README quotes these; do not quote older figures).
+- After rc2 (released in v1.1.0-rc3 and v1.1.0): second bug-hunting round - app layer
   (17 findings: folder-security race, laptop autostart, tray icon after
   Explorer restart, manual mode overridden by site test, watchdog balloon
   loop, validated block IPs, absolute System32 paths, non-elevated browser,

@@ -28,7 +28,7 @@ enum {
     DNS_IN_NOT_OURS = 0,   /* no question of ours: deliver unchanged */
     DNS_IN_REWRITE = 1,    /* the clean resolver's first answer (any rcode): rewrite to look like the asked one */
     DNS_IN_DROP = 2,       /* forged, or a late duplicate: drop */
-    DNS_IN_PASS = 3,       /* the asked resolver's own clean answer: deliver, trusted */
+    DNS_IN_PASS = 3,       /* the asked resolver's own clean answer (LAN addresses allowed from a local resolver): deliver, trusted */
     DNS_IN_PASS_OTHER = 4  /* a clean-looking answer from someone else: deliver, not trusted */
 };
 
@@ -39,7 +39,11 @@ void dns_set_clean(uint32_t v4, uint16_t v4port, const uint32_t v6[4], uint16_t 
 /* An extra block-page address ("a.b.c.d" or IPv6 text); 1 if it was parsed. */
 int  dns_add_block_ip(const char *ip);
 /* 1 if an answer must not be trusted: an error code, a block page, a private
- * or special address, or a message that does not parse. */
+ * or special address, or a message that does not parse. This is the strict
+ * check for an answer whose sender is not known to be local; in the hybrid
+ * race (dns_handle_incoming_hybrid) an answer from the asked resolver may
+ * carry RFC 1918 / 169.254 addresses when that resolver's own address is
+ * local (RFC 1918, 169.254, loopback, ULA, link-local; not CGNAT). */
 int  dns_answer_is_forged(const char *data, unsigned int len);
 /* 1 for a well-formed DNS question (outgoing) or answer (incoming). */
 int  dns_is_dns_packet(const char *data, unsigned int len, int outgoing);

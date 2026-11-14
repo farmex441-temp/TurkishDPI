@@ -72,15 +72,29 @@ static int lookup(const char *host) {
     }
 }
 
-int exclude_add(const char *host) {
+#define BUILTIN_COUNT (sizeof(BUILTIN_EXCLUDES) / sizeof(BUILTIN_EXCLUDES[0]))
+#define EXCL_MAX_NAMES (EXCL_SLOTS / 2)
+static int builtins_loaded;
+/* the reserve below must leave room for user names */
+_Static_assert(BUILTIN_COUNT < EXCL_MAX_NAMES, "built-in list does not fit the name set");
+
+/* Built-in names always win: until they are loaded, user names may not use the
+ * room reserved for them, whatever the call order. */
+static int add_name(const char *host, int builtin) {
     char buf[HOST_MAXLEN + 1];
     const char *s = host;
+    size_t len;
+    int limit = EXCL_MAX_NAMES;
     unsigned i;
     while (*s == ' ' || *s == '\t' || *s == '.') s++;
-    if (strlen(s) < 2 || strlen(s) > HOST_MAXLEN || *s == '#') return 0;
-    strcpy(buf, s);
+    len = strlen(s);
+    while (len && (s[len - 1] == '.' || s[len - 1] == ' ' || s[len - 1] == '\t')) len--;
+    if (len < 2 || len > HOST_MAXLEN || *s == '#') return 0;
+    memcpy(buf, s, len);
+    buf[len] = 0;
     normalize(buf);
-    if (!buf[0] || lookup(buf) || excluded_count >= EXCL_SLOTS / 2) return 0;
+    if (!builtin && !builtins_loaded) limit -= (int)BUILTIN_COUNT;
+    if (!buf[0] || lookup(buf) || excluded_count >= limit) return 0;
     for (i = name_hash(buf) & (EXCL_SLOTS - 1); excluded[i]; i = (i + 1) & (EXCL_SLOTS - 1)) {}
     excluded[i] = strdup(buf);
     if (!excluded[i]) return 0;
@@ -88,21 +102,65 @@ int exclude_add(const char *host) {
     return 1;
 }
 
+int exclude_add(const char *host) {
+    return add_name(host, 0);
+}
+
 int exclude_load_builtin(void) {
     int n = 0;
-    for (size_t i = 0; i < sizeof(BUILTIN_EXCLUDES) / sizeof(BUILTIN_EXCLUDES[0]); i++)
-        n += exclude_add(BUILTIN_EXCLUDES[i]);
+    for (size_t i = 0; i < BUILTIN_COUNT; i++)
+        n += add_name(BUILTIN_EXCLUDES[i], 1);
+    builtins_loaded = 1;
     return n;
 }
 
+/* The built-in list will not be loaded (payment protection off): user names may
+ * use the whole set. */
+void exclude_skip_builtin(void) {
+    builtins_loaded = 1;
+}
+
+/* One name per line. Lines end at LF, CR or CRLF; the file is read in binary
+ * mode (a 0x1A byte is just a byte). Bytes after the first '#' of a line are a
+ * comment: they are not stored, do not count towards the length limit, and a
+ * NUL byte inside them is just comment text. The part before the '#' must fit
+ * LINE_MAX_BYTES and contain no NUL, otherwise the line is invalid and skipped
+ * as a whole. A UTF-8 byte order mark at the start (Notepad) is ignored. On a
+ * read error the unterminated last line is not used and -1 is returned. */
+#define LINE_MAX_BYTES 1023
 int exclude_load_list(const char *filename) {
-    char line[1024];
-    int cnt = 0;
-    FILE *fp = fopen(filename, "r");
+    char line[LINE_MAX_BYTES + 1];
+    size_t n = 0;
+    int cnt = 0, first = 1, bad = 0, comment = 0, c;
+    FILE *fp = fopen(filename, "rb");
     if (!fp) return -1;
-    while (fgets(line, sizeof(line), fp)) {
-        line[strcspn(line, "\r\n#")] = '\0';
-        cnt += exclude_add(line);
+    for (;;) {
+        c = fgetc(fp);
+        if (c != EOF && c != '\n' && c != '\r') {
+            if (comment) continue;
+            if (c == '#') { comment = 1; continue; }
+            if (c == 0) bad = 1;
+            if (n < LINE_MAX_BYTES) line[n++] = (char)c;
+            else bad = 1;
+            continue;
+        }
+        if (c == EOF && ferror(fp)) { fclose(fp); return -1; }
+        if (c == '\r') {
+            int d = fgetc(fp);
+            if (d != '\n' && d != EOF) ungetc(d, fp);
+        }
+        if (n || bad || c != EOF) {
+            line[n] = 0;
+            if (first && n >= 3 && (unsigned char)line[0] == 0xEF &&
+                (unsigned char)line[1] == 0xBB && (unsigned char)line[2] == 0xBF)
+                memmove(line, line + 3, n - 3 + 1);
+            first = 0;
+            if (!bad) cnt += exclude_add(line);
+        }
+        n = 0;
+        bad = 0;
+        comment = 0;
+        if (c == EOF) break;
     }
     fclose(fp);
     return cnt;
@@ -116,33 +174,61 @@ int exclude_enabled(void) {
 #define EXCL_V4 512
 #define EXCL_V6 256
 #define EXCL_TTL_MS (2ull * 3600ull * 1000ull)
+/* One DNS answer may carry any number of records; only this many addresses of
+ * one answer are learned, so a single (forged or odd) answer cannot flush the
+ * table. */
+#define EXCL_MAX_PER_ANSWER 16
 static struct { unsigned long addr; ULONGLONG until; } excl_v4[EXCL_V4];
 static struct { unsigned char addr[16]; ULONGLONG until; } excl_v6[EXCL_V6];
-static int excl_v4_next, excl_v6_next;
 
-static void ip_add(const unsigned char *a, int is_v6) {
-    ULONGLONG until = GetTickCount64() + EXCL_TTL_MS;
+static ULONGLONG real_clock(void) { return GetTickCount64(); }
+static ULONGLONG (*excl_clock)(void) = real_clock;
+
+void exclude_set_clock_for_test(unsigned long long (*clock_ms)(void)) {
+    excl_clock = clock_ms ? clock_ms : real_clock;
+}
+
+void exclude_reset_for_test(void) {
+    for (int i = 0; i < EXCL_SLOTS; i++) { free(excluded[i]); excluded[i] = NULL; }
+    excluded_count = 0;
+    builtins_loaded = 0;
+    memset(excl_v4, 0, sizeof excl_v4);
+    memset(excl_v6, 0, sizeof excl_v6);
+}
+
+/* A known address only gets a fresh lifetime. A new one takes a free or
+ * expired slot, else the entry that expires soonest (the one refreshed
+ * longest ago). */
+static void ip_add(const unsigned char *a, int is_v6, ULONGLONG now) {
+    ULONGLONG until = now + EXCL_TTL_MS;
+    int i, victim = 0;
     if (!is_v6) {
         unsigned long v;
         memcpy(&v, a, 4);
-        for (int i = 0; i < EXCL_V4; i++)
+        for (i = 0; i < EXCL_V4; i++)
             if (excl_v4[i].until && excl_v4[i].addr == v) { excl_v4[i].until = until; return; }
-        excl_v4[excl_v4_next].addr = v;
-        excl_v4[excl_v4_next].until = until;
-        excl_v4_next = (excl_v4_next + 1) % EXCL_V4;
+        for (i = 0; i < EXCL_V4; i++) {
+            if (excl_v4[i].until <= now) { victim = i; break; }
+            if (excl_v4[i].until < excl_v4[victim].until) victim = i;
+        }
+        excl_v4[victim].addr = v;
+        excl_v4[victim].until = until;
     } else {
-        for (int i = 0; i < EXCL_V6; i++)
+        for (i = 0; i < EXCL_V6; i++)
             if (excl_v6[i].until && !memcmp(excl_v6[i].addr, a, 16)) { excl_v6[i].until = until; return; }
-        memcpy(excl_v6[excl_v6_next].addr, a, 16);
-        excl_v6[excl_v6_next].until = until;
-        excl_v6_next = (excl_v6_next + 1) % EXCL_V6;
+        for (i = 0; i < EXCL_V6; i++) {
+            if (excl_v6[i].until <= now) { victim = i; break; }
+            if (excl_v6[i].until < excl_v6[victim].until) victim = i;
+        }
+        memcpy(excl_v6[victim].addr, a, 16);
+        excl_v6[victim].until = until;
     }
 }
 
 int exclude_check_ip(const void *addr, int is_ipv6) {
     ULONGLONG now;
     if (!excluded_count) return 0;
-    now = GetTickCount64();
+    now = excl_clock();
     if (!is_ipv6) {
         unsigned long v;
         memcpy(&v, addr, 4);
@@ -169,7 +255,8 @@ static int skip_name(const unsigned char *m, unsigned int len, unsigned int off)
 void exclude_learn_dns(const char *data, unsigned int len) {
     const unsigned char *m = (const unsigned char *)data;
     char name[HOST_MAXLEN + 1];
-    unsigned int off = 12, n = 0, qd, an;
+    unsigned int off = 12, n = 0, qd, an, learned = 0;
+    ULONGLONG now;
     int o;
     if (!excluded_count || len < 12 || !(m[2] & 0x80) || (m[3] & 0x0F)) return;
     qd = (m[4] << 8) | m[5];
@@ -188,6 +275,7 @@ void exclude_learn_dns(const char *data, unsigned int len) {
     name[n] = 0;
     if (!exclude_check_hostname(name, n)) return;
     o = (int)off + 1 + 4;   /* root label, QTYPE, QCLASS */
+    now = excl_clock();
     for (unsigned int i = 0; i < an; i++) {
         unsigned int type, rdlen;
         o = skip_name(m, len, (unsigned int)o);
@@ -196,8 +284,9 @@ void exclude_learn_dns(const char *data, unsigned int len) {
         rdlen = (m[o + 8] << 8) | m[o + 9];
         o += 10;
         if ((unsigned int)o + rdlen > len) return;
-        if (type == 1 && rdlen == 4) ip_add(m + o, 0);
-        else if (type == 28 && rdlen == 16) ip_add(m + o, 1);
+        if (type == 1 && rdlen == 4) { ip_add(m + o, 0, now); learned++; }
+        else if (type == 28 && rdlen == 16) { ip_add(m + o, 1, now); learned++; }
+        if (learned >= EXCL_MAX_PER_ANSWER) return;
         o += (int)rdlen;
     }
 }
