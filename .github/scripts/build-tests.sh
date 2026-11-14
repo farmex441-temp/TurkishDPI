@@ -45,6 +45,9 @@ test_tcpdpi|tests/core/test_tcpdpi.c $CORE|-Isrc/engine/core
 test_udpdpi|tests/core/test_udpdpi.c $CORE|-Isrc/engine/core
 test_rawscope|tests/core/test_rawscope.c $CORE|-Isrc/engine/core
 xlate_test|tests/xlate_test.c src/engine/core/tcpdpi.c|-Isrc/engine/core
+pieces_test|tests/pieces_test.c src/engine/core/tcpdpi.c src/engine/core/proto.c|-Isrc/engine/core|-
+policy_test|tests/policy_test.c src/engine/policy.c src/engine/core/udpdpi.c|-Isrc/engine -Isrc/engine/core|-
+desync_test|tests/desync_test.c src/engine/desync.c src/engine/core/tcpdpi.c src/engine/core/proto.c|-Isrc/engine -Isrc/engine/core|-
 "
 
 mkdir -p "$OUT"

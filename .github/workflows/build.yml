@@ -145,7 +145,7 @@ jobs:
           # Only the tests that do not include Windows headers (dns and
           # exclude run under MSVC ASan in test-asan-windows). Same table and
           # warning policy as the other jobs: .github/scripts/build-tests.sh
-          export TEST_ONLY="diag_test updpkg_test test_proto test_tcpdpi test_udpdpi test_rawscope xlate_test"
+          export TEST_ONLY="diag_test updpkg_test test_proto test_tcpdpi test_udpdpi test_rawscope xlate_test pieces_test policy_test desync_test"
           export TEST_LIBS="" TEST_EXT=""
           bash .github/scripts/build-tests.sh gcc build/san -g -O1 -fsanitize=address,undefined -fno-sanitize-recover=all
           for t in build/san/*; do
