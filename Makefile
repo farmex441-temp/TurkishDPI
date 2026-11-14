@@ -17,8 +17,14 @@ CFLAGS  := -std=gnu11 -O2 -pipe -Wall -Wextra -Wno-unused-parameter \
            -D_WIN32_WINNT=0x0601 -DWINVER=0x0601 \
            -I$(WINDIVERT)/include -Isrc/engine -Isrc/app \
            -ffunction-sections -fdata-sections
-LDFLAGS := -mwindows -static -Wl,--gc-sections \
-           -Wl,--dynamicbase,--nxcompat
+# -S drops only the DWARF debug info that the static MinGW libraries bring
+# in; the symbol table stays on purpose (never -s: see CLAUDE.md, VirusTotal).
+LDFLAGS := -mwindows -static -Wl,--gc-sections -Wl,-S \
+           -Wl,--dynamicbase,--nxcompat,--tsaware
+# MAP=<file> writes a linker map (CI uploads it to inspect section sizes)
+ifneq ($(MAP),)
+LDFLAGS += -Wl,-Map=$(MAP)
+endif
 ifeq ($(ARCH),x86_64)
 LDFLAGS += -Wl,--high-entropy-va
 endif
@@ -40,6 +46,8 @@ ifneq ($(WINDIVERT_DLL_SHA256),)
 CFLAGS += -DWINDIVERT_DLL_SHA256=\"$(WINDIVERT_DLL_SHA256)\"
 else ifeq ($(REQUIRE_WINDIVERT_HASH),1)
 $(error $(WINDIVERT_DLL) not found: cannot pin its SHA-256)
+else
+$(warning $(WINDIVERT_DLL) not found: this exe pins no WinDivert.dll hash (local build only, never release it))
 endif
 # The drivers are pinned too: WinDivert.dll installs whichever .sys sits next
 # to it as a kernel driver. x64 packages ship WinDivert64.sys; x86 packages
@@ -52,11 +60,15 @@ ifneq ($(WINDIVERT_SYS64_SHA256),)
 CFLAGS += -DWINDIVERT_SYS64_SHA256=\"$(WINDIVERT_SYS64_SHA256)\"
 else ifeq ($(REQUIRE_WINDIVERT_HASH),1)
 $(error $(WINDIVERT_SYS64) not found: cannot pin its SHA-256)
+else
+$(warning $(WINDIVERT_SYS64) not found: this exe pins no WinDivert64.sys hash (local build only, never release it))
 endif
 ifneq ($(WINDIVERT_SYS32_SHA256),)
 CFLAGS += -DWINDIVERT_SYS32_SHA256=\"$(WINDIVERT_SYS32_SHA256)\"
 else ifeq ($(REQUIRE_WINDIVERT_HASH)$(WDARCH),1x86)
 $(error $(WINDIVERT_SYS32) not found: cannot pin its SHA-256)
+else ifeq ($(WDARCH),x86)
+$(warning $(WINDIVERT_SYS32) not found: this exe pins no WinDivert32.sys hash (local build only, never release it))
 endif
 
 ENGINE_SRC := $(wildcard src/engine/*.c src/engine/core/*.c)
