@@ -35,6 +35,15 @@ static uint16_t csum_fold(uint32_t sum) {
   return (uint16_t)(~sum & 0xffff);
 }
 
+/* TurkishDPI: a decoy's checksum that can never verify. Inverting the right
+ * one is enough except where the right one is 0x0000 or 0xffff: those two are
+ * the same value in one's-complement arithmetic, so the inverse would verify
+ * (about 1 in 65536 decoys) - then a fixed other value is used. Every other
+ * result is the original inversion, byte for byte. */
+uint16_t tcpdpi_bad_csum(uint16_t good) {
+  return (good == 0x0000 || good == 0xffff) ? (uint16_t)0x5a5a : (uint16_t)(good ^ 0xffff);
+}
+
 /* Write IPv4 header checksum and TCP checksum into a complete IPv4+TCP segment
  * buffer `pkt` of length `len`. ihl = IPv4 header length in bytes. If bad != 0
  * the TCP checksum is inverted so the destination drops the segment. */
@@ -53,7 +62,7 @@ static void fill_checksums4(uint8_t *pkt, int len, int ihl, int bad) {
   sum += (uint32_t)tcp_len;                 /* TCP length */
   pkt[tcp_off + 16] = 0; pkt[tcp_off + 17] = 0;
   uint16_t c = csum_fold(csum_add(pkt + tcp_off, tcp_len, sum));
-  if (bad) c = (uint16_t)(c ^ 0xffff);      /* deliberately wrong: server drops it */
+  if (bad) c = tcpdpi_bad_csum(c);          /* deliberately wrong: server drops it */
   wr16(pkt + tcp_off + 16, c);
 }
 
@@ -195,10 +204,10 @@ int tcpdpi_build_seqovl4(uint8_t *dst, size_t dstcap,
                                pay, paylen, 0 /* good: the server keeps it */);
 }
 
-/* TurkishDPI: now built from tcpdpi_plan_fakedsplit (one piece per part as
- * before while the parts fit TCPDPI_PIECE_MAX; a larger payload needs more
- * pieces than segs[3] holds and is refused here - the engine sends whole
- * plans itself). Output for payloads that fit is unchanged. */
+/* TurkishDPI: built from tcpdpi_plan_fakedsplit with the old limit (a part
+ * may fill a TCPDPI_SEG_MAX packet), so the output is exactly the original
+ * builder's. The engine uses the plans directly; this function is kept as
+ * the reference implementation the tests compare against. */
 int tcpdpi_build_fakedsplit4(tcpdpi_seg segs[3], int *nsegs,
                              const uint8_t *ip_tmpl, int ihl,
                              const uint8_t *tcp_tmpl, int tcphl,
@@ -208,7 +217,7 @@ int tcpdpi_build_fakedsplit4(tcpdpi_seg segs[3], int *nsegs,
                              int disorder) {
   if (!segs || !nsegs || !real) return 0;
   tcpdpi_piece plan[3];
-  int n = tcpdpi_plan_fakedsplit(plan, 3, real_len, split_pos, disorder);
+  int n = tcpdpi_plan_fakedsplit(plan, 3, real_len, split_pos, disorder, TCPDPI_SEG_MAX - ihl - tcphl);
   if (n != 3) return 0;
   /* The three segments in the order they are sent. The fake shadows the real
    * part that follows it, carrying junk so the DPI mis-reads that region; its
@@ -249,10 +258,11 @@ int tcpdpi_build_multisplit4(tcpdpi_seg segs[3], int *nsegs,
                              const uint8_t *real, int real_len,
                              const int *cuts, int ncuts, int reverse) {
   if (!segs || !nsegs || !real || !cuts || ncuts < 1 || ncuts > 2 || real_len < 2) return 0;
-  /* TurkishDPI: built from tcpdpi_plan_split; a payload whose parts do not
-   * fit TCPDPI_PIECE_MAX needs more than three pieces and is refused here. */
+  /* TurkishDPI: built from tcpdpi_plan_split with the old limit (a part may
+   * fill a TCPDPI_SEG_MAX packet): the original builder's output. Kept as the
+   * reference implementation the tests compare against. */
   tcpdpi_piece plan[3];
-  int k = tcpdpi_plan_split(plan, 3, real_len, cuts, ncuts, reverse);
+  int k = tcpdpi_plan_split(plan, 3, real_len, cuts, ncuts, reverse, TCPDPI_SEG_MAX - ihl - tcphl);
   if (k != ncuts + 1) return 0;
   for (int i = 0; i < k; i++) {
     int len = tcpdpi_build_piece4(segs[i].data, sizeof segs[i].data, ip_tmpl, ihl, tcp_tmpl, tcphl,
@@ -267,10 +277,10 @@ int tcpdpi_build_multisplit4(tcpdpi_seg segs[3], int *nsegs,
 
 /* ───────────── TurkishDPI: bounded pieces for payloads of any size ───────────── */
 /* Appends the runs of [from, to) to out[*n..], ids from *id; ascending. */
-static int plan_runs(tcpdpi_piece *out, int cap, int *n, int from, int to, int fake, int *id) {
-  for (int off = from; off < to; off += TCPDPI_PIECE_MAX) {
+static int plan_runs(tcpdpi_piece *out, int cap, int *n, int from, int to, int fake, int *id, int max) {
+  for (int off = from; off < to; off += max) {
     if (*n >= cap) return 0;
-    int len = to - off < TCPDPI_PIECE_MAX ? to - off : TCPDPI_PIECE_MAX;
+    int len = to - off < max ? to - off : max;
     out[*n].off = off; out[*n].len = len; out[*n].fake = fake; out[*n].id = (*id)++;
     (*n)++;
   }
@@ -281,32 +291,33 @@ static void plan_reverse(tcpdpi_piece *p, int n) {
   for (int i = 0, j = n - 1; i < j; i++, j--) { tcpdpi_piece t = p[i]; p[i] = p[j]; p[j] = t; }
 }
 
-int tcpdpi_plan_split(tcpdpi_piece *out, int cap, int plen, const int *cuts, int ncuts, int reverse) {
-  if (!out || cap < 1 || plen < 1 || ncuts < 0 || ncuts > 4 || (ncuts > 0 && !cuts)) return 0;
+int tcpdpi_plan_split(tcpdpi_piece *out, int cap, int plen, const int *cuts, int ncuts, int reverse,
+                      int piece_max) {
+  if (!out || cap < 1 || plen < 1 || piece_max < 1 || piece_max > TCPDPI_SEG_MAX || ncuts < 0 || ncuts > 4 || (ncuts > 0 && !cuts)) return 0;
   int n = 0, id = 0, start = 0;
   for (int i = 0; i <= ncuts; i++) {
     int end = i < ncuts ? cuts[i] : plen;
     if (end <= start || end > plen || (i < ncuts && end >= plen)) return 0;  /* ascending, inside */
-    if (!plan_runs(out, cap, &n, start, end, 0, &id)) return 0;
+    if (!plan_runs(out, cap, &n, start, end, 0, &id, piece_max)) return 0;
     start = end;
   }
   if (reverse) plan_reverse(out, n);
   return n;
 }
 
-int tcpdpi_plan_fakedsplit(tcpdpi_piece *out, int cap, int plen, int split, int disorder) {
-  if (!out || cap < 1 || plen < 2 || split < 1 || split >= plen) return 0;
-  int n = 0, id = 0, m;
+int tcpdpi_plan_fakedsplit(tcpdpi_piece *out, int cap, int plen, int split, int disorder, int piece_max) {
+  if (!out || cap < 1 || plen < 2 || split < 1 || split >= plen || piece_max < 1 || piece_max > TCPDPI_SEG_MAX) return 0;
+  int n = 0, id = 0, m, mx = piece_max;
   if (!disorder) {                                  /* A, decoy@split, B */
-    if (!plan_runs(out, cap, &n, 0, split, 0, &id)) return 0;
-    if (!plan_runs(out, cap, &n, split, split + (plen - split < TCPDPI_PIECE_MAX ? plen - split : TCPDPI_PIECE_MAX), 1, &id)) return 0;
-    if (!plan_runs(out, cap, &n, split, plen, 0, &id)) return 0;
+    if (!plan_runs(out, cap, &n, 0, split, 0, &id, mx)) return 0;
+    if (!plan_runs(out, cap, &n, split, split + (plen - split < mx ? plen - split : mx), 1, &id, mx)) return 0;
+    if (!plan_runs(out, cap, &n, split, plen, 0, &id, mx)) return 0;
   } else {                                          /* B desc, decoy@0, A desc */
-    if (!plan_runs(out, cap, &n, split, plen, 0, &id)) return 0;
+    if (!plan_runs(out, cap, &n, split, plen, 0, &id, mx)) return 0;
     plan_reverse(out, n);
-    if (!plan_runs(out, cap, &n, 0, split < TCPDPI_PIECE_MAX ? split : TCPDPI_PIECE_MAX, 1, &id)) return 0;
+    if (!plan_runs(out, cap, &n, 0, split < mx ? split : mx, 1, &id, mx)) return 0;
     m = n;
-    if (!plan_runs(out, cap, &n, 0, split, 0, &id)) return 0;
+    if (!plan_runs(out, cap, &n, 0, split, 0, &id, mx)) return 0;
     plan_reverse(out + m, n - m);
   }
   for (int i = 0; i < n; i++) out[i].id = i;        /* ids in send order */
@@ -318,8 +329,8 @@ int tcpdpi_build_piece4(uint8_t *dst, size_t dstcap,
                         const uint8_t *tcp_tmpl, int tcphl,
                         uint16_t ip_id, uint32_t seq, int ttl, int fake_ttl, uint8_t pattern,
                         const uint8_t *data, const tcpdpi_piece *p) {
-  uint8_t junk[TCPDPI_PIECE_MAX];
-  if (!p || !data || p->off < 0 || p->len < 1 || p->len > TCPDPI_PIECE_MAX) return 0;
+  uint8_t junk[TCPDPI_SEG_MAX];
+  if (!p || !data || p->off < 0 || p->len < 1 || p->len > TCPDPI_SEG_MAX) return 0;
   if (p->fake) memset(junk, pattern, (size_t)p->len);
   return tcpdpi_build_segment4(dst, dstcap, ip_tmpl, ihl, tcp_tmpl, tcphl,
                                (uint16_t)(ip_id + p->id), seq + (uint32_t)p->off,
@@ -349,7 +360,7 @@ int tcpdpi_build_segment6(uint8_t *dst, size_t dstcap,
   sum += 6;                                         /* next header */
   dst[40 + 16] = 0; dst[40 + 17] = 0;
   uint16_t c = csum_fold(csum_add(dst + 40, tcphl + seg_len, sum));
-  if (bad_tcp_csum) c = (uint16_t)(c ^ 0xffff);
+  if (bad_tcp_csum) c = tcpdpi_bad_csum(c);
   wr16(dst + 40 + 16, c);
   return total;
 }
@@ -358,8 +369,8 @@ int tcpdpi_build_piece6(uint8_t *dst, size_t dstcap,
                         const uint8_t *ip6_tmpl, const uint8_t *tcp_tmpl, int tcphl,
                         uint32_t seq, int hop, int fake_hop, uint8_t pattern,
                         const uint8_t *data, const tcpdpi_piece *p) {
-  uint8_t junk[TCPDPI_PIECE_MAX];
-  if (!p || !data || p->off < 0 || p->len < 1 || p->len > TCPDPI_PIECE_MAX) return 0;
+  uint8_t junk[TCPDPI_SEG_MAX];
+  if (!p || !data || p->off < 0 || p->len < 1 || p->len > TCPDPI_SEG_MAX) return 0;
   if (p->fake) memset(junk, pattern, (size_t)p->len);
   return tcpdpi_build_segment6(dst, dstcap, ip6_tmpl, tcp_tmpl, tcphl, seq + (uint32_t)p->off,
                                p->fake ? fake_hop : hop, p->fake ? junk : data + p->off, p->len, p->fake);

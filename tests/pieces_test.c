@@ -24,7 +24,6 @@ static int fails, checks;
 static uint16_t rd16(const uint8_t *p) { return (uint16_t)((p[0] << 8) | p[1]); }
 static uint32_t rd32(const uint8_t *p) { return ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) | ((uint32_t)p[2] << 8) | p[3]; }
 static void wr16(uint8_t *p, int v) { p[0] = (uint8_t)(v >> 8); p[1] = (uint8_t)v; }
-static void wr32(uint8_t *p, uint32_t v) { p[0] = (uint8_t)(v >> 24); p[1] = (uint8_t)(v >> 16); p[2] = (uint8_t)(v >> 8); p[3] = (uint8_t)v; }
 
 /* ---------- headers and checksums ---------- */
 static void mk_hdr4(uint8_t *b) {             /* 1.2.3.4:50000 -> 5.6.7.8:443, PSH+ACK */
@@ -104,6 +103,7 @@ static int old_fakedsplit4(tcpdpi_seg segs[3], int *nsegs, const uint8_t *ip_tmp
   return 1;
 }
 
+#define OLD_LIM (TCPDPI_SEG_MAX - 40)   /* the old limit for 20 + 20 header bytes */
 static tcpdpi_piece plan[TCPDPI_PIECES_MAX];
 static uint8_t seg[TCPDPI_SEG_MAX];
 static uint8_t big[65536 + 16], back[65536 + 16];
@@ -167,32 +167,32 @@ static void test_sizes(void) {
     int two[2] = { plen == 3 ? 1 : 2, plen == 3 ? 2 : plen * 2 / 3 };
     int far[1] = { plen > 2500 ? 2500 : plen - 1 };          /* a cut past the first piece */
     for (int rev = 0; rev <= 1; rev++) {
-      int n = tcpdpi_plan_split(plan, TCPDPI_PIECES_MAX, plen, one, 1, rev);
+      int n = tcpdpi_plan_split(plan, TCPDPI_PIECES_MAX, plen, one, 1, rev, TCPDPI_PIECE_MAX);
       check_plan(big, plen, one, 1, rev, n);
-      n = tcpdpi_plan_split(plan, TCPDPI_PIECES_MAX, plen, two, 2, rev);
+      n = tcpdpi_plan_split(plan, TCPDPI_PIECES_MAX, plen, two, 2, rev, TCPDPI_PIECE_MAX);
       check_plan(big, plen, two, 2, rev, n);
-      n = tcpdpi_plan_split(plan, TCPDPI_PIECES_MAX, plen, far, 1, rev);
+      n = tcpdpi_plan_split(plan, TCPDPI_PIECES_MAX, plen, far, 1, rev, TCPDPI_PIECE_MAX);
       check_plan(big, plen, far, 1, rev, n);
-      n = tcpdpi_plan_split(plan, TCPDPI_PIECES_MAX, plen, NULL, 0, rev);
+      n = tcpdpi_plan_split(plan, TCPDPI_PIECES_MAX, plen, NULL, 0, rev, TCPDPI_PIECE_MAX);
       check_plan(big, plen, NULL, 0, rev, n);
     }
   }
   /* preset 0 on an 1800-byte ClientHello: [1200,1800) [2,1200) [0,2) */
   int one[1] = { 2 };
-  CHECK(tcpdpi_plan_split(plan, TCPDPI_PIECES_MAX, 1800, one, 1, 1) == 3);
+  CHECK(tcpdpi_plan_split(plan, TCPDPI_PIECES_MAX, 1800, one, 1, 1, TCPDPI_PIECE_MAX) == 3);
   CHECK(plan[0].off == 1202 && plan[0].len == 598 && plan[1].off == 2 && plan[1].len == 1200 && plan[2].off == 0 && plan[2].len == 2);
   CHECK(plan[2].id == 0 && plan[1].id == 1 && plan[0].id == 2);     /* ids in sequence order */
   /* the largest packet the loop takes still fits the plan table */
-  CHECK(tcpdpi_plan_split(plan, TCPDPI_PIECES_MAX, 65535 + TCPDPI_TLSREC_GROWTH, one, 1, 1) > 0);
+  CHECK(tcpdpi_plan_split(plan, TCPDPI_PIECES_MAX, 65535 + TCPDPI_TLSREC_GROWTH, one, 1, 1, TCPDPI_PIECE_MAX) > 0);
   int two[2] = { 2, 40000 };
-  CHECK(tcpdpi_plan_split(plan, TCPDPI_PIECES_MAX, 65535, two, 2, 0) > 0);
+  CHECK(tcpdpi_plan_split(plan, TCPDPI_PIECES_MAX, 65535, two, 2, 0, TCPDPI_PIECE_MAX) > 0);
   /* refusals: too many pieces for cap, cuts not ascending / outside */
-  CHECK(tcpdpi_plan_split(plan, 10, 64000, one, 1, 0) == 0);
+  CHECK(tcpdpi_plan_split(plan, 10, 64000, one, 1, 0, TCPDPI_PIECE_MAX) == 0);
   int bad1[2] = { 9, 5 }, bad2[1] = { 0 }, bad3[1] = { 100 };
-  CHECK(tcpdpi_plan_split(plan, TCPDPI_PIECES_MAX, 100, bad1, 2, 0) == 0);
-  CHECK(tcpdpi_plan_split(plan, TCPDPI_PIECES_MAX, 100, bad2, 1, 0) == 0);
-  CHECK(tcpdpi_plan_split(plan, TCPDPI_PIECES_MAX, 100, bad3, 1, 0) == 0);
-  CHECK(tcpdpi_plan_split(plan, TCPDPI_PIECES_MAX, 0, NULL, 0, 0) == 0);
+  CHECK(tcpdpi_plan_split(plan, TCPDPI_PIECES_MAX, 100, bad1, 2, 0, TCPDPI_PIECE_MAX) == 0);
+  CHECK(tcpdpi_plan_split(plan, TCPDPI_PIECES_MAX, 100, bad2, 1, 0, TCPDPI_PIECE_MAX) == 0);
+  CHECK(tcpdpi_plan_split(plan, TCPDPI_PIECES_MAX, 100, bad3, 1, 0, TCPDPI_PIECE_MAX) == 0);
+  CHECK(tcpdpi_plan_split(plan, TCPDPI_PIECES_MAX, 0, NULL, 0, 0, TCPDPI_PIECE_MAX) == 0);
 }
 
 /* Payloads that fit: byte-identical to the old builders. */
@@ -209,8 +209,8 @@ static void test_identical(void) {
       for (int c1 = 1; c1 < plen; c1 += (plen > 50 ? 97 : 1)) {
         int cuts1[1] = { c1 };
         int ok_old = old_multisplit4(olds, &on, h4, 20, h4 + 20, 20, 0x1234, 99, 128, big, plen, cuts1, 1, rev);
-        int fits = c1 <= TCPDPI_PIECE_MAX && plen - c1 <= TCPDPI_PIECE_MAX;
-        int n = tcpdpi_plan_split(plan, TCPDPI_PIECES_MAX, plen, cuts1, 1, rev);
+        int fits = c1 <= OLD_LIM && plen - c1 <= OLD_LIM;
+        int n = tcpdpi_plan_split(plan, TCPDPI_PIECES_MAX, plen, cuts1, 1, rev, OLD_LIM);
         CHECK(ok_old && (n == 2) == fits);
         if (fits) {
           for (int i = 0; i < n; i++) {
@@ -223,8 +223,8 @@ static void test_identical(void) {
         for (int c2 = c1 + 1; c2 < plen; c2 += (plen > 50 ? 331 : 1)) {
           int cuts2[2] = { c1, c2 };
           ok_old = old_multisplit4(olds, &on, h4, 20, h4 + 20, 20, 0x4321, 7, 64, big, plen, cuts2, 2, rev);
-          fits = c1 <= TCPDPI_PIECE_MAX && c2 - c1 <= TCPDPI_PIECE_MAX && plen - c2 <= TCPDPI_PIECE_MAX;
-          n = tcpdpi_plan_split(plan, TCPDPI_PIECES_MAX, plen, cuts2, 2, rev);
+          fits = c1 <= OLD_LIM && c2 - c1 <= OLD_LIM && plen - c2 <= OLD_LIM;
+          n = tcpdpi_plan_split(plan, TCPDPI_PIECES_MAX, plen, cuts2, 2, rev, OLD_LIM);
           CHECK(ok_old && (n == 3) == fits);
           if (fits)
             for (int i = 0; i < n; i++) {
@@ -236,8 +236,8 @@ static void test_identical(void) {
       /* fakedsplit / fakeddisorder */
       for (int sp = 1; sp < plen; sp += (plen > 50 ? 113 : 1)) {
         int ok_old = old_fakedsplit4(olds, &on, h4, 20, h4 + 20, 20, 0x0100, 5000, 128, big, plen, sp, 4, 0xCC, rev);
-        int fits = sp <= TCPDPI_PIECE_MAX && plen - sp <= TCPDPI_PIECE_MAX;
-        int n = tcpdpi_plan_fakedsplit(plan, TCPDPI_PIECES_MAX, plen, sp, rev);
+        int fits = sp <= OLD_LIM && plen - sp <= OLD_LIM;
+        int n = tcpdpi_plan_fakedsplit(plan, TCPDPI_PIECES_MAX, plen, sp, rev, OLD_LIM);
         CHECK(ok_old && (n == 3) == fits);
         if (fits) {
           for (int i = 0; i < n; i++) {
@@ -253,7 +253,7 @@ static void test_identical(void) {
   /* IPv6: the old loop's order (from/to ranges, reversed for disorder) */
   for (int rev = 0; rev <= 1; rev++) {
     int cuts[2] = { 2, 300 }, from[3] = { 0, 2, 300 }, to[3] = { 2, 300, 900 };
-    int n = tcpdpi_plan_split(plan, TCPDPI_PIECES_MAX, 900, cuts, 2, rev);
+    int n = tcpdpi_plan_split(plan, TCPDPI_PIECES_MAX, 900, cuts, 2, rev, TCPDPI_PIECE_MAX);
     CHECK(n == 3);
     for (int k = 0; k < 3 && n == 3; k++) {
       int i = rev ? 2 - k : k;
@@ -271,7 +271,7 @@ static void test_faked_large(void) {
     int plen = lens[li];
     fill(big, plen, 99u);
     for (int dis = 0; dis <= 1; dis++) {
-      int n = tcpdpi_plan_fakedsplit(plan, TCPDPI_PIECES_MAX, plen, 2, dis), fakes = 0, fake_at = -1;
+      int n = tcpdpi_plan_fakedsplit(plan, TCPDPI_PIECES_MAX, plen, 2, dis, TCPDPI_PIECE_MAX), fakes = 0, fake_at = -1;
       CHECK(n == 1 + 1 + ceil_div(plen - 2, TCPDPI_PIECE_MAX));
       memset(seen, 0, (size_t)plen);
       for (int i = 0; i < n; i++) {
@@ -328,7 +328,8 @@ static void test_truncated_hello(void) {
   CHECK(tcpdpi_split_points(big, 1460, pi.host_off, pi.host_len, cuts) == 0);   /* the old choice: no cut */
   CHECK(tcpdpi_choose_cuts(big, 1460, pi.kind == PROTO_TLS, pi.host_off, pi.host_len, 0, cuts) == 1 && cuts[0] == TCPDPI_FALLBACK_CUT);
   /* ... and that cut, in disorder, is two pieces */
-  CHECK(tcpdpi_plan_split(plan, TCPDPI_PIECES_MAX, 1460, cuts, 1, 1) == 3);   /* 1458 bytes after the cut: 2 runs */
+  CHECK(tcpdpi_plan_split(plan, TCPDPI_PIECES_MAX, 1460, cuts, 1, 1, tcpdpi_piece_limit(1500, 40)) == 2);   /* one wire packet: as before */
+  CHECK(tcpdpi_plan_split(plan, TCPDPI_PIECES_MAX, 1460, cuts, 1, 1, TCPDPI_PIECE_MAX) == 3);               /* pieces: 1458 bytes in 2 runs */
   /* --split-pos still wins; HTTP without a Host in the segment is not cut */
   CHECK(tcpdpi_choose_cuts(big, 1460, 1, -1, 0, 5, cuts) == 1 && cuts[0] == 5);
   CHECK(tcpdpi_choose_cuts(big, 4, 1, -1, 0, 9, cuts) == 1 && cuts[0] == 3);
@@ -355,7 +356,7 @@ static void test_tlsrec_large(void) {
   CHECK(tcpdpi_build_tlsrec_pair(pair, &np, h4, 20, h4 + 20, 20, 0x55, 1000, 128, big, n, cuts[1]) == 1);
   int g = tcpdpi_tlsrec_form(back, (int)sizeof(back), big, n, cuts[1], &rec1);
   CHECK(g == n + TCPDPI_TLSREC_GROWTH);
-  int k = tcpdpi_plan_split(plan, TCPDPI_PIECES_MAX, g, &rec1, 1, 0);
+  int k = tcpdpi_plan_split(plan, TCPDPI_PIECES_MAX, g, &rec1, 1, 0, tcpdpi_piece_limit(g + 40, 40));
   CHECK(k == 2);
   for (int i = 0; i < k; i++) {
     int len = tcpdpi_build_piece4(seg, sizeof seg, h4, 20, h4 + 20, 20, 0x55, 1000, 128, 128, 0, back, &plan[i]);
@@ -369,13 +370,66 @@ static void test_tlsrec_large(void) {
   CHECK(g == plen + 5 && rec1 == 300);
   CHECK(back[0] == 0x16 && rd16(back + 3) == 295 && memcmp(back + 5, big + 5, 295) == 0);
   CHECK(back[300] == 0x16 && rd16(back + 303) == plen - 5 - 295 && memcmp(back + 305, big + 300, (size_t)(plen - 300)) == 0);
-  k = tcpdpi_plan_split(plan, TCPDPI_PIECES_MAX, g, &rec1, 1, 0);
+  k = tcpdpi_plan_split(plan, TCPDPI_PIECES_MAX, g, &rec1, 1, 0, TCPDPI_PIECE_MAX);
   check_plan(back, g, &rec1, 1, 0, k);
   /* the old one-packet limit is gone only where the caller gives room */
   CHECK(tcpdpi_tlsrec_form(back, 1600, big, plen, 300, &rec1) == 0);
 }
 
+/* Exact multiples of the piece limit: no empty or short tail piece. */
+static void test_multiples(void) {
+  const int sizes[] = { 1200, 2400, 3600, 2402 };
+  for (unsigned s = 0; s < 4; s++) {
+    int plen = sizes[s];
+    fill(big, plen, 3u);
+    int n = tcpdpi_plan_split(plan, TCPDPI_PIECES_MAX, plen, NULL, 0, 0, TCPDPI_PIECE_MAX);
+    CHECK(n == ceil_div(plen, TCPDPI_PIECE_MAX));
+    check_plan(big, plen, NULL, 0, 0, n);
+    for (int i = 0; i < n; i++) CHECK(plan[i].len == (i < n - 1 || plen % TCPDPI_PIECE_MAX == 0 ? TCPDPI_PIECE_MAX : plen % TCPDPI_PIECE_MAX));
+  }
+  /* a cut after byte 2 of 2402 bytes: [0,2) and exactly two full runs */
+  int one[1] = { 2 };
+  CHECK(tcpdpi_plan_split(plan, TCPDPI_PIECES_MAX, 2402, one, 1, 1, TCPDPI_PIECE_MAX) == 3);
+  CHECK(plan[0].off == 1202 && plan[0].len == 1200 && plan[1].off == 2 && plan[1].len == 1200 && plan[2].len == 2);
+  /* the limit follows the captured packet: one wire packet keeps the old one */
+  CHECK(tcpdpi_piece_limit(1500, 40) == TCPDPI_SEG_MAX - 40);
+  CHECK(tcpdpi_piece_limit(1500, 52) == TCPDPI_SEG_MAX - 52);
+  CHECK(tcpdpi_piece_limit(1501, 40) == TCPDPI_PIECE_MAX);
+  CHECK(tcpdpi_piece_limit(64000, 60) == TCPDPI_PIECE_MAX);
+}
+
+/* A decoy's bad checksum never verifies - also where the correct one is
+ * 0x0000 (whose plain inverse 0xffff is the same value in one's complement);
+ * everywhere else it is the plain inverse, as before. */
+static void test_bad_csum(void) {
+  uint8_t h4[40], h6[60], pay[2];
+  int found4 = 0, found6 = 0, others = 0;
+  mk_hdr4(h4); mk_hdr6(h6);
+  CHECK(tcpdpi_bad_csum(0x0000) == 0x5a5a && tcpdpi_bad_csum(0xffff) == 0x5a5a);
+  CHECK(tcpdpi_bad_csum(0x1234) == (0x1234 ^ 0xffff) && tcpdpi_bad_csum(0xa5a5) == 0x5a5a);
+  for (unsigned x = 0; x < 65536; x++) {
+    pay[0] = (uint8_t)(x >> 8); pay[1] = (uint8_t)x;
+    int n = tcpdpi_build_segment4(seg, sizeof seg, h4, 20, h4 + 20, 20, 7, 1000, 64, pay, 2, 0);
+    uint16_t good = rd16(seg + 36);
+    CHECK(n == 42 && tcp4_ok(seg, n));
+    int b = tcpdpi_build_segment4(seg, sizeof seg, h4, 20, h4 + 20, 20, 7, 1000, 64, pay, 2, 1);
+    if (b != 42 || tcp4_ok(seg, b)) { CHECK(!"IPv4 decoy verifies"); break; }
+    if (good == 0) { found4++; CHECK(rd16(seg + 36) == 0x5a5a); }
+    else if (rd16(seg + 36) == (uint16_t)(good ^ 0xffff)) others++;
+    n = tcpdpi_build_segment6(seg, sizeof seg, h6, h6 + 40, 20, 1000, 64, pay, 2, 0);
+    good = rd16(seg + 56);
+    CHECK(n == 62 && tcp6_ok(seg, n));
+    b = tcpdpi_build_segment6(seg, sizeof seg, h6, h6 + 40, 20, 1000, 64, pay, 2, 1);
+    if (b != 62 || tcp6_ok(seg, b)) { CHECK(!"IPv6 decoy verifies"); break; }
+    if (good == 0) { found6++; CHECK(rd16(seg + 56) == 0x5a5a); }
+  }
+  CHECK(found4 >= 1 && found6 >= 1);            /* the case was really reached */
+  CHECK(others == 65536 - found4);              /* IPv4: the plain inverse everywhere else */
+}
+
 int main(void) {
+  test_multiples();
+  test_bad_csum();
   test_sizes();
   test_identical();
   test_faked_large();

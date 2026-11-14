@@ -31,14 +31,20 @@ typedef struct {
  * string that must not be used). Never writes past cap. */
 int policy_build_filter(char *f, size_t cap, const policy_filter_opts *o);
 
-/* Whether a connection is left alone by payment protection. When the
- * segment carries a host name (name != NULL, name_len > 0) the NAME alone
- * decides; the addresses learned from DNS answers for payment domains decide
- * only when there is no name (a shared CDN/anycast address must not exclude
- * an unrelated blocked site that names itself). */
+/* Whether a connection is left alone by payment protection.
+ *  - no host name in the segment: the addresses learned from DNS answers for
+ *    payment domains decide;
+ *  - a name, and the ClientHello carries no Encrypted Client Hello
+ *    (ech == 0, also for HTTP): the NAME alone decides, so a shared
+ *    CDN/anycast address learned for a bank cannot exclude an unrelated
+ *    blocked site that names itself;
+ *  - a name, and ECH present (ech > 0) or not known (ech < 0, the
+ *    extensions run past the segment): the visible name may be a shared
+ *    public one (cloudflare-ech.com), so the name OR the learned address
+ *    excludes. */
 typedef int (*policy_name_fn)(const char *name, size_t len);
 typedef int (*policy_ip_fn)(const void *addr, int is_ipv6);
-int policy_excluded(int enabled, const char *name, size_t name_len, const void *daddr, int v6,
+int policy_excluded(int enabled, const char *name, size_t name_len, int ech, const void *daddr, int v6,
                     policy_name_fn name_listed, policy_ip_fn ip_learned);
 
 #endif

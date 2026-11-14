@@ -22,6 +22,7 @@ static void parse_tls(const uint8_t *buf, size_t len, proto_info *out) {
   if (buf[5] != 0x01) return; /* ClientHello */
   out->kind = PROTO_TLS;
   out->tls_record_total = rec_total;
+  out->ech = PROTO_ECH_UNKNOWN;             /* TurkishDPI: until every extension is seen */
 
   size_t p = 5 + 4 + 2 + 32; /* rec hdr + hs hdr + version + random */
   if (p + 1 > end) return;
@@ -33,28 +34,34 @@ static void parse_tls(const uint8_t *buf, size_t len, proto_info *out) {
   if (p + 2 > end) return;
   size_t ext_end = p + 2 + (size_t)rd16(buf + p);
   p += 2;
+  int complete = ext_end <= end;            /* TurkishDPI: all extensions in this segment */
   if (ext_end > end) ext_end = end;
 
+  /* TurkishDPI: the walk goes on past the server name to find ECH; the name
+   * found (the first server_name extension) is the same as before. */
+  int sni_seen = 0;
   while (p + 4 <= ext_end) {
     int type = rd16(buf + p);
     size_t elen = (size_t)rd16(buf + p + 2);
     p += 4;
-    if (p + elen > ext_end) return;
-    if (type == 0x0000 && elen >= 5) {
+    if (p + elen > ext_end) return;         /* runs past the segment: ECH as found so far */
+    if (type == PROTO_EXT_ECH) out->ech = PROTO_ECH_YES;
+    if (type == 0x0000 && elen >= 5 && !sni_seen) {
+      sni_seen = 1;
       /* list_len(2) type(1) name_len(2) name */
-      if (buf[p + 2] != 0x00) return;
       size_t nlen = (size_t)rd16(buf + p + 3);
       size_t noff = p + 5;
-      if (nlen == 0 || noff + nlen > p + elen) return;
-      out->host_off = (int)noff;
-      out->host_len = (int)nlen;
-      size_t c = nlen < sizeof(out->host) - 1 ? nlen : sizeof(out->host) - 1;
-      memcpy(out->host, buf + noff, c);
-      out->host[c] = 0;
-      return;
+      if (buf[p + 2] == 0x00 && nlen != 0 && noff + nlen <= p + elen) {
+        out->host_off = (int)noff;
+        out->host_len = (int)nlen;
+        size_t c = nlen < sizeof(out->host) - 1 ? nlen : sizeof(out->host) - 1;
+        memcpy(out->host, buf + noff, c);
+        out->host[c] = 0;
+      }
     }
     p += elen;
   }
+  if (complete && p == ext_end && out->ech != PROTO_ECH_YES) out->ech = PROTO_ECH_NO;
 }
 
 static const char *const METHODS[] = {

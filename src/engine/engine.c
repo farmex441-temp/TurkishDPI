@@ -8,9 +8,10 @@
  * filter but dies before the server (low TTL, bad TCP checksum, the name
  * scrambled), then the real request cut so that no segment carries the whole
  * name. Resets the filter forges against such a connection are dropped.
- * Everything crafted is sent in pieces of at most TCPDPI_PIECE_MAX payload
- * bytes: WinDivert sees segments before NIC segmentation offload, so one
- * captured ClientHello can be larger than any packet on the wire.
+ * What is sent is composed by desync.c: a captured packet that fits one
+ * wire packet gives exactly what was measured on real lines; a larger one
+ * (WinDivert sees segments before NIC segmentation offload) is sent in pieces
+ * of at most TCPDPI_PIECE_MAX payload bytes.
  * Payment and bank connections are never touched (exclude.c); DNS goes to a
  * clean resolver as well (dns.c, the hybrid race).
  *
@@ -53,6 +54,7 @@
 #include "dns.h"
 #include "exclude.h"
 #include "policy.h"
+#include "desync.h"
 #include "engine.h"
 #include "version.h"
 
@@ -122,41 +124,35 @@ static void send_crafted(const uint8_t *seg, int len, const WINDIVERT_ADDRESS *b
     WinDivertSend(wd, seg, (UINT)len, NULL, &a);
 }
 
-/* The decoy's payload: the request with another (or a scrambled) name. A
- * decoy is one piece: of a request larger than TCPDPI_PIECE_MAX only the
- * first TCPDPI_PIECE_MAX bytes are copied (the name, when it is in this
- * segment at all, sits early in it). */
-static int decoy_payload(uint8_t *out, int cap, const uint8_t *pay, int plen,
-                         const proto_info *pi, int iphl, int tcphl) {
-    int n;
-    if (plen > TCPDPI_PIECE_MAX) plen = TCPDPI_PIECE_MAX;
-    n = proto_decoy_rename(out, cap, pay, plen, pi->kind == PROTO_TLS, pi->host_off, pi->host_len,
-                           decoy_room(plen, iphl, tcphl));
-    if (n > 0) return n;
-    if (plen > cap) return 0;
-    memcpy(out, pay, (size_t)plen);
-    if (pi->host_off >= 0 && pi->host_off + pi->host_len <= plen) {
-        for (int i = pi->host_off; i < pi->host_off + pi->host_len; i++) out[i] ^= 0x5a;
-    } else {
-        for (int i = plen / 3; i < plen; i++) out[i] ^= 0x5a;
-    }
-    return plen;
+/* What is sent for one first request is composed by desync.c (pure, unit
+ * tested); the loop is single-threaded, so one output buffer serves. */
+static desync_cfg dcfg;
+static desync_out dout;
+
+static void send_out(const WINDIVERT_ADDRESS *addr, int v6) {
+    for (int i = 0; i < dout.n; i++) send_crafted(dout.pkt[i], dout.len[i], addr, v6);
 }
 
-/* Where the real request is cut: a fixed early byte (--split-pos: the
- * filter then sees a piece too short to classify, and a piece without a TLS
- * record header), or - by default - inside the site name (Shroudly); a
- * ClientHello whose name is not in this segment is cut after byte 2. */
-static int cut_points(const uint8_t *pay, int plen, const proto_info *pi, int cuts[2]) {
-    return tcpdpi_choose_cuts(pay, plen, pi->kind == PROTO_TLS, pi->host_off, pi->host_len, split_pos, cuts);
+/* A first request larger than one wire packet (segmentation offload) gets a
+ * plain log line - the first one and then each new maximum at least 25 %
+ * larger, at most LARGE_NOTES per run. Worded so that none of the app's
+ * protocol prefixes ("TurkishDPI engine", "Filter activated", "Error
+ * opening filter:", "STATS ") can match it. */
+#define LARGE_NOTES 6
+static void note_large(int plen, int v6, const desync_out *o, int excluded) {
+    static int notes, last;
+    if (plen <= last + last / 4 || notes >= LARGE_NOTES) return;
+    last = plen;
+    notes++;
+    if (excluded)
+        printf("Large first segment: %d bytes (IPv%d), left untouched (payment protection)\n", plen, v6 ? 6 : 4);
+    else if (o->n > 0 && o->replaced)
+        printf("Large first segment: %d bytes (IPv%d), sent as %d pieces%s\n", plen, v6 ? 6 : 4,
+               desync_real_count(o), o->n > desync_real_count(o) ? " after a decoy" : "");
+    else
+        printf("Large first segment: %d bytes (IPv%d), passed unchanged%s\n", plen, v6 ? 6 : 4,
+               o->n > 0 ? " after a decoy" : "");
 }
-
-/* Builders' scratch: the packet loop is single-threaded. A plan is built in
- * full before anything is sent, so a failure leaves the original to pass. */
-static tcpdpi_piece plan[TCPDPI_PIECES_MAX];
-static uint8_t plan_seg[TCPDPI_PIECES_MAX][TCPDPI_SEG_MAX];
-static int plan_len[TCPDPI_PIECES_MAX];
-static uint8_t grown[65535 + TCPDPI_TLSREC_GROWTH];   /* a TLS record split of a whole packet */
 
 /* ================= IPv4 (adapted from Shroudly raw_windows.c) ============= */
 static int decoy_ttl4(uint32_t daddr) {
@@ -167,116 +163,24 @@ static int decoy_ttl4(uint32_t daddr) {
     return cfg.fake_ttl;
 }
 
-/* Builds every piece of plan[0..n) from data (seq: the sequence number of
- * data[0]) into plan_seg, IP ids from ipid on, and takes those ids; 1 when
- * all were built, 0 when any could not be (nothing taken, nothing sent). */
-static int build_plan4(const uint8_t *pkt, int ihl, int tcphl, const uint8_t *data, int n,
-                       uint32_t seq, int ttl, int fake_ttl) {
-    if (n <= 0 || n > TCPDPI_PIECES_MAX) return 0;
-    for (int i = 0; i < n; i++) {
-        plan_len[i] = tcpdpi_build_piece4(plan_seg[i], sizeof(plan_seg[i]), pkt, ihl, pkt + ihl, tcphl,
-                                          ipid, seq, ttl, fake_ttl, cfg.fake_pattern, data, &plan[i]);
-        if (plan_len[i] <= 0) return 0;
-    }
-    ipid = (uint16_t)(ipid + n);
-    return 1;
-}
-
-static void send_plan(int n, const WINDIVERT_ADDRESS *addr, int v6) {
-    for (int i = 0; i < n; i++) send_crafted(plan_seg[i], plan_len[i], addr, v6);
-}
-
-static int send_plan4(const uint8_t *pkt, int ihl, int tcphl, const uint8_t *data, int n,
-                      uint32_t seq, int ttl, int fake_ttl, const WINDIVERT_ADDRESS *addr) {
-    if (!build_plan4(pkt, ihl, tcphl, data, n, seq, ttl, fake_ttl)) return 0;
-    send_plan(n, addr, 0);
-    return 1;
-}
-
-static void send_fake4(const uint8_t *pkt, int len, int ihl, int tcphl, int poff,
-                       const proto_info *pi, int ttl, const WINDIVERT_ADDRESS *addr) {
-    uint8_t pay[TCPDPI_PIECE_MAX], out[TCPDPI_SEG_MAX];
-    int plen = len - poff, dlen, n;
-    if (plen <= 0) return;
-    dlen = decoy_payload(pay, (int)sizeof(pay), pkt + poff, plen, pi, ihl, tcphl);
-    if (dlen <= 0) return;
-    n = tcpdpi_build_segment4(out, sizeof(out), pkt, ihl, pkt + ihl, tcphl, ipid++,
-                              rd32be(pkt + ihl + 4), ttl > 0 ? ttl : cfg.fake_ttl, pay, dlen, 1);
-    if (n > 0) send_crafted(out, n, addr, 0);
-}
-
-static int send_cut4(const uint8_t *pkt, int ihl, int tcphl, int poff, int plen,
-                     const proto_info *pi, int disorder, const WINDIVERT_ADDRESS *addr) {
-    int cuts[2], nc = cut_points(pkt + poff, plen, pi, cuts);
-    int ttl = pkt[8] ? pkt[8] : 64;
-    int n = nc > 0 ? tcpdpi_plan_split(plan, TCPDPI_PIECES_MAX, plen, cuts, nc, disorder) : 0;
-    return send_plan4(pkt, ihl, tcphl, pkt + poff, n, rd32be(pkt + ihl + 4), ttl, ttl, addr);
+struct grow_ctx { uint32_t sa, da; uint16_t sp, dp; uint32_t at; };
+static int grow4(void *v) {
+    const struct grow_ctx *g = (const struct grow_ctx *)v;
+    return tcpdpi_xlate_begin(g->sa, g->da, g->sp, g->dp, g->at, TCPDPI_TLSREC_GROWTH, now_ms());
 }
 
 /* 1 when the original was replaced by what was sent. */
 static int desync4(const uint8_t *pkt, int len, int ihl, int tcphl, int poff,
                    const proto_info *pi, int decoy, const WINDIVERT_ADDRESS *addr) {
-    int plen = len - poff;
-    uint32_t daddr = rd32be(pkt + 16), seq = rd32be(pkt + ihl + 4);
-    int otl = pkt[8] ? pkt[8] : 64;
-    int faked = cfg.desync_mode == RAW_DESYNC_FAKEDSPLIT || cfg.desync_mode == RAW_DESYNC_FAKEDDISORDER;
-
-    /* The TLS record split needs the name (the cut goes inside it); a
-     * ClientHello whose name is not in this segment gets the plain cut below
-     * (after byte 2) instead. The two records are sent in pieces: record 1,
-     * then record 2 and the rest, each run at most TCPDPI_PIECE_MAX bytes. */
-    if (cfg.tlsrec && pi->kind == PROTO_TLS && pi->host_off >= 1) {
-        int cuts[2], nc = tcpdpi_split_points(pkt + poff, plen, pi->host_off, pi->host_len, cuts);
-        int cut = nc >= 2 ? cuts[1] : (nc == 1 ? cuts[0] : 0);
-        int rec1 = 0, glen = cut > 5 ? tcpdpi_tlsrec_form(grown, (int)sizeof(grown), pkt + poff, plen, cut, &rec1) : 0;
-        int n = glen > 0 && rec1 > 0 && rec1 < glen ? tcpdpi_plan_split(plan, TCPDPI_PIECES_MAX, glen, &rec1, 1, 0) : 0;
-        if (n > 0 && build_plan4(pkt, ihl, tcphl, grown, n, seq, otl, otl) &&
-            tcpdpi_xlate_begin(rd32be(pkt + 12), daddr, rd16be(pkt + ihl), rd16be(pkt + ihl + 2),
-                               seq + (uint32_t)plen, TCPDPI_TLSREC_GROWTH, now_ms())) {
-            if (decoy) send_fake4(pkt, len, ihl, tcphl, poff, pi, decoy_ttl4(daddr), addr);
-            send_plan(n, addr, 0);
-            return 1;
-        }
-    }
-    if (!decoy) {
-        if (cfg.split == RAW_SPLIT_OFF && !faked) return 0;
-        return send_cut4(pkt, ihl, tcphl, poff, plen, pi,
-                         cfg.split == RAW_SPLIT_DISORDER || cfg.desync_mode == RAW_DESYNC_FAKEDDISORDER, addr);
-    }
-    if (faked) {
-        int split = split_pos > 0 ? (split_pos < plen ? split_pos : plen - 1)
-                  : (pi->host_off > 0 && pi->host_off < plen) ? pi->host_off : (plen > 2 ? 2 : 1);
-        int n = tcpdpi_plan_fakedsplit(plan, TCPDPI_PIECES_MAX, plen, split,
-                                       cfg.desync_mode == RAW_DESYNC_FAKEDDISORDER);
-        return send_plan4(pkt, ihl, tcphl, pkt + poff, n, seq, otl, decoy_ttl4(daddr), addr);
-    }
-    send_fake4(pkt, len, ihl, tcphl, poff, pi, decoy_ttl4(daddr), addr);
-    if (cfg.seqovl > 0 && plen > 0) {
-        /* The overlapped first segment carries at most TCPDPI_PIECE_MAX
-         * bytes (pattern included); the rest of a larger payload follows in
-         * order, in pieces. */
-        uint8_t out[TCPDPI_SEG_MAX];
-        int first = plen + cfg.seqovl <= TCPDPI_PIECE_MAX ? plen : TCPDPI_PIECE_MAX - cfg.seqovl;
-        int n = 0, rest = 0;
-        if (first > 0 && first < plen) {
-            rest = tcpdpi_plan_split(plan, TCPDPI_PIECES_MAX, plen - first, NULL, 0, 0);
-            if (rest <= 0 || !build_plan4(pkt, ihl, tcphl, pkt + poff + first, rest,
-                                          seq + (uint32_t)first, otl, otl)) first = 0;
-            /* build_plan4 took ids ipid-rest .. ipid-1; the overlap gets the next */
-        }
-        if (first > 0)
-            n = tcpdpi_build_seqovl4(out, sizeof(out), pkt, ihl, pkt + ihl, tcphl, ipid, seq, otl,
-                                     pkt + poff, first, cfg.seqovl, cfg.seqovl_pattern);
-        if (n > 0) {
-            ipid++;
-            send_crafted(out, n, addr, 0);
-            if (first < plen) send_plan(rest, addr, 0);
-            return 1;
-        }
-    }
-    if (cfg.split != RAW_SPLIT_OFF)
-        return send_cut4(pkt, ihl, tcphl, poff, plen, pi, cfg.split == RAW_SPLIT_DISORDER, addr);
-    return 0;
+    struct grow_ctx g;
+    uint32_t daddr = rd32be(pkt + 16);
+    g.sa = rd32be(pkt + 12); g.da = daddr;
+    g.sp = rd16be(pkt + ihl); g.dp = rd16be(pkt + ihl + 2);
+    g.at = rd32be(pkt + ihl + 4) + (uint32_t)(len - poff);
+    desync_compose4(&dout, &dcfg, pkt, len, ihl, tcphl, pi, decoy, decoy ? decoy_ttl4(daddr) : cfg.fake_ttl,
+                    &ipid, grow4, &g);
+    send_out(addr, 0);
+    return dout.replaced;
 }
 
 static void send_udp_decoys4(const uint8_t *pkt, int ihl, int plen, const WINDIVERT_ADDRESS *addr) {
@@ -325,34 +229,9 @@ static int decoy_ttl6(const uint8_t daddr[16]) {
 
 static int desync6(const uint8_t *pkt, int len, int tcphl, const proto_info *pi, int decoy,
                    const WINDIVERT_ADDRESS *addr) {
-    const int poff = 40 + tcphl;
-    const uint8_t *pay = pkt + poff;
-    int plen = len - poff, hop = pkt[7] ? pkt[7] : 64;
-    uint32_t seq = rd32be(pkt + 40 + 4);
-    uint8_t out[TCPDPI_SEG_MAX];
-    int cuts[2], nc, n;
-    int disorder = cfg.split == RAW_SPLIT_DISORDER || cfg.desync_mode == RAW_DESYNC_FAKEDDISORDER;
-    int cut = cfg.split != RAW_SPLIT_OFF || cfg.desync_mode != RAW_DESYNC_FAKE;
-
-    if (plen <= 0 || tcphl > 60) return 0;
-    if (decoy) {
-        uint8_t fake[TCPDPI_PIECE_MAX];      /* one piece: decoy_payload truncates */
-        int dlen = decoy_payload(fake, (int)sizeof(fake), pay, plen, pi, 40, tcphl);
-        if (dlen > 0 && (n = tcpdpi_build_segment6(out, sizeof(out), pkt, pkt + 40, tcphl, seq,
-                                                   decoy_ttl6(pkt + 24), fake, dlen, 1)) > 0)
-            send_crafted(out, n, addr, 1);
-    }
-    if (!cut) return 0;
-    nc = cut_points(pay, plen, pi, cuts);
-    n = nc > 0 ? tcpdpi_plan_split(plan, TCPDPI_PIECES_MAX, plen, cuts, nc, disorder) : 0;
-    if (n <= 0) return 0;
-    for (int i = 0; i < n; i++) {              /* all built before any is sent */
-        plan_len[i] = tcpdpi_build_piece6(plan_seg[i], sizeof(plan_seg[i]), pkt, pkt + 40, tcphl,
-                                          seq, hop, hop, 0, pay, &plan[i]);
-        if (plan_len[i] <= 0) return 0;      /* nothing sent: the original goes on */
-    }
-    send_plan(n, addr, 1);
-    return 1;
+    desync_compose6(&dout, &dcfg, pkt, len, tcphl, pi, decoy, decoy ? decoy_ttl6(pkt + 24) : cfg.fake_ttl);
+    send_out(addr, 1);
+    return dout.replaced;
 }
 
 /* ================= DNS ================= */
@@ -444,13 +323,14 @@ static int build_filter(char *f, size_t cap, int alert_watch) {
 }
 
 /* ================= the loop ================= */
-/* Payment protection: the name in the segment decides; the addresses learned
- * for payment domains only when the segment carries no name. */
+/* Payment protection (policy_excluded): the name in the segment decides
+ * unless the ClientHello carries (or may carry) Encrypted Client Hello; the
+ * addresses learned for payment domains when there is no name or with ECH. */
 static int excluded_conn(const uint8_t *pay, const proto_info *pi, const uint8_t *daddr, int v6) {
     int named = pi->host_off >= 0 && pi->host_len > 0;
     return policy_excluded(exclude_enabled(), named ? (const char *)pay + pi->host_off : NULL,
-                           named ? (size_t)pi->host_len : 0, daddr, v6,
-                           exclude_check_hostname, exclude_check_ip);
+                           named ? (size_t)pi->host_len : 0, pi->kind == PROTO_TLS ? pi->ech : PROTO_ECH_NO,
+                           daddr, v6, exclude_check_hostname, exclude_check_ip);
 }
 
 static void note_maxpay(const proto_info *pi, int plen) {
@@ -529,6 +409,7 @@ static int run_loop(void) {
                     if (pi.kind != PROTO_UNKNOWN && !rawscope_local6(pkt + 24)) {
                         if (excluded_conn(pkt + poff, &pi, pkt + 24, 1)) {
                             InterlockedIncrement(&stats.excluded);
+                            if (len > TCPDPI_WIRE_MAX && pi.kind == PROTO_TLS) note_large(plen, 1, &dout, 1);
                         } else {
                             int decoy = !no_decoy && !rawscope_nodecoy(pkt + 24, 16, now);
                             rawscope_touch(pkt + 24, 16, now);
@@ -537,6 +418,7 @@ static int run_loop(void) {
                                                     rawscope_tls_next_seq(seq, pkt + poff, plen), now);
                             count_kind(&pi);
                             handled = desync6(pkt, (int)len, tcphl, &pi, decoy, &addr);
+                            if (len > TCPDPI_WIRE_MAX && pi.kind == PROTO_TLS) note_large(plen, 1, &dout, 0);
                         }
                     }
                 }
@@ -636,6 +518,7 @@ static int run_loop(void) {
                     if (pi.kind != PROTO_UNKNOWN && !rawscope_local4(pkt + 16)) {
                         if (excluded_conn(pkt + poff, &pi, pkt + 16, 0)) {
                             InterlockedIncrement(&stats.excluded);
+                            if (len > TCPDPI_WIRE_MAX && pi.kind == PROTO_TLS) note_large(plen, 0, &dout, 1);
                         } else {
                             int decoy = !no_decoy && !rawscope_nodecoy(pkt + 16, 4, now);
                             rawscope_touch(pkt + 16, 4, now);
@@ -644,6 +527,7 @@ static int run_loop(void) {
                                                     rawscope_tls_next_seq(seq, pkt + poff, plen), now);
                             count_kind(&pi);
                             handled = desync4(pkt, (int)len, ihl, tcphl, poff, &pi, decoy, &addr);
+                            if (len > TCPDPI_WIRE_MAX && pi.kind == PROTO_TLS) note_large(plen, 0, &dout, 0);
                         }
                     }
                 }
@@ -686,8 +570,9 @@ static int parse_port(const char *s, uint16_t *out) {
 
 int engine_main(int argc, char *argv[]) {
     char filter[POLICY_FILTER_CAP];
-    int payment = 1, dns_hybrid = 0, alert_watch;
+    int payment = 1, dns_hybrid = 0, alert_watch, nxfiles = 0;
     const char *bad = NULL;
+    const char **xfiles = (const char **)calloc((size_t)(argc > 0 ? argc : 1), sizeof(*xfiles));
     WSADATA w;
 
     WSAStartup(MAKEWORD(2, 2), &w);
@@ -740,19 +625,40 @@ int engine_main(int argc, char *argv[]) {
         else if (!strcmp(a, "--dnsv6-port")) { NEED(); if (!parse_port(v, &dns6_port)) bad = a; }
         else if (!strcmp(a, "--dns-hybrid")) dns_hybrid = 1;
         else if (!strcmp(a, "--dns-block-ip")) { NEED(); if (!dns_add_block_ip(v)) bad = a; }
-        else if (!strcmp(a, "--exclude")) { NEED(); if (exclude_load_list(v) < 0) bad = a; }
+        else if (!strcmp(a, "--exclude")) { NEED(); if (xfiles) xfiles[nxfiles++] = v; else bad = a; }
         else if (!strcmp(a, "--no-payment-exclude")) payment = 0;
-        else if (!strcmp(a, "-h") || !strcmp(a, "--help")) { usage(); return 0; }
+        else if (!strcmp(a, "-h") || !strcmp(a, "--help")) { usage(); free(xfiles); return 0; }
         else bad = a;
 #undef NEED
     }
     if (bad) {
         printf("Unknown or invalid option: %s\n", bad);
         usage();
+        free(xfiles);
         return 2;
     }
     if (cfg.fake_repeats <= 0 || cfg.fake_repeats > 64) cfg.fake_repeats = 6;
+    /* the user's lists after the built-in one: until it is loaded, room is
+     * reserved for it; without payment protection it is never loaded and the
+     * user's lists may use the whole set */
     if (payment) exclude_load_builtin();
+    else exclude_skip_builtin();
+    for (int i = 0; i < nxfiles; i++) {
+        if (exclude_load_list(xfiles[i]) < 0) {
+            printf("Unknown or invalid option: --exclude %s\n", xfiles[i]);
+            usage();
+            free(xfiles);
+            return 2;
+        }
+    }
+    free(xfiles);
+    dcfg.split = cfg.split;
+    dcfg.desync_mode = cfg.desync_mode;
+    dcfg.split_pos = split_pos;
+    dcfg.seqovl = cfg.seqovl;
+    dcfg.seqovl_pattern = cfg.seqovl_pattern;
+    dcfg.fake_pattern = cfg.fake_pattern;
+    dcfg.tlsrec = cfg.tlsrec;
     if (dns_hybrid && (dns4 || dns6)) dns_set_hybrid(1);
     dns_set_clean(dns4_addr, dns4_port, dns6_addr, dns6_port);
     udp_flow_init(&flows);

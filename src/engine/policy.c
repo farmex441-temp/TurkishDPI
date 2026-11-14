@@ -79,9 +79,12 @@ int policy_build_filter(char *f, size_t cap, const policy_filter_opts *o) {
     return t.over ? -1 : (int)t.len;
 }
 
-int policy_excluded(int enabled, const char *name, size_t name_len, const void *daddr, int v6,
+int policy_excluded(int enabled, const char *name, size_t name_len, int ech, const void *daddr, int v6,
                     policy_name_fn name_listed, policy_ip_fn ip_learned) {
     if (!enabled) return 0;
-    if (name && name_len > 0) return name_listed ? name_listed(name, name_len) != 0 : 0;
+    if (name && name_len > 0) {
+        if (name_listed && name_listed(name, name_len)) return 1;
+        if (ech == 0) return 0;              /* the name is the site's own: it alone decides */
+    }
     return ip_learned && daddr ? ip_learned(daddr, v6) != 0 : 0;
 }
