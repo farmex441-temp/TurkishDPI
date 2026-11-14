@@ -851,7 +851,7 @@ void app_uninstall(void) {
     MessageBoxW(NULL, L"TurkishDPI kaldırıldı: başlangıç görevi, Program Files kopyası, ayarlar, günlük ve "
                       L"WinDivert sürücü hizmeti silindi.\n"
                       L"Son olarak TurkishDPI.exe dosyasını silebilirsiniz.", L"TurkishDPI",
-                MB_ICONINFORMATION);
+                MB_ICONINFORMATION | MB_SETFOREGROUND | MB_TOPMOST);
     ExitProcess(0);
 }
 
@@ -1862,17 +1862,15 @@ static void check_conflicts(void) {
  * new version (whatever it does at start) finds no running instance.
  */
 void app_update_done(int how) {
-    NOTIFYICONDATAW n;
     STARTUPINFOW si;
     PROCESS_INFORMATION pi;
     wchar_t cmd[MAX_PATH + 32], image[MAX_PATH * 2];
     DWORD il = MAX_PATH * 2;
+    /* read before hiding: it decides --tray for the new process */
     int hidden = !IsWindowVisible(ui_hwnd()), started = 0;
-    ZeroMemory(&n, sizeof(n));
-    n.cbSize = sizeof(n);
-    n.hWnd = ui_hwnd();
-    n.uID = 1;
-    Shell_NotifyIconW(NIM_DELETE, &n);
+    /* window and tray icon away first: the controller is stopping, so its
+     * buttons would only post commands nobody runs */
+    ui_hide_for_exit();
     apply_pending_payment(stop_controller(5000));
     engine_stop();
     if (how != 1 || g_update_lock == INVALID_HANDLE_VALUE) {
@@ -1882,7 +1880,7 @@ void app_update_done(int how) {
         MessageBoxW(NULL, L"Güncelleme tamamlanamadı. TurkishDPI kapatılıyor.\n\n"
                           L"Son sürümü GitHub'daki sürümler sayfasından indirin. "
                           L"Tamam'a basınca sayfa açılır.",
-                    L"TurkishDPI", MB_ICONERROR);
+                    L"TurkishDPI", MB_ICONERROR | MB_SETFOREGROUND | MB_TOPMOST);
         app_open_url(TURKISHDPI_RELEASES_URL);
         ExitProcess(1);
     }
@@ -1916,7 +1914,7 @@ void app_update_done(int how) {
     log_line(started ? "update: new version started" : "update: new version could not be started");
     if (!started)
         MessageBoxW(NULL, L"Yeni sürüm kuruldu ama başlatılamadı. TurkishDPI.exe'yi yeniden açın.",
-                    L"TurkishDPI", MB_ICONWARNING);
+                    L"TurkishDPI", MB_ICONWARNING | MB_SETFOREGROUND | MB_TOPMOST);
     ExitProcess(0);
 }
 
