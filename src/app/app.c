@@ -420,6 +420,8 @@ static int engine_start(int preset, int dns) {
     EnterCriticalSection(&g_lock);
     g_ui.driver_err = 0;   /* an old driver error must not label a new failure */
     LeaveCriticalSection(&g_lock);
+    /* nor make engine_fatal() stop on a failure before the engine ran */
+    InterlockedExchange(&g_engine_err, 0);
     build_args(preset, dns, args, sizeof(args));
     /* Already running with exactly these arguments: keep it. Restarting
      * would only drop the user's connections for nothing (a watchdog or
@@ -489,11 +491,30 @@ static int engine_start(int preset, int dns) {
     return 0;
 }
 
+/* The driver WinDivert loads on this system (as in sys_install_copy and
+ * windivert_dyn.c): a 32-bit build on 64-bit Windows needs the 64-bit one. */
+static const wchar_t *needed_driver(void) {
+#ifdef _WIN64
+    return L"WinDivert64.sys";
+#else
+    typedef BOOL (WINAPI *wow_fn)(HANDLE, PBOOL);
+    BOOL wow = FALSE;
+    wow_fn f = (wow_fn)(void *)GetProcAddress(GetModuleHandleW(L"kernel32.dll"), "IsWow64Process");
+    if (f) f(GetCurrentProcess(), &wow);
+    return wow ? L"WinDivert64.sys" : L"WinDivert32.sys";
+#endif
+}
+
+/* Text for a driver error; never NULL. Controller thread only (static buffer). */
 static const wchar_t *windivert_error_text(long e) {
+    static wchar_t buf[160];
     switch (e) {
     /* each text fits g_ui.detail (159 chars) and four lines of the window */
-    case 2:    return L"WinDivert64.sys bulunamadı. Zip'teki tüm dosyaları exe ile aynı klasöre "
-                      L"çıkarın; dosya varsa antivirüs karantinasına bakın.";
+    case 2:
+        _snwprintf(buf, 159, L"%ls bulunamadı. Zip'teki tüm dosyaları exe ile aynı klasöre "
+                             L"çıkarın; dosya varsa antivirüs karantinasına bakın.", needed_driver());
+        buf[159] = 0;
+        return buf;
     case 126:  return L"WinDivert.dll bulunamadı. Zip'teki tüm dosyaları exe ile aynı klasöre "
                       L"çıkarın; dosya varsa antivirüs karantinasına bakın.";
     case 1920: return L"WinDivert dosyalarına erişilemiyor: antivirüs engellemiş ya da başka bir "
@@ -510,7 +531,11 @@ static const wchar_t *windivert_error_text(long e) {
                       L"güvenlik için yüklenmedi. Resmi zip'i yeniden indirin.";
     case 50:   return L"ARM işlemcili Windows desteklenmiyor: WinDivert sürücüsünün ARM64 sürümü yok. "
                       L"x64 veya x86 işlemcili bir bilgisayar gerekir.";
-    default:   return NULL;
+    default:
+        _snwprintf(buf, 159, L"WinDivert sürücüsü açılamadı (hata %ld). Ayrıntılar günlükte: "
+                             L"Ayarlar > Günlüğü aç.", e);
+        buf[159] = 0;
+        return buf;
     }
 }
 
@@ -660,20 +685,32 @@ static void load_block_ips(void) {
     LeaveCriticalSection(&g_lock);
 }
 
+/*
+ * 1 when the last engine start failed in a way no other preset can fix: any
+ * driver error the engine reported, except 87 (filter syntax, i.e. a bug in
+ * that one preset's arguments, worth trying the others). No reported code
+ * (timeout, crash) is not fatal either. The caller stops at once and records
+ * nothing in the learned stats: the presets are not at fault.
+ */
+#define ENGINE_ERR_FILTER_SYNTAX 87
+
 static int engine_fatal(void) {
-    const wchar_t *msg = windivert_error_text(g_engine_err);
+    long e = g_engine_err;
+    const wchar_t *msg;
     wchar_t st[64];
-    if (!msg) return 0;
-    swprintf(st, 64, L"Sürücü başlatılamadı (%ld)", g_engine_err);
+    if (e == 0 || e == ENGINE_ERR_FILTER_SYNTAX) return 0;
+    msg = windivert_error_text(e);
+    log_line("driver error %ld: stopping, no preset is tried or recorded", e);
+    swprintf(st, 64, L"Sürücü başlatılamadı (%ld)", e);
     EnterCriticalSection(&g_lock);
-    g_ui.driver_err = g_engine_err;
+    g_ui.driver_err = e;
     LeaveCriticalSection(&g_lock);
     set_state(ST_ERROR, st, msg);
     g_quiet_start = 0;
-    if (g_engine_err != g_last_fatal) {   /* no repeated balloons from the watchdog */
+    if (e != g_last_fatal) {   /* no repeated balloons from the watchdog */
         notify(L"TurkishDPI çalışamıyor", msg);
         g_notified_kind = ST_ERROR;   /* the next success is news again */
-        g_last_fatal = g_engine_err;
+        g_last_fatal = e;
     }
     return 1;
 }
