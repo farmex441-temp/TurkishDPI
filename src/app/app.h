@@ -19,8 +19,11 @@ typedef enum {
     ST_PAUSED, ST_OFFLINE, ST_ERROR
 } state_kind_t;
 
+/* CMD_PAUSE / CMD_RESUME are explicit, chosen by the UI from its state
+ * snapshot, and ignored by the controller when already in that state: two
+ * quick clicks can no longer pause and then start a full rescan. */
 enum { CMD_NONE, CMD_RESCAN, CMD_SELECT, CMD_AUTO, CMD_PAUSE, CMD_RESUME,
-       CMD_TESTSITE, CMD_RESTART, CMD_TOGGLE_PAUSE, CMD_AUTOSTART, CMD_UPDATE,
+       CMD_TESTSITE, CMD_RESTART, CMD_AUTOSTART, CMD_UPDATE,
        CMD_PAYMENT /* arg: 1 on, 0 off */ };
 
 typedef struct {
@@ -62,7 +65,7 @@ extern int g_auto, g_preset, g_paused, g_payment_protect;
  * a click, while g_payment_protect belongs to the controller (CMD_PAYMENT). */
 extern int g_payment_shown;
 extern wchar_t g_log[MAX_PATH], g_ini[MAX_PATH];
-void post_cmd(LONG cmd, LONG arg);
+int  post_cmd(LONG cmd, LONG arg);   /* 0 if dropped (queue full) */
 void post_site_test(const wchar_t *host);
 int  autostart_enabled(void);
 void autostart_set(int on);

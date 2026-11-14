@@ -1394,7 +1394,6 @@ static DWORD WINAPI controller(LPVOID unused) {
              * not replace the scan must finish it afterwards, otherwise the
              * engine stays on whatever preset was being tried. */
             int interrupted = g_scan_aborted != 0;
-            if (cmd == CMD_TOGGLE_PAUSE) cmd = g_paused ? CMD_RESUME : CMD_PAUSE;
             if (cmd != CMD_TESTSITE) InterlockedExchange(&g_scan_aborted, 0);
             switch (cmd) {
             case CMD_RESCAN:  g_paused = 0; set_reason(WHY_USER_RESCAN); auto_scan(); break;
@@ -1406,7 +1405,9 @@ static DWORD WINAPI controller(LPVOID unused) {
                                   config_save(); manual_start((int)arg);
                               }
                               break;
-            case CMD_PAUSE:   g_paused = 1; engine_stop(); probe_flush_dns_cache();
+            case CMD_PAUSE:   if (g_paused) { log_line("pause: already paused, ignored"); break; }
+                              g_paused = 1; engine_stop(); probe_flush_dns_cache();
+                              log_line("paused");
                               set_state(ST_PAUSED, L"Duraklatıldı", L"Açmak için düğmeye basın"); break;
             case CMD_RESTART: /* settings changed: restart what runs, no full rescan */
                               restart_running(interrupted);
@@ -1422,16 +1423,24 @@ static DWORD WINAPI controller(LPVOID unused) {
                                   if (g_auto) auto_scan(); else manual_start(g_preset);
                               }
                               break;
-            case CMD_RESUME:  g_paused = 0;
+            case CMD_RESUME:  if (!g_paused) {
+                                  log_line("resume: not paused, ignored");
+                                  if (interrupted) auto_scan();   /* the scan it interrupted */
+                                  break;
+                              }
+                              g_paused = 0;
+                              log_line("resumed");
                               set_reason(WHY_RESUME_PAUSE);
                               if (g_auto) auto_scan(); else manual_start(g_preset);
                               break;
+            /* An interrupted scan is finished also in manual mode: it was an
+             * auto_scan (a "rescan"), and is never left on a candidate. */
             case CMD_AUTOSTART: autostart_set((int)arg);
-                              if (interrupted && g_auto && !g_paused) auto_scan();
+                              if (interrupted && !g_paused) auto_scan();
                               break;
             case CMD_UPDATE:  update_install();
                               if (g_quitting) return 0;
-                              if (interrupted && g_auto && !g_paused) auto_scan();
+                              if (interrupted && !g_paused) auto_scan();
                               break;
             case CMD_TESTSITE: {
                 wchar_t h[256];
@@ -1520,16 +1529,26 @@ static DWORD WINAPI controller(LPVOID unused) {
     return 0;
 }
 
-void post_cmd(LONG cmd, LONG arg) {
+int post_cmd(LONG cmd, LONG arg) {
+    int queued = 1, merged = 0;
     EnterCriticalSection(&g_lock);
-    if (g_cmdq_count < CMD_QUEUE) {
+    if (cmd == CMD_RESCAN && g_cmdq_count &&
+        g_cmdq[(g_cmdq_head + g_cmdq_count - 1) % CMD_QUEUE].cmd == CMD_RESCAN) {
+        merged = 1;   /* back-to-back rescans are one rescan */
+    } else if (g_cmdq_count < CMD_QUEUE) {
         int tail = (g_cmdq_head + g_cmdq_count) % CMD_QUEUE;
         g_cmdq[tail].cmd = cmd;
         g_cmdq[tail].arg = arg;
         g_cmdq_count++;
+    } else {
+        queued = 0;
     }
     LeaveCriticalSection(&g_lock);
+    /* logged outside g_lock (file I/O) */
+    if (merged) log_line("command %ld merged with the queued one", cmd);
+    if (!queued) log_line("command %ld dropped: queue full (%d)", cmd, CMD_QUEUE);
     SetEvent(g_cmd_event);
+    return queued;
 }
 
 void post_site_test(const wchar_t *host) {
@@ -1543,8 +1562,7 @@ void post_site_test(const wchar_t *host) {
 /* UI thread: shown at once, applied by the controller (CMD_PAYMENT saves
  * the ini and restarts what runs; a paused app stays paused). */
 void set_payment_protect(int on) {
-    g_payment_shown = on != 0;
-    post_cmd(CMD_PAYMENT, on != 0);
+    if (post_cmd(CMD_PAYMENT, on != 0)) g_payment_shown = on != 0;   /* dropped: unchanged */
     ui_refresh();
 }
 

@@ -1362,6 +1362,14 @@ static void profile_menu(void) {
     popup(m, p.x, p.y);
 }
 
+/* Pause and resume are explicit commands chosen from what the user sees
+ * (the state snapshot), never a toggle resolved later by the controller. */
+static int g_menu_resume;   /* tray menu showed "Devam et" */
+
+static void post_pause_or_resume(int resume) {
+    post_cmd(resume ? CMD_RESUME : CMD_PAUSE, 0);
+}
+
 void ui_tray_menu(HWND owner) {
     HMENU m = CreatePopupMenu();
     POINT p;
@@ -1371,7 +1379,9 @@ void ui_tray_menu(HWND owner) {
     AppendMenuW(m, MF_STRING | MF_GRAYED, 0, kind_headline(&st));
     AppendMenuW(m, MF_SEPARATOR, 0, NULL);
     AppendMenuW(m, MF_STRING | MF_DEFAULT, IDM_SHOW, L"TurkishDPI'ı aç");
-    AppendMenuW(m, MF_STRING, IDM_PAUSE, g_paused ? L"Devam et" : L"Duraklat");
+    /* the item does what its label says (IDM_PAUSE in command()) */
+    g_menu_resume = st.kind == ST_PAUSED;
+    AppendMenuW(m, MF_STRING, IDM_PAUSE, g_menu_resume ? L"Devam et" : L"Duraklat");
     AppendMenuW(m, MF_STRING, IDM_RESCAN, L"Yeniden tara");
     AppendMenuW(m, MF_SEPARATOR, 0, NULL);
     AppendMenuW(m, MF_STRING, IDM_EXIT, L"Çıkış");
@@ -1453,12 +1463,12 @@ static void do_click(int id) {
         return;
     }
     switch (id) {
-    case ID_POWER:  post_cmd(CMD_TOGGLE_PAUSE, 0); break;
+    case ID_POWER:  post_pause_or_resume(st.kind == ST_PAUSED); break;
     case ID_ACTION:
         switch (action_for(&st)) {
         case A_RETRY:  post_cmd(CMD_RESCAN, 0); break;
         case A_FIX:    command(IDM_AVHELP); break;
-        case A_RESUME: post_cmd(CMD_TOGGLE_PAUSE, 0); break;
+        case A_RESUME: post_pause_or_resume(1); break;
         case A_DOWNLOAD: command(IDM_UPDATE); break;
         }
         break;
@@ -1545,7 +1555,7 @@ static void command(int id) {
             app_uninstall();
         break;
     case IDM_SHOW:      ui_show(); break;
-    case IDM_PAUSE:     post_cmd(CMD_TOGGLE_PAUSE, 0); break;
+    case IDM_PAUSE:     post_pause_or_resume(g_menu_resume); break;
     case IDM_RESCAN:    post_cmd(CMD_RESCAN, 0); break;
     }
 }
