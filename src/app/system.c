@@ -852,10 +852,14 @@ static HANDLE open_update_dir(const wchar_t *running_exe, wchar_t *real, DWORD c
     if (!GetFullPathNameW(running_exe, MAX_PATH, dir, NULL) || !(slash = wcsrchr(dir, L'\\')))
         return INVALID_HANDLE_VALUE;
     *slash = 0;
-    /* no delete sharing: while we hold it the folder cannot be renamed (nor
-     * can any folder above it), so paths built from real stay in it */
+    /* Full sharing on purpose. Paths built from real stay valid because NTFS
+     * refuses to rename a folder (or any folder above it) while a handle to
+     * something inside it is open - and our own lock on the running exe is
+     * always open during an update. Denying delete sharing here would add
+     * nothing and would only make this open fail whenever another process
+     * holds the folder with DELETE access. */
     h = CreateFileW(dir, FILE_LIST_DIRECTORY | FILE_TRAVERSE | FILE_READ_ATTRIBUTES | SYNCHRONIZE,
-                    FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, OPEN_EXISTING,
+                    FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, NULL, OPEN_EXISTING,
                     FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT, NULL);
     if (h == INVALID_HANDLE_VALUE) return h;
     if (!GetFileInformationByHandle(h, &fi) || !(fi.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) ||
@@ -1051,6 +1055,9 @@ static LONG rename_aside(HANDLE f, HANDLE dirh, const wchar_t *base) {
  * directory) is opened without following links, checked to be in the
  * folder, and renamed aside first. Fails only when the name cannot be freed
  * (held open without delete sharing, or a directory with open files).
+ * A squatter DIRECTORY moved aside to "<name>.<n>.old" stays there for good:
+ * sys_update_cleanup skips directories (no recursive deletes in a folder
+ * that may be Downloads).
  */
 static int put_back(HANDLE ho, HANDLE dirh, const wchar_t *real, const wchar_t *base) {
     wchar_t path[MAX_PATH], fp[MAX_PATH * 2];
@@ -1074,7 +1081,7 @@ static int put_back(HANDLE ho, HANDLE dirh, const wchar_t *real, const wchar_t *
 }
 
 #ifdef UPD_TEST
-/* tests/update_install_test.c: plays the other process at these points */
+/* tests/upd_swap_test.c: plays the other process at these points */
 enum { UPD_STEP_UNLOCKED = 1, UPD_STEP_MOVED_ASIDE, UPD_STEP_NEW_IN_PLACE };
 void upd_test_hook(int step, const wchar_t *real, const wchar_t *base);
 #define UPD_HOOK(step) upd_test_hook((step), real, base)
@@ -1085,17 +1092,24 @@ void upd_test_hook(int step, const wchar_t *real, const wchar_t *base);
 /*
  * (b) of the update: installs the checked package files (data/dlen as in
  * UPD_ITEMS, data[0] = the exe) into the folder the running exe is in.
- * self_exe: the running exe's lock (read, no write/delete sharing; it may
- * also carry DELETE access, then it is used for the move directly).
+ * self_exe: the running exe's lock (read, no write/delete sharing). app.c's
+ * lock_self_exe opens it read-only - and must stay that way: a freshly
+ * updated process locks its exe while the old one still holds the update
+ * lock - so it is closed and re-opened with DELETE access for the move. The
+ * handle handed back after a failed update already has DELETE access; such
+ * a handle is used for the move directly.
  *
  * Invariant: from the moment the running exe is moved aside until the end,
  * a handle to it (ho, sharing only reads) stays open, so it cannot be
  * changed, replaced or held by anyone else, and every failure puts it back
  * under its name - replacing or moving away whatever sits there - and keeps
- * ho as the new lock. Every exit leaves either the old exe or the verified
- * new exe (locked in *lock_out) under the exe's name, no temp file, and no
- * handle of ours open besides that lock. Texts are only replaced after the
- * exe step succeeded, so a failed update never mixes versions.
+ * ho as the new lock. Results 1, 0 and -1 leave either the old exe or the
+ * verified new exe (locked in *lock_out) under the exe's name, no temp file,
+ * and no handle of ours open besides that lock. Only -2 differs: another
+ * process holds the name without delete sharing, so whatever file sits
+ * there is NOT verified (it is never started by us), the old exe stays as
+ * <name>.<n>.old, and no handle is handed back. Texts are only replaced
+ * after the exe step succeeded, so a failed update never mixes versions.
  * Returns as sys_update_install.
  */
 static int upd_install_files(HANDLE *self_exe, const wchar_t *running_exe, unsigned char *const data[],
@@ -1112,8 +1126,8 @@ static int upd_install_files(HANDLE *self_exe, const wchar_t *running_exe, unsig
     *why = "";
     base[0] = 0;
 
-    /* 1. where we run from: the folder (held so it cannot be renamed), and the
-     * exe's real (long) name in it taken from its locked handle - the start
+    /* 1. where we run from: the folder (it cannot be renamed while our lock
+     * on the exe inside it is open, see open_update_dir), and the exe's real (long) name in it taken from its locked handle - the start
      * path may use 8.3 names */
     if ((dirh = open_update_dir(running_exe, real, MAX_PATH * 2)) == INVALID_HANDLE_VALUE) {
         *why = "open folder";
@@ -1161,9 +1175,10 @@ static int upd_install_files(HANDLE *self_exe, const wchar_t *running_exe, unsig
     /* 4. the running exe moved aside; ho stays open until the end */
     st = rename_aside(*self_exe, dirh, base);
     if (st >= 0) {
-        ho = *self_exe;                     /* the lock had DELETE access: no gap at all */
+        ho = *self_exe;                     /* DELETE access (handed back by a failed
+                                             * update): no unlocked moment at all */
         *self_exe = INVALID_HANDLE_VALUE;
-    } else if (st == (LONG)0xC0000022L) {   /* STATUS_ACCESS_DENIED: a read-only lock */
+    } else if (st == (LONG)0xC0000022L) {   /* STATUS_ACCESS_DENIED: lock_self_exe's read-only lock */
         /* it denies delete sharing, so it must go before a DELETE handle can
          * be opened; the gap is closed again by open_original, which shares
          * only reads */
@@ -1352,7 +1367,9 @@ static int upd_leftover(const wchar_t *name, const wchar_t *base) {
 
 /* Removes what an update left in the exe's folder: the previous exe (moved
  * aside while it ran) and unfinished writes. Only our own exact names
- * (upd_leftover), each deleted through a handle that does not follow links. */
+ * (upd_leftover), each deleted through a handle that does not follow links.
+ * Directories are skipped, so a squatter directory that a failed update
+ * moved aside to "<name>.<n>.old" is left for the user. */
 void sys_update_cleanup(const wchar_t *running_exe) {
     wchar_t real[MAX_PATH * 2], pat[MAX_PATH], path[MAX_PATH], longp[MAX_PATH];
     const wchar_t *slash;

@@ -1,4 +1,4 @@
-/* MSVC: /DUPD_TEST /Isrc/app /Isrc/engine /Itests tests/update_install_test.c src/app/updpkg.c advapi32.lib shell32.lib ole32.lib */
+/* MSVC: /DUPD_TEST /Isrc/app /Isrc/engine /Itests tests/upd_swap_test.c src/app/updpkg.c advapi32.lib shell32.lib ole32.lib */
 /*
  * TurkishDPI: the install half of the one-click update (upd_install_files
  * in src/app/system.c) against real files - no elevation, no network, no
@@ -11,8 +11,11 @@
  * files, the texts and whether the lock handed back really locks.
  * Also: path_join/wfmt at the exact-fit boundary and the cleanup patterns.
  *
- *   gcc -DUPD_TEST -Isrc/app -Isrc/engine -Itests tests/update_install_test.c src/app/updpkg.c \
- *       -ladvapi32 -lshell32 -lole32 -lws2_32 -o update_install_test
+ *   gcc -DUPD_TEST -Isrc/app -Isrc/engine -Itests tests/upd_swap_test.c src/app/updpkg.c \
+ *       -ladvapi32 -lshell32 -lole32 -luuid -lws2_32 -o upd_swap_test
+ *   (CI: the upd_swap_test line in .github/scripts/build-tests.sh)
+ * Runs from any working directory: it works in "upd_swap_test" under the
+ * current directory and removes it; it never touches an installed copy.
  */
 #include "system.c"   /* the code under test, with UPD_TEST hooks */
 
@@ -280,7 +283,7 @@ int main(void) {
     int rc, match, dirs;
     DWORD n = GetCurrentDirectoryW(MAX_PATH, g_root);
     if (!n || n >= MAX_PATH - 40) return 2;
-    wcscat(g_root, L"\\upd_install_test");
+    wcscat(g_root, L"\\upd_swap_test");
     rm_tree(g_root);
     CreateDirectoryW(g_root, NULL);
 
@@ -365,11 +368,40 @@ int main(void) {
     EXPECT(file_is(L"WinDivert.dll", "WD") == -1, "not installed");
     finish(self, lock);
 
+    /* What keeps the folder from being renamed during an update is not the
+     * folder handle (open_update_dir shares delete) but NTFS: a folder, or
+     * any folder above it, cannot be renamed while something inside is open
+     * - and the update always holds the old exe and the new file open. */
+    {
+        wchar_t a[MAX_PATH], b[MAX_PATH], f[MAX_PATH], to[MAX_PATH];
+        HANDLE fh, dh;
+        g_case = "folder rename vs. open handles";
+        path_join(a, MAX_PATH, g_root, L"outer");
+        path_join(b, MAX_PATH, a, L"inner");
+        path_join(f, MAX_PATH, b, L"file.bin");
+        CreateDirectoryW(a, NULL);
+        CreateDirectoryW(b, NULL);
+        fh = CreateFileW(f, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, NULL, CREATE_ALWAYS,
+                         FILE_ATTRIBUTE_NORMAL, NULL);
+        dh = CreateFileW(b, FILE_LIST_DIRECTORY, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, NULL,
+                         OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT, NULL);
+        EXPECT(fh != INVALID_HANDLE_VALUE && dh != INVALID_HANDLE_VALUE, "set-up");
+        wfmt(to, MAX_PATH, L"%ls-moved", b);
+        EXPECT(!MoveFileExW(b, to, 0), "folder with an open file inside: rename refused");
+        wfmt(to, MAX_PATH, L"%ls-moved", a);
+        EXPECT(!MoveFileExW(a, to, 0), "its parent: rename refused");
+        CloseHandle(fh);
+        wfmt(to, MAX_PATH, L"%ls-moved", b);
+        EXPECT(MoveFileExW(b, to, 0) != 0, "nothing open inside: the delete-sharing folder handle does not block it");
+        CloseHandle(dh);
+        rm_tree(a);
+    }
+
     self = setup("folder cannot be renamed during the update", "WD", 0);
     package("WD");
     g_hook = hook_rename_folder;
     rc = run(&self, &lock, &why);
-    EXPECT(g_folder_renamed == 0, "folder rename refused");
+    EXPECT(g_folder_renamed == 0, "folder rename refused (our handles inside are open)");
     EXPECT(rc == 1 && file_is(EXE, NEW_EXE) == 1, why);
     finish(self, lock);
 

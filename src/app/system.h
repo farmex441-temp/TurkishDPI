@@ -19,17 +19,22 @@ int  sys_install_copy(void *self_exe, const wchar_t *running_exe, wchar_t *insta
 void sys_uninstall_install_dir(const wchar_t *running_exe);
 /*
  * One-click update to release tag (e.g. L"v2.0.2") in the exe's own folder.
- * self_exe: the running exe's lock handle (read, no write/delete sharing; if
- * it also has DELETE access the move needs no unlocked moment). It is given
- * up on success; on 0/-1 *self_exe is again a valid lock of the running exe
- * (possibly a different handle).
+ * self_exe: the running exe's lock handle (read, no write/delete sharing, as
+ * lock_self_exe opens it). It is given up on success; on 0/-1 *self_exe is
+ * again a valid lock of the running exe (possibly a different handle, one
+ * that also has DELETE access).
  * Returns 1 with *lock_out = the new exe opened read-only without write/delete
  * sharing (start it, keep the handle until exit); 0 failed, the running exe
- * is (back) under its name and nothing else changed; -1 refused (the release
- * changes WinDivert: update by hand); -2 the running exe could not be put
- * back under its name or locked again (another process holds the name): the
- * app must not go on (restart it by hand; the old exe may be <name>.<n>.old).
- * Downloads are bounded (30 s checksums, 3 min package).
+ * is (back) under its name, locked, the package's files were not installed
+ * (something another process put under the exe's name meanwhile may have
+ * been replaced or moved aside to <name>.<n>.old); -1 refused (the release
+ * changes WinDivert: update by hand); -2 another process holds the exe's
+ * name or the running exe so that it could not be put back or locked again.
+ * Then *self_exe and *lock_out are invalid, and the file under the exe's
+ * name may be the new exe or another process's file - NOT verified, never
+ * start it; the running exe is either still under its name (unlocked) or
+ * at <name>.<n>.old. The app must not go on (the user restarts it by hand).
+ * Downloads are bounded in time (about 30 s checksums, 3 min package).
  * why: short English reason for the log.
  */
 int  sys_update_install(const wchar_t *tag, void **self_exe, const wchar_t *running_exe,
