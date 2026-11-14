@@ -75,6 +75,8 @@ static int lookup(const char *host) {
 #define BUILTIN_COUNT (sizeof(BUILTIN_EXCLUDES) / sizeof(BUILTIN_EXCLUDES[0]))
 #define EXCL_MAX_NAMES (EXCL_SLOTS / 2)
 static int builtins_loaded;
+/* the reserve below must leave room for user names */
+_Static_assert(BUILTIN_COUNT < EXCL_MAX_NAMES, "built-in list does not fit the name set");
 
 /* Built-in names always win: until they are loaded, user names may not use the
  * room reserved for them, whatever the call order. */
@@ -112,25 +114,37 @@ int exclude_load_builtin(void) {
     return n;
 }
 
+/* The built-in list will not be loaded (payment protection off): user names may
+ * use the whole set. */
+void exclude_skip_builtin(void) {
+    builtins_loaded = 1;
+}
+
 /* One name per line. Lines end at LF, CR or CRLF; the file is read in binary
- * mode (a 0x1A byte is just a byte). A line longer than LINE_MAX_BYTES or
- * containing a NUL byte is invalid and skipped as a whole. A UTF-8 byte order
- * mark at the start (Notepad) is ignored. */
+ * mode (a 0x1A byte is just a byte). Bytes after the first '#' of a line are a
+ * comment: they are not stored, do not count towards the length limit, and a
+ * NUL byte inside them is just comment text. The part before the '#' must fit
+ * LINE_MAX_BYTES and contain no NUL, otherwise the line is invalid and skipped
+ * as a whole. A UTF-8 byte order mark at the start (Notepad) is ignored. On a
+ * read error the unterminated last line is not used and -1 is returned. */
 #define LINE_MAX_BYTES 1023
 int exclude_load_list(const char *filename) {
     char line[LINE_MAX_BYTES + 1];
     size_t n = 0;
-    int cnt = 0, first = 1, bad = 0, c;
+    int cnt = 0, first = 1, bad = 0, comment = 0, c;
     FILE *fp = fopen(filename, "rb");
     if (!fp) return -1;
     for (;;) {
         c = fgetc(fp);
         if (c != EOF && c != '\n' && c != '\r') {
+            if (comment) continue;
+            if (c == '#') { comment = 1; continue; }
             if (c == 0) bad = 1;
             if (n < LINE_MAX_BYTES) line[n++] = (char)c;
             else bad = 1;
             continue;
         }
+        if (c == EOF && ferror(fp)) { fclose(fp); return -1; }
         if (c == '\r') {
             int d = fgetc(fp);
             if (d != '\n' && d != EOF) ungetc(d, fp);
@@ -141,13 +155,11 @@ int exclude_load_list(const char *filename) {
                 (unsigned char)line[1] == 0xBB && (unsigned char)line[2] == 0xBF)
                 memmove(line, line + 3, n - 3 + 1);
             first = 0;
-            if (!bad) {
-                line[strcspn(line, "#")] = '\0';
-                cnt += exclude_add(line);
-            }
+            if (!bad) cnt += exclude_add(line);
         }
         n = 0;
         bad = 0;
+        comment = 0;
         if (c == EOF) break;
     }
     fclose(fp);

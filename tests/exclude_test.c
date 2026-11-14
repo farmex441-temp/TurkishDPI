@@ -586,6 +586,34 @@ static void test_list(void) {
     EXPECT(r == 2);                                      /* the long NUL line is dropped, the two lines after it load */
     EXPECT(host("tail-nul2.test") && host("after-nul2.test"));
 
+    /* a comment does not count towards the length limit: the name part is what must fit */
+    memcpy(big, "bank-long-comment.test # ", 25);
+    memset(big + 25, 'c', 1500);
+    big[1525] = '\n';
+    memcpy(big + 1526, "after-comment.test\n", 19);
+    r = load_bytes(big, 1526 + 19);
+    EXPECT(r == 2 && host("bank-long-comment.test") && host("after-comment.test"));
+    memset(big, 'n', 1100);                                                  /* name part too long: skipped whole */
+    memcpy(big + 1100, " # comment\nafter-long-name.test\n", 32);
+    r = load_bytes(big, 1100 + 32);
+    EXPECT(r == 1 && host("after-long-name.test"));
+    big[0] = '#';                                                            /* 5 KB line that starts with '#' */
+    memset(big + 1, 'x', 2000);
+    memcpy(big + 2001, " hidden-in-comment.test ", 24);
+    memset(big + 2025, 'y', 2975);
+    big[5000] = '\n';
+    memcpy(big + 5001, "after-5k.test\n", 14);
+    r = load_bytes(big, 5001 + 14);
+    EXPECT(r == 1 && !host("hidden-in-comment.test") && host("after-5k.test"));
+    {
+        /* NUL inside the comment part is comment text (the name still loads);
+         * a NUL before the '#' invalidates the line */
+        static const char d[] = "nul-comment.test # a\0b\nnul-before.test\0 # c\nnul-ok.test\n";
+        r = load_bytes(d, sizeof d - 1);
+        EXPECT(r == 2);
+        EXPECT(host("nul-comment.test") && !host("nul-before.test") && host("nul-ok.test"));
+    }
+
     /* name set capacity: 512 names; further names are refused (silently, the call still
      * succeeds); nothing already stored is lost */
     before = known;
@@ -699,7 +727,7 @@ static void test_capacity(void) {
     for (i = 0; i < 5; i++) EXPECT(!has4(10, 21, 0, i));
     for (i = 0; i < 8; i++) EXPECT(has4(10, 22, 0, i));
     for (i = 0; i < 20; i++) EXPECT(has6_i(4000 + i) == (i < 8));
-    /* a few oversized answers cannot flush the genuine addresses */
+    /* the rate: at most 16 entries are replaced per answer, however large it is */
     fresh();
     for (i = 0; i < 512; i++) learn_a_t(172, 16, i >> 8, i & 255);
     for (k = 0; k < 3; k++) {
@@ -711,6 +739,20 @@ static void test_capacity(void) {
     live = 0;
     for (i = 0; i < 512; i++) live += has4(172, 16, i >> 8, i & 255);
     EXPECT(live == 512 - 48);
+    /* trade-off of the per-answer cap: junk records in front push the real address out of
+     * the 16 that are learned; the same address first in another answer is learned */
+    fresh();
+    hdr(&m, RESP, 1, 17); question(&m, "www.paypal.com");
+    for (i = 0; i < 16; i++) { ip[0] = 10; ip[1] = 40; ip[2] = 0; ip[3] = (unsigned char)i; rr(&m, 1, ip, 4); }
+    ip[0] = 10; ip[1] = 41; ip[2] = 0; ip[3] = 1; rr(&m, 1, ip, 4);
+    learn(&m);
+    EXPECT(has4(10, 40, 0, 15));
+    EXPECT(!has4(10, 41, 0, 1));                               /* known: the 17th record is ignored */
+    hdr(&m, RESP, 1, 2); question(&m, "www.paypal.com");
+    rr(&m, 1, ip, 4);
+    ip[1] = 40; ip[3] = 99; rr(&m, 1, ip, 4);
+    learn(&m);
+    EXPECT(has4(10, 41, 0, 1) && has4(10, 40, 0, 99));
 }
 
 static void test_expiry(void) {
@@ -781,32 +823,83 @@ static void test_expiry(void) {
 }
 
 /* ---------- 5. built-in names win whatever the load order ---------- */
+static int fill_until_refused(const char *prefix) {
+    int k = 0;
+    char nm[32];
+    for (;; k++) {
+        sprintf(nm, "%s%04d.test", prefix, k);
+        if (!exclude_add(nm)) break;
+        if (k > 600) break;
+    }
+    return k;
+}
 static void test_builtin_first(void) {
     char *names;
-    int i, user_added, builtin_n, builtin_n2;
+    int i, user_added, user_added2, builtin_n, builtin_n2;
     size_t n;
     grp = G_LIST;
 
     exclude_reset_for_test();
     builtin_n = exclude_load_builtin();
+    EXPECT(builtin_n > 100 && builtin_n < 512);
     exclude_reset_for_test();
     EXPECT(!exclude_enabled());                                 /* reset really empties */
 
     /* a user list that is larger than the whole set, loaded BEFORE the built-in names */
-    names = (char *)malloc(700 * 16 + 1);
+    names = (char *)malloc(1400 * 16 + 1);
     n = 0;
     for (i = 0; i < 700; i++) n += (size_t)sprintf(names + n, "usr%03d.test\n", i);
     write_file(names, n);
-    free(names);
     user_added = exclude_load_list(LISTFILE);
-    EXPECT(user_added > 0 && user_added <= 512 - builtin_n);   /* room is kept for the built-in list */
+    EXPECT(user_added == 512 - builtin_n);                      /* room is kept for the built-in list */
     builtin_n2 = exclude_load_builtin();
     EXPECT(builtin_n2 == builtin_n);                           /* none of them displaced */
     EXPECT(host("paypal.com") && host("www.garanti.com.tr") && host("isbank.com.tr"));
     EXPECT(host("btcturk.com") && host("paribu.com") && host("sanalpos.iyzico.com"));
     EXPECT(host("usr000.test") && !host("usr699.test"));
-    /* after the built-in names are in, user names may use the rest of the 512 */
-    EXPECT(exclude_add("late-user.test") == (user_added + builtin_n < 512));
+    EXPECT(exclude_add("late-user.test") == 0);                 /* the set is exactly full */
+
+    /* with a small user list the flag matters: after the built-ins are loaded the whole
+     * rest of the set is free (would be 0 if the flag were never set) */
+    exclude_reset_for_test();
+    n = 0;
+    for (i = 0; i < 100; i++) n += (size_t)sprintf(names + n, "few%03d.test\n", i);
+    write_file(names, n);
+    EXPECT(exclude_load_list(LISTFILE) == 100);
+    EXPECT(exclude_load_builtin() == builtin_n);
+    EXPECT(fill_until_refused("fill") == 512 - 100 - builtin_n);
+
+    /* a user list loaded first that contains built-in names ends with the same final
+     * count as a clean load: no lost slot, no double count */
+    exclude_reset_for_test();
+    EXPECT(exclude_add("paypal.com") == 1);
+    EXPECT(exclude_add("stripe.com") == 1);
+    EXPECT(exclude_add("btcturk.com") == 1);
+    builtin_n2 = exclude_load_builtin();
+    EXPECT(builtin_n2 == builtin_n - 3);                        /* three were already there */
+    EXPECT(fill_until_refused("fz") == 512 - builtin_n);        /* same final count as a clean load */
+
+    /* payment protection off: the built-in list is never loaded, the reserve is released */
+    exclude_reset_for_test();
+    n = 0;
+    for (i = 0; i < 700; i++) n += (size_t)sprintf(names + n, "usr%03d.test\n", i);
+    write_file(names, n);
+    user_added = exclude_load_list(LISTFILE);
+    EXPECT(user_added == 512 - builtin_n);                      /* reserve active */
+    exclude_skip_builtin();
+    n = 0;
+    for (i = 0; i < 700; i++) n += (size_t)sprintf(names + n, "usq%03d.test\n", i);
+    write_file(names, n);
+    user_added2 = exclude_load_list(LISTFILE);
+    EXPECT(user_added2 == builtin_n);                           /* the rest, up to 512 */
+    EXPECT(exclude_add("one-too-many.test") == 0);
+    EXPECT(exclude_load_builtin() == 0);                        /* a late load: nothing fits, no overflow */
+    EXPECT(host("usr000.test") && host("usq000.test") && !host("paypal.com"));
+    exclude_reset_for_test();                                   /* skip first on an empty set, load later */
+    exclude_skip_builtin();
+    EXPECT(exclude_load_builtin() == builtin_n);
+    EXPECT(host("paypal.com"));
+    free(names);
 }
 
 int main(void) {
