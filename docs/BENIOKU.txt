@@ -26,16 +26,68 @@ KULLANIM
    "Güncelle" düğmesine basın: TurkishDPI yeni sürümü GitHub'dan indirir,
    doğrular, kendini aynı klasörde değiştirir ve yeniden açılır. Ayarlarınız
    korunur. Güncelleme yapılamazsa düğme sürüm sayfasını açar (aşağıda
-   "GÜNCELLEME OLMAZSA
-  Olağan durum: pencerede "Güncelleme yapılamadı" yazar, program çalışmaya
-  devam eder. "Sayfa →" düğmesiyle sürüm sayfasını açın, yeni zip'i
-  indirin, TurkishDPI'ı kapatın (simge > Çıkış) ve zip'teki dosyaları eski
-  klasöre kopyalayıp eskilerin üzerine yazın. Nedenini günlükteki
-  "update: failed" satırı gösterir. (Lisans ve BENIOKU metinleri exe'den
-  önce değiştirildiği için bu durumda bile yenilenmiş olabilir.)
-  Nadir durum: yeni exe yazıldıktan sonra bozulursa ya da kilitlenemezse
-  "Güncelleme yarıda kaldı. TurkishDPI kapatılıyor." çıkar ve program
-  kapanır; TurkishDPI.exe'yi yeniden açın, açılmazsa son sürümü indirin.
+   "GÜNCELLEME OLMAZSA").
+7) TurkishDPI zaten çalışırken TurkishDPI.exe'yi yeniden başlatırsanız
+   çalışan pencere öne gelir.
+
+ÖNEMLİ
+- WinDivert.dll ve WinDivert64.sys dosyaları TurkishDPI.exe ile aynı
+  klasörde durmalıdır (zip'in tamamını aynı klasöre çıkarın).
+- "Windows açılışında başlat" programı C:\Program Files\TurkishDPI
+  klasörüne kopyalar ve oradan çalıştırır (32 bit sürüm 64 bit Windows'ta:
+  C:\Program Files (x86)\TurkishDPI).
+- Bazı antivirüsler WinDivert sürücüsünü "RiskTool/WinDivert" olarak
+  işaretler; WinDivert kullanan her araçta aynı yanlış alarm görülür.
+  Gerekirse yalnızca C:\Program Files\TurkishDPI klasörünü (32 bit sürüm
+  64 bit Windows'ta: Program Files (x86)) istisnalara ekleyin.
+  Kaspersky kullanıyorsanız sürücüyü engelleyebilir.
+  Ayarlar sayfasındaki "Antivirüs yardımı" adım adım anlatır.
+- Çalışan bir GoodbyeDPI/zapret hizmeti varsa TurkishDPI bunu fark eder ve
+  kaldırmayı önerir.
+
+İNDİRMEYİ DOĞRULAMA
+  cd /d "%USERPROFILE%\Downloads"
+  certutil -hashfile TurkishDPI-vX.Y.Z-x64.zip SHA256
+  (İlk satır zip'in bulunduğu klasöre geçer.) Çıkan değeri Release
+  sayfasındaki SHA256SUMS.txt ile karşılaştırın; aynı olmalıdır (Windows
+  7/8 bayt çiftleri arasına boşluk koyar, boşlukları yok sayın). Farklıysa
+  zip'i yeniden indirin.
+
+SÜRÜCÜ HATALARI (kod günlükteki "err=" değeridir)
+  Pencerede "Sürücü başlatılamadı" yazar ve altında bir açıklama görünür;
+  kod günlükte ("Error opening filter: <kod>", "... err=<kod>") yazar.
+  Sürücü hatasında program başka yöntem denemez.
+  2, 126  WinDivert64.sys (32 bit Windows'ta WinDivert32.sys) /
+          WinDivert.dll yok: zip'in tamamını exe ile aynı klasöre
+          çıkarın; dosya oradaysa antivirüs karantinasına bakın.
+  193     WinDivert.dll bu Windows'a uymuyor: x64/x86 zip'ini doğru seçin.
+  5       Yönetici izni gerekiyor: yönetici olarak çalıştırın.
+  50      ARM işlemcili Windows desteklenmiyor.
+  577     Sürücü imzası doğrulanamadı: Windows güncellemelerini yükleyin.
+  654     Başka sürümde bir WinDivert sürücüsü yüklü (eski GoodbyeDPI/zapret
+          olabilir): onları kapatıp bilgisayarı yeniden başlatın.
+  1006    WinDivert dosyaları beklenenler değil: resmi zip'i yeniden
+          indirin.
+  1275    Sürücü bir güvenlik yazılımı (ör. Kaspersky) tarafından engellendi.
+  1753    Base Filtering Engine (BFE) hizmeti kapalı: Hizmetler'den açın.
+  1920    WinDivert dosyalarına erişilemiyor: antivirüs engellemiş ya da
+          başka bir program kullanıyor olabilir.
+  Başka bir kodda pencere "WinDivert sürücüsü açılamadı (hata <kod>)"
+  der; başka bir WinDivert aracını (GoodbyeDPI, zapret) kapatıp yeniden
+  deneyin.
+
+GÜNCELLEME OLMAZSA
+  Güncelleme, indirilen exe'nin sürümü etiketle aynı ve çalışandan yeni
+  değilse ya da yanındaki WinDivert dosyaları zip'tekilerden farklıysa
+  yapılmaz. Olağan durum: pencerede "Güncelleme yapılamadı" yazar, program
+  çalışmaya devam eder (lisans ve BENIOKU metinleri değişmez).
+  "Sayfa →" düğmesiyle sürüm sayfasını açın, yeni zip'i indirin,
+  TurkishDPI'ı kapatın (simge > Çıkış) ve zip'teki dosyaları eski klasöre
+  kopyalayıp eskilerin üzerine yazın. Nedenini günlükteki "update: failed"
+  satırı gösterir.
+  Nadir durum: eski exe geri konamazsa "Güncelleme tamamlanamadı.
+  TurkishDPI kapatılıyor." çıkar, Tamam'a basınca sürümler sayfası açılır
+  ve program kapanır; son sürümü oradan indirin.
 
 ELLE KALDIRMA
   En kolay yol Ayarlar > "Kaldır ve temizle…" düğmesidir. Program
